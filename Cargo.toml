@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/gguf"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/giannisanni/pulsar"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
