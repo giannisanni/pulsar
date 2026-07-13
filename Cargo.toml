@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/gguf", "crates/stream", "crates/kernels"]
+members = ["crates/gguf", "crates/stream", "crates/kernels", "crates/tokenizer"]
 
 [workspace.package]
 edition = "2021"
