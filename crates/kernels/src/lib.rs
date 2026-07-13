@@ -47,6 +47,9 @@ mod real {
     extern "C" {
         fn cudaMalloc(ptr: *mut *mut c_void, bytes: usize) -> i32;
         fn cudaFree(ptr: *mut c_void) -> i32;
+        fn cudaHostAlloc(ptr: *mut *mut c_void, bytes: usize, flags: u32) -> i32;
+        fn cudaFreeHost(ptr: *mut c_void) -> i32;
+        fn cudaHostGetDevicePointer(dev: *mut *mut c_void, host: *mut c_void, flags: u32) -> i32;
         fn cudaMemcpy(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32) -> i32;
         fn cudaDeviceSynchronize() -> i32;
 
@@ -109,10 +112,13 @@ mod real {
         }
     }
 
-    /// An owned device allocation. Byte-oriented; callers track element
-    /// layout themselves (this engine's tensors are f32/i32/quant blobs).
+    /// An owned device-visible allocation: VRAM (cudaMalloc) or mapped
+    /// pinned host memory (weights too big for VRAM, read zero-copy over
+    /// PCIe - ds4's trick for GLM-class backbones). Byte-oriented; callers
+    /// track element layout themselves.
     pub struct DeviceBuf {
         ptr: *mut c_void,
+        host: *mut c_void, // null for VRAM allocations
         bytes: usize,
     }
 
@@ -122,7 +128,17 @@ mod real {
         pub fn alloc(bytes: usize) -> Result<Self> {
             let mut ptr = std::ptr::null_mut();
             check_rt(unsafe { cudaMalloc(&mut ptr, bytes.max(1)) }, "cudaMalloc")?;
-            Ok(DeviceBuf { ptr, bytes })
+            Ok(DeviceBuf { ptr, host: std::ptr::null_mut(), bytes })
+        }
+
+        /// Mapped pinned host memory; `ptr()` is device-visible.
+        pub fn alloc_pinned(bytes: usize) -> Result<Self> {
+            const MAPPED: u32 = 2; // cudaHostAllocMapped
+            let mut host = std::ptr::null_mut();
+            check_rt(unsafe { cudaHostAlloc(&mut host, bytes.max(1), MAPPED) }, "cudaHostAlloc")?;
+            let mut dev = std::ptr::null_mut();
+            check_rt(unsafe { cudaHostGetDevicePointer(&mut dev, host, 0) }, "cudaHostGetDevicePointer")?;
+            Ok(DeviceBuf { ptr: dev, host, bytes })
         }
 
         pub fn from_bytes(data: &[u8]) -> Result<Self> {
@@ -155,6 +171,16 @@ mod real {
 
         pub fn write(&mut self, off: usize, data: &[u8]) -> Result {
             assert!(off + data.len() <= self.bytes, "device write out of range");
+            if !self.host.is_null() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        (self.host as *mut u8).add(off),
+                        data.len(),
+                    )
+                };
+                return Ok(());
+            }
             check_rt(
                 unsafe {
                     cudaMemcpy(
@@ -198,7 +224,11 @@ mod real {
 
     impl Drop for DeviceBuf {
         fn drop(&mut self) {
-            unsafe { cudaFree(self.ptr) };
+            if self.host.is_null() {
+                unsafe { cudaFree(self.ptr) };
+            } else {
+                unsafe { cudaFreeHost(self.host) };
+            }
         }
     }
 

@@ -28,8 +28,18 @@ mod real {
         format!("gguf metadata missing/bad: {key}").into()
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Family {
+        /// Plain GQA attention (Hy3 / hy-v3).
+        Gqa,
+        /// Multi-head latent attention, compact-KV path (GLM-5.2 /
+        /// glm-dsa; no DSA indexer, so contexts up to indexer_top_k only).
+        Mla,
+    }
+
     #[derive(Debug, Clone, Copy)]
     pub struct Shape {
+        pub family: Family,
         pub n_embd: u32,
         pub n_head: u32,
         pub n_head_kv: u32,
@@ -45,6 +55,40 @@ mod real {
         pub expert_weight_scale: f32,
         pub rope_freq_base: f32,
         pub rms_eps: f32,
+        // MLA only (zero for Gqa)
+        pub n_lora_q: u32,
+        pub n_kv_lora: u32,
+        pub qk_nope: u32,
+        pub qk_rope: u32,
+        pub value_mla: u32,
+        pub rope_orig_ctx: u32,
+    }
+
+    impl Shape {
+        pub fn qk_dim(&self) -> u32 {
+            self.qk_nope + self.qk_rope
+        }
+
+        /// Attention output width (input of attn_output).
+        fn heads_dim(&self) -> u32 {
+            match self.family {
+                Family::Gqa => self.n_head * self.head_dim,
+                Family::Mla => self.n_head * self.value_mla,
+            }
+        }
+
+        fn rope_cfg(&self) -> kernels::RopeCfg {
+            // GLM-5.2 ships yarn off (scale 1.0); parameters ride along.
+            kernels::RopeCfg {
+                n_ctx_orig: self.rope_orig_ctx,
+                freq_base: self.rope_freq_base,
+                freq_scale: 1.0,
+                ext_factor: 0.0,
+                attn_factor: 1.0,
+                beta_fast: 0.0,
+                beta_slow: 0.0,
+            }
+        }
     }
 
     impl Shape {
@@ -55,16 +99,22 @@ mod real {
             let f = |k: &str| -> Result<f32> {
                 g.arch_meta(k).and_then(Value::as_f32).ok_or_else(|| meta_err(k))
             };
+            let family = match g.architecture() {
+                Some("hy-v3") => Family::Gqa,
+                Some("glm-dsa") => Family::Mla,
+                other => return Err(format!("unsupported architecture {other:?}").into()),
+            };
             let n_layer = u("block_count")?;
             let nextn = u("nextn_predict_layers").unwrap_or(0);
             let n_vocab = match g.metadata.get("tokenizer.ggml.tokens") {
                 Some(Value::Array(a)) => a.len() as u32,
                 _ => return Err(meta_err("tokenizer.ggml.tokens")),
             };
-            Ok(Shape {
+            let mut s = Shape {
+                family,
                 n_embd: u("embedding_length")?,
                 n_head: u("attention.head_count")?,
-                n_head_kv: u("attention.head_count_kv")?,
+                n_head_kv: u("attention.head_count_kv").unwrap_or(1),
                 head_dim: u("attention.key_length")?,
                 n_layer,
                 n_exec_layer: n_layer - nextn,
@@ -77,7 +127,25 @@ mod real {
                 expert_weight_scale: f("expert_weights_scale")?,
                 rope_freq_base: f("rope.freq_base")?,
                 rms_eps: f("attention.layer_norm_rms_epsilon")?,
-            })
+                n_lora_q: 0,
+                n_kv_lora: 0,
+                qk_nope: 0,
+                qk_rope: 0,
+                value_mla: 0,
+                rope_orig_ctx: 0,
+            };
+            if family == Family::Mla {
+                // GLM-5.2 MLA split, ds4's DS4_SHAPE_GLM52 (metadata keys
+                // for the nope/rope split are not standardized; the gguf
+                // values that do exist are preferred).
+                s.n_lora_q = u("attention.q_lora_rank").unwrap_or(2048);
+                s.n_kv_lora = u("attention.kv_lora_rank").unwrap_or(512);
+                s.qk_rope = u("rope.dimension_count").unwrap_or(64);
+                s.qk_nope = 192;
+                s.value_mla = u("attention.value_length").unwrap_or(256);
+                s.rope_orig_ctx = u("rope.scaling.original_context_length").unwrap_or(1_048_576);
+            }
+            Ok(s)
         }
     }
 
@@ -129,14 +197,29 @@ mod real {
         },
     }
 
+    enum Attn {
+        Gqa {
+            attn_q: DeviceBuf,
+            attn_k: DeviceBuf,
+            attn_v: DeviceBuf,
+            q_norm: DeviceBuf,
+            k_norm: DeviceBuf,
+        },
+        Mla {
+            q_a: DeviceBuf,
+            q_a_norm: DeviceBuf,
+            q_b: DeviceBuf,
+            kv_a_mqa: DeviceBuf,
+            kv_a_norm: DeviceBuf,
+            k_b: DeviceBuf,
+            v_b: DeviceBuf,
+        },
+    }
+
     struct LayerW {
         attn_norm: DeviceBuf,
-        attn_q: DeviceBuf,
-        attn_k: DeviceBuf,
-        attn_v: DeviceBuf,
+        attn: Attn,
         attn_output: DeviceBuf,
-        q_norm: DeviceBuf,
-        k_norm: DeviceBuf,
         ffn_norm: DeviceBuf,
         ffn: Ffn,
     }
@@ -457,13 +540,22 @@ mod real {
         Ok(DeviceBuf::from_bytes(&read_tensor_bytes(file, g, name)?)?)
     }
 
+    /// Big attention weights: pinned host memory when PULSAR_ATTN_HOST=1
+    /// (zero-copy PCIe reads - GLM-class backbones exceed VRAM), else VRAM.
+    fn upload_attn(file: &File, g: &Gguf, name: &str) -> Result<DeviceBuf> {
+        let bytes = read_tensor_bytes(file, g, name)?;
+        let mut buf = if std::env::var_os("PULSAR_ATTN_HOST").is_some() {
+            DeviceBuf::alloc_pinned(bytes.len())?
+        } else {
+            DeviceBuf::alloc(bytes.len())?
+        };
+        buf.write(0, &bytes)?;
+        Ok(buf)
+    }
+
     impl Model {
         pub fn load(path: &Path) -> Result<Model> {
             let (file, gguf) = parse_header(path)?;
-            let _ = &file;
-            if gguf.architecture() != Some("hy-v3") {
-                return Err(format!("not a hy-v3 gguf: {:?}", gguf.architecture()).into());
-            }
             let shape = Shape::from_gguf(&gguf)?;
 
             let token_embd = upload(&file, &gguf, "token_embd.weight")?;
@@ -496,14 +588,28 @@ mod real {
                         down_exps: exps("ffn_down_exps.weight")?,
                     }
                 };
+                let attn = match shape.family {
+                    Family::Gqa => Attn::Gqa {
+                        attn_q: upload_attn(&file, &gguf, &t("attn_q.weight"))?,
+                        attn_k: upload_attn(&file, &gguf, &t("attn_k.weight"))?,
+                        attn_v: upload_attn(&file, &gguf, &t("attn_v.weight"))?,
+                        q_norm: upload(&file, &gguf, &t("attn_q_norm.weight"))?,
+                        k_norm: upload(&file, &gguf, &t("attn_k_norm.weight"))?,
+                    },
+                    Family::Mla => Attn::Mla {
+                        q_a: upload_attn(&file, &gguf, &t("attn_q_a.weight"))?,
+                        q_a_norm: upload(&file, &gguf, &t("attn_q_a_norm.weight"))?,
+                        q_b: upload_attn(&file, &gguf, &t("attn_q_b.weight"))?,
+                        kv_a_mqa: upload_attn(&file, &gguf, &t("attn_kv_a_mqa.weight"))?,
+                        kv_a_norm: upload(&file, &gguf, &t("attn_kv_a_norm.weight"))?,
+                        k_b: upload_attn(&file, &gguf, &t("attn_k_b.weight"))?,
+                        v_b: upload_attn(&file, &gguf, &t("attn_v_b.weight"))?,
+                    },
+                };
                 layers.push(LayerW {
                     attn_norm: upload(&file, &gguf, &t("attn_norm.weight"))?,
-                    attn_q: upload(&file, &gguf, &t("attn_q.weight"))?,
-                    attn_k: upload(&file, &gguf, &t("attn_k.weight"))?,
-                    attn_v: upload(&file, &gguf, &t("attn_v.weight"))?,
-                    attn_output: upload(&file, &gguf, &t("attn_output.weight"))?,
-                    q_norm: upload(&file, &gguf, &t("attn_q_norm.weight"))?,
-                    k_norm: upload(&file, &gguf, &t("attn_k_norm.weight"))?,
+                    attn,
+                    attn_output: upload_attn(&file, &gguf, &t("attn_output.weight"))?,
                     ffn_norm: upload(&file, &gguf, &t("ffn_norm.weight"))?,
                     ffn,
                 });
@@ -558,6 +664,13 @@ mod real {
         pred_logits: DeviceBuf,
         pred_selected: DeviceBuf,
         pred_weights: DeviceBuf,
+        // MLA scratch (dummies for Gqa)
+        q_rank: DeviceBuf,
+        q_rank_norm: DeviceBuf,
+        kv_raw: DeviceBuf,
+        kv_norm: DeviceBuf,
+        qk_low: DeviceBuf,
+        mla_selected: DeviceBuf,
     }
 
     impl State {
@@ -659,12 +772,23 @@ mod real {
                 .max()
                 .unwrap_or(0) as usize;
 
-            let kv_bytes = s.n_head_kv as usize * ctx as usize * s.head_dim as usize * 4;
+            // Gqa: kcache/vcache are per-head K/V. Mla: kcache is the
+            // compact latent cache (kv_lora wide), vcache the rope tail.
+            let (k_bytes, v_bytes) = match s.family {
+                Family::Gqa => {
+                    let b = s.n_head_kv as usize * ctx as usize * s.head_dim as usize * 4;
+                    (b, b)
+                }
+                Family::Mla => (
+                    ctx as usize * s.n_kv_lora as usize * 4,
+                    ctx as usize * s.qk_rope as usize * 4,
+                ),
+            };
             let mut kcache = Vec::new();
             let mut vcache = Vec::new();
             for _ in 0..s.n_exec_layer {
-                kcache.push(DeviceBuf::alloc(kv_bytes)?);
-                vcache.push(DeviceBuf::alloc(kv_bytes)?);
+                kcache.push(DeviceBuf::alloc(k_bytes)?);
+                vcache.push(DeviceBuf::alloc(v_bytes)?);
             }
 
             // batch prefill: activations sized for max_batch tokens; the
@@ -684,10 +808,10 @@ mod real {
                 last_row: f32s(s.n_embd)?,
                 cur: f32s(mb * s.n_embd)?,
                 normed: f32s(mb * s.n_embd)?,
-                q: f32s(mb * s.n_head * s.head_dim)?,
+                q: f32s(mb * s.n_head * s.head_dim.max(s.qk_dim()))?,
                 k: f32s(mb * s.n_head_kv * s.head_dim)?,
                 v: f32s(mb * s.n_head_kv * s.head_dim)?,
-                heads: f32s(mb * s.n_head * s.head_dim)?,
+                heads: f32s(mb * s.heads_dim().max(s.n_head * s.head_dim))?,
                 attn_out: f32s(mb * s.n_embd)?,
                 after_attn: f32s(mb * s.n_embd)?,
                 gate_act: f32s(mb * s.n_ff_dense.max(s.n_ff_exp))?,
@@ -730,6 +854,12 @@ mod real {
                 pred_logits: f32s(s.n_expert)?,
                 pred_selected: DeviceBuf::alloc(n_used * 4)?,
                 pred_weights: f32s(s.n_expert_used)?,
+                q_rank: f32s(mb * s.n_lora_q.max(1))?,
+                q_rank_norm: f32s(mb * s.n_lora_q.max(1))?,
+                kv_raw: f32s(mb * (s.n_kv_lora + s.qk_rope).max(1))?,
+                kv_norm: f32s(mb * s.n_kv_lora.max(1))?,
+                qk_low: f32s(mb * s.n_head * s.n_kv_lora.max(1))?,
+                mla_selected: DeviceBuf::alloc(mb as usize * ctx as usize * 4)?,
             };
             let t0 = std::time::Instant::now();
             let warmed = st.load_warm(m)?;
@@ -782,17 +912,39 @@ mod real {
             for (il, l) in self.layers.iter().enumerate() {
                 // attention
                 kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, n_tok, eps)?;
-                kernels::matmul_q8_0(&mut st.q, &l.attn_q, &st.normed, s.n_embd, s.n_head * s.head_dim, n_tok)?;
-                kernels::matmul_q8_0(&mut st.k, &l.attn_k, &st.normed, s.n_embd, s.n_head_kv * s.head_dim, n_tok)?;
-                kernels::matmul_q8_0(&mut st.v, &l.attn_v, &st.normed, s.n_embd, s.n_head_kv * s.head_dim, n_tok)?;
-                kernels::gqa_head_rms_norm(&mut st.q, &l.q_norm, n_tok * s.n_head, s.head_dim, eps)?;
-                kernels::gqa_head_rms_norm(&mut st.k, &l.k_norm, n_tok * s.n_head_kv, s.head_dim, eps)?;
-                kernels::gqa_rope(&mut st.q, n_tok, s.n_head, s.head_dim, pos0, s.rope_freq_base)?;
-                kernels::gqa_rope(&mut st.k, n_tok, s.n_head_kv, s.head_dim, pos0, s.rope_freq_base)?;
-                kernels::gqa_kv_append(&mut st.kcache[il], &st.k, n_tok, s.n_head_kv, s.head_dim, st.ctx, pos0)?;
-                kernels::gqa_kv_append(&mut st.vcache[il], &st.v, n_tok, s.n_head_kv, s.head_dim, st.ctx, pos0)?;
-                kernels::gqa_attention(&mut st.heads, &st.q, &st.kcache[il], &st.vcache[il], n_tok, s.n_head, s.n_head_kv, s.head_dim, st.ctx, pos0)?;
-                kernels::matmul_q8_0(&mut st.attn_out, &l.attn_output, &st.heads, s.n_head * s.head_dim, s.n_embd, n_tok)?;
+                match &l.attn {
+                    Attn::Gqa { attn_q, attn_k, attn_v, q_norm, k_norm } => {
+                        kernels::matmul_q8_0(&mut st.q, attn_q, &st.normed, s.n_embd, s.n_head * s.head_dim, n_tok)?;
+                        kernels::matmul_q8_0(&mut st.k, attn_k, &st.normed, s.n_embd, s.n_head_kv * s.head_dim, n_tok)?;
+                        kernels::matmul_q8_0(&mut st.v, attn_v, &st.normed, s.n_embd, s.n_head_kv * s.head_dim, n_tok)?;
+                        kernels::gqa_head_rms_norm(&mut st.q, q_norm, n_tok * s.n_head, s.head_dim, eps)?;
+                        kernels::gqa_head_rms_norm(&mut st.k, k_norm, n_tok * s.n_head_kv, s.head_dim, eps)?;
+                        kernels::gqa_rope(&mut st.q, n_tok, s.n_head, s.head_dim, pos0, s.rope_freq_base)?;
+                        kernels::gqa_rope(&mut st.k, n_tok, s.n_head_kv, s.head_dim, pos0, s.rope_freq_base)?;
+                        kernels::gqa_kv_append(&mut st.kcache[il], &st.k, n_tok, s.n_head_kv, s.head_dim, st.ctx, pos0)?;
+                        kernels::gqa_kv_append(&mut st.vcache[il], &st.v, n_tok, s.n_head_kv, s.head_dim, st.ctx, pos0)?;
+                        kernels::gqa_attention(&mut st.heads, &st.q, &st.kcache[il], &st.vcache[il], n_tok, s.n_head, s.n_head_kv, s.head_dim, st.ctx, pos0)?;
+                    }
+                    Attn::Mla { q_a, q_a_norm, q_b, kv_a_mqa, kv_a_norm, k_b, v_b } => {
+                        // ds4's GLM compact-KV decode path: q through the
+                        // lora bottleneck, latent kv cached once for all
+                        // heads, attention over all visible rows.
+                        let rope = s.rope_cfg();
+                        let kv_raw_dim = s.n_kv_lora + s.qk_rope;
+                        kernels::matmul_q8_0(&mut st.q_rank, q_a, &st.normed, s.n_embd, s.n_lora_q, n_tok)?;
+                        kernels::rms_norm(&mut st.q_rank_norm, &st.q_rank, q_a_norm, s.n_lora_q, n_tok, eps)?;
+                        kernels::matmul_q8_0(&mut st.q, q_b, &st.q_rank_norm, s.n_lora_q, s.n_head * s.qk_dim(), n_tok)?;
+                        kernels::mla_rope_tail(&mut st.q, n_tok, s.n_head, s.qk_dim(), s.qk_rope, pos0, &rope)?;
+                        kernels::matmul_q8_0(&mut st.kv_raw, kv_a_mqa, &st.normed, s.n_embd, kv_raw_dim, n_tok)?;
+                        kernels::mla_kv_lora_rms_norm(&mut st.kv_norm, &st.kv_raw, kv_a_norm, n_tok, kv_raw_dim, s.n_kv_lora, eps)?;
+                        kernels::mla_store_compact_kv(&mut st.kcache[il], &mut st.vcache[il], &st.kv_norm, &st.kv_raw, pos0, n_tok, st.ctx, kv_raw_dim, s.n_kv_lora, s.qk_rope)?;
+                        let n_sel = pos0 + n_tok;
+                        kernels::mla_fill_selected_range(&mut st.mla_selected, n_tok, pos0, n_sel, st.ctx)?;
+                        kernels::mla_qk_lowrank(&mut st.qk_low, &st.q, k_b, n_tok, s.n_head, s.n_kv_lora, s.qk_nope, s.qk_dim())?;
+                        kernels::mla_attention(&mut st.heads, &st.q, &st.qk_low, &st.kcache[il], &st.vcache[il], v_b, &st.mla_selected, n_tok, n_sel, st.ctx, s.n_head, s.n_kv_lora, s.qk_nope, s.qk_rope, s.value_mla, &rope)?;
+                    }
+                }
+                kernels::matmul_q8_0(&mut st.attn_out, &l.attn_output, &st.heads, s.heads_dim(), s.n_embd, n_tok)?;
                 kernels::add(&mut st.after_attn, &st.cur, &st.attn_out, n_tok * s.n_embd)?;
 
                 // ffn

@@ -37,6 +37,17 @@ pub struct Tokenizer {
     pub bos_id: Option<u32>,
     pub eos_id: Option<u32>,
     pub eot_id: Option<u32>,
+    pre: Pre,
+}
+
+/// Pre-tokenizer split family, from `tokenizer.ggml.pre`. The split shape
+/// determines the merges, so it must match the reference engine exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pre {
+    /// ds4's JoyAI-style split (DeepSeek "joyai-llm", Hy3 "hunyuan-dense").
+    JoyAi,
+    /// ChatGLM4/GLM llama3-style split ("glm4").
+    Glm4,
 }
 
 /// The special-token ids a chat loop needs, resolved from the vocab.
@@ -128,6 +139,10 @@ impl Tokenizer {
             bos_id: id_key("tokenizer.ggml.bos_token_id"),
             eos_id: id_key("tokenizer.ggml.eos_token_id"),
             eot_id: id_key("tokenizer.ggml.eot_token_id"),
+            pre: match g.metadata.get("tokenizer.ggml.pre").and_then(Value::as_str) {
+                Some("glm4") => Pre::Glm4,
+                _ => Pre::JoyAi,
+            },
         })
     }
 
@@ -150,7 +165,11 @@ impl Tokenizer {
     /// pushed by id, exactly as ds4 does).
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut out = Vec::new();
-        for piece in pretokenize(text.as_bytes()) {
+        let pieces = match self.pre {
+            Pre::JoyAi => pretokenize(text.as_bytes()),
+            Pre::Glm4 => pretokenize_glm4(text.as_bytes()),
+        };
+        for piece in pieces {
             self.bpe_piece(piece, &mut out);
         }
         out
@@ -381,6 +400,222 @@ fn pretokenize(s: &[u8]) -> Vec<&[u8]> {
     out
 }
 
+/* ---- glm4 pre-tokenizer: port of ds4's bpe_tokenize_text_glm4 ---------- */
+
+#[derive(Clone, Copy)]
+struct Glm4Char {
+    cp: u32,
+    next: usize,
+    valid: bool,
+    is_letter: bool,
+    is_number: bool,
+    is_whitespace: bool,
+}
+
+fn glm4_whitespace(cp: u32) -> bool {
+    if cp < 128 {
+        return ascii_space(cp as u8);
+    }
+    cp == 0x0085
+        || cp == 0x00a0
+        || cp == 0x1680
+        || (0x2000..=0x200a).contains(&cp)
+        || cp == 0x2028
+        || cp == 0x2029
+        || cp == 0x202f
+        || cp == 0x205f
+        || cp == 0x3000
+}
+
+fn glm4_number(cp: u32) -> bool {
+    if cp < 128 {
+        return cp.try_into().map(ascii_digit).unwrap_or(false);
+    }
+    const RANGES: &[(u32, u32)] = &[
+        (0x0660, 0x0669), (0x06f0, 0x06f9), (0x07c0, 0x07c9), (0x0966, 0x096f),
+        (0x09e6, 0x09ef), (0x0a66, 0x0a6f), (0x0ae6, 0x0aef), (0x0b66, 0x0b6f),
+        (0x0be6, 0x0bef), (0x0c66, 0x0c6f), (0x0ce6, 0x0cef), (0x0d66, 0x0d6f),
+        (0x0de6, 0x0def), (0x0e50, 0x0e59), (0x0ed0, 0x0ed9), (0x0f20, 0x0f29),
+        (0x1040, 0x1049), (0x1090, 0x1099), (0x17e0, 0x17e9), (0x1810, 0x1819),
+        (0xff10, 0xff19),
+    ];
+    RANGES.iter().any(|&(lo, hi)| (lo..=hi).contains(&cp))
+}
+
+fn glm4_punct_symbol(cp: u32) -> bool {
+    if cp < 128 {
+        return cp.try_into().map(punct_symbol).unwrap_or(false);
+    }
+    const RANGES: &[(u32, u32)] = &[
+        (0x00a1, 0x00a9), (0x00ab, 0x00ac), (0x00ae, 0x00b1), (0x00b4, 0x00b4),
+        (0x00b6, 0x00b8), (0x00bb, 0x00bb), (0x00bf, 0x00bf), (0x00d7, 0x00d7),
+        (0x00f7, 0x00f7), (0x02c2, 0x02df), (0x02e5, 0x02eb), (0x02ed, 0x02ff),
+        (0x0375, 0x037e), (0x0384, 0x0385), (0x0387, 0x0387), (0x055a, 0x055f),
+        (0x0589, 0x058a), (0x05be, 0x05c0), (0x05c3, 0x05c3), (0x05c6, 0x05c7),
+        (0x0609, 0x060a), (0x060c, 0x060d), (0x061b, 0x061b), (0x061e, 0x061f),
+        (0x066a, 0x066a), (0x066d, 0x066d), (0x06d4, 0x06d4), (0x2000, 0x206f),
+        (0x20a0, 0x20cf), (0x2100, 0x214f), (0x2190, 0x23ff), (0x2460, 0x24ff),
+        (0x2500, 0x2775), (0x2794, 0x2bff), (0x2e00, 0x2e7f), (0x3000, 0x303f),
+        (0xfd3e, 0xfd3f), (0xfe10, 0xfe6f), (0xff01, 0xff0f), (0xff1a, 0xff20),
+        (0xff3b, 0xff40), (0xff5b, 0xff65), (0x1f000, 0x1faff),
+    ];
+    RANGES.iter().any(|&(lo, hi)| (lo..=hi).contains(&cp))
+}
+
+fn glm4_char_at(s: &[u8], pos: usize) -> Glm4Char {
+    if pos >= s.len() {
+        return Glm4Char { cp: 0, next: pos, valid: false, is_letter: false, is_number: false, is_whitespace: false };
+    }
+    let cp = peek_codepoint(s, pos);
+    let next = next_char(s, pos);
+    let is_whitespace = glm4_whitespace(cp);
+    let is_number = glm4_number(cp);
+    let is_letter = if cp < 128 {
+        (cp as u8).is_ascii_alphabetic()
+    } else {
+        !is_whitespace && !is_number && !glm4_punct_symbol(cp)
+    };
+    Glm4Char { cp, next, valid: true, is_letter, is_number, is_whitespace }
+}
+
+fn ascii_lower(cp: u32) -> u32 {
+    if (b'A' as u32..=b'Z' as u32).contains(&cp) {
+        cp + 32
+    } else {
+        cp
+    }
+}
+
+fn pretokenize_glm4(s: &[u8]) -> Vec<&[u8]> {
+    let len = s.len();
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+
+    while pos < len {
+        let start = pos;
+        let cur = glm4_char_at(s, pos);
+        if !cur.valid {
+            break;
+        }
+
+        // english contractions: 's 't 'm 'd 're 've 'll
+        if cur.cp == '\'' as u32 && cur.next < len {
+            let next = glm4_char_at(s, cur.next);
+            let n1 = ascii_lower(next.cp);
+            if matches!(n1, 0x73 | 0x74 | 0x6d | 0x64) {
+                pos = next.next;
+                out.push(&s[start..pos]);
+                continue;
+            }
+            if next.valid && next.next < len {
+                let next2 = glm4_char_at(s, next.next);
+                let n2 = ascii_lower(next2.cp);
+                if (n1 == 0x72 && n2 == 0x65) || (n1 == 0x76 && n2 == 0x65) || (n1 == 0x6c && n2 == 0x6c) {
+                    pos = next2.next;
+                    out.push(&s[start..pos]);
+                    continue;
+                }
+            }
+        }
+
+        // letter run (optionally led by one non-letter, non-newline char)
+        if !(cur.cp == 0x0d || cur.cp == 0x0a || cur.is_number) {
+            let next = glm4_char_at(s, cur.next);
+            if cur.is_letter || next.is_letter {
+                pos = cur.next;
+                while pos < len {
+                    let scan = glm4_char_at(s, pos);
+                    if !scan.valid || !scan.is_letter {
+                        break;
+                    }
+                    pos = scan.next;
+                }
+                out.push(&s[start..pos]);
+                continue;
+            }
+        }
+
+        // digits, max 3
+        if cur.is_number {
+            let mut ndigits = 0;
+            while pos < len && ndigits < 3 {
+                let scan = glm4_char_at(s, pos);
+                if !scan.valid || !scan.is_number {
+                    break;
+                }
+                pos = scan.next;
+                ndigits += 1;
+            }
+            out.push(&s[start..pos]);
+            continue;
+        }
+
+        // punct/symbol run (optionally led by one space), trailing newlines
+        let (mut punct, punct_pos) = if cur.cp == ' ' as u32 {
+            (glm4_char_at(s, cur.next), cur.next)
+        } else {
+            (cur, pos)
+        };
+        punct.valid = punct.valid && punct_pos < len;
+        if punct.valid && !punct.is_whitespace && !punct.is_letter && !punct.is_number {
+            pos = punct_pos;
+            while pos < len {
+                let scan = glm4_char_at(s, pos);
+                if !scan.valid || scan.is_whitespace || scan.is_letter || scan.is_number {
+                    break;
+                }
+                pos = scan.next;
+            }
+            while pos < len {
+                let scan = glm4_char_at(s, pos);
+                if !scan.valid || !(scan.cp == 0x0d || scan.cp == 0x0a) {
+                    break;
+                }
+                pos = scan.next;
+            }
+            out.push(&s[start..pos]);
+            continue;
+        }
+
+        // whitespace runs: keep through the last newline, or leave the
+        // final ws char to join the next word
+        if cur.is_whitespace {
+            let mut p = pos;
+            let mut last_newline_end = 0usize;
+            let mut last_ws_start = pos;
+            let mut nspace = 0;
+            while p < len {
+                let scan = glm4_char_at(s, p);
+                if !scan.valid || !scan.is_whitespace {
+                    break;
+                }
+                last_ws_start = p;
+                if scan.cp == 0x0d || scan.cp == 0x0a {
+                    last_newline_end = scan.next;
+                }
+                p = scan.next;
+                nspace += 1;
+            }
+            if last_newline_end != 0 {
+                pos = last_newline_end;
+            } else if nspace > 1 && p < len {
+                pos = last_ws_start;
+            } else {
+                pos = p;
+            }
+            out.push(&s[start..pos]);
+            continue;
+        }
+
+        pos = cur.next;
+        if pos == start {
+            pos = next_char(s, pos);
+        }
+        out.push(&s[start..pos.min(len)]);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +648,35 @@ mod tests {
     fn pretokenize_keeps_newlines_with_punct() {
         let pieces: Vec<&[u8]> = pretokenize(b"x;\ny");
         assert_eq!(pieces, vec![&b"x"[..], &b";\n"[..], &b"y"[..]]);
+    }
+
+    #[test]
+    fn glm4_splits_contractions() {
+        let pieces: Vec<&[u8]> = pretokenize_glm4(b"I'll don't");
+        assert_eq!(
+            pieces,
+            vec![&b"I"[..], &b"'ll"[..], &b" don"[..], &b"'t"[..]]
+        );
+    }
+
+    #[test]
+    fn glm4_groups_digits_by_three() {
+        let pieces: Vec<&[u8]> = pretokenize_glm4(b"12345");
+        assert_eq!(pieces, vec![&b"123"[..], &b"45"[..]]);
+    }
+
+    #[test]
+    fn glm4_leading_space_joins_word_and_punct_keeps_newline() {
+        let pieces: Vec<&[u8]> = pretokenize_glm4(b"a b;\nc");
+        assert_eq!(
+            pieces,
+            vec![&b"a"[..], &b" b"[..], &b";\n"[..], &b"c"[..]]
+        );
+    }
+
+    #[test]
+    fn glm4_whitespace_run_leaves_last_for_next_word() {
+        let pieces: Vec<&[u8]> = pretokenize_glm4(b"a    b");
+        assert_eq!(pieces, vec![&b"a"[..], &b"   "[..], &b" b"[..]]);
     }
 }
