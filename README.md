@@ -1,66 +1,150 @@
 # pulsar
 
 An inference engine for giant Mixture-of-Experts models on hardware that
-has no business running them. Successor to
-[NeutronStar](https://github.com/giannisanni/neutronstar): same thesis
-(the routed experts live on disk and stream per token; everything that
-makes decisions stays resident), rebuilt as its own engine instead of a
-fork, with no llama.cpp anywhere in the stack.
+has no business running them. The routed experts live on NVMe and stream
+per token; everything that makes decisions stays resident in VRAM. No
+llama.cpp anywhere in the stack.
 
-Working name. A pulsar is a neutron star that spins fast and emits beams.
+Successor to [NeutronStar](https://github.com/giannisanni/neutronstar),
+rebuilt as its own engine in Rust + CUDA instead of a C fork. A pulsar is
+a neutron star that spins fast and emits beams.
 
-## Why a new engine
+## What it does today
 
-NeutronStar proved the numbers on a single RTX 4060 Ti 16GB: Hy3 295B at
-~2.2 tok/s decode and ~6 tok/s batch prefill, GLM-5.2 743B end to end.
-Every hard bug on the way lived in one layer: concurrent I/O
-orchestration - buffer ownership across fetch threads, cache lifetime
-races, fire-and-forget ring completions. That layer is being rebuilt in
-Rust, where those bug classes fail at compile time. The GPU kernels
-(GQA attention, IQ2 expert tiles, dp4a MoE) stay CUDA C++ behind a thin
-FFI - as they do in every engine - derived from the ds4 lineage with
-attribution.
+Runs **Hy3 295B** (hy-v3, 192 experts, ~85GB gguf) on a single
+**RTX 4060 Ti 16GB**:
 
-## Architecture (planned)
+| | pulsar | ds4 (reference C engine, same box) |
+|---|---|---|
+| decode | **2.2–2.7 tok/s** | 0.64–0.70 |
+| long-prompt prefill | **5.4 tok/s** | 0.44 |
+| warm start | 16GB of hot experts in **~4s** | – |
 
-- `crates/gguf` - zero-copy GGUF reader: header, metadata, tensor table;
-  tensor data is never touched at parse time. DONE, tested against the
-  production Hy3 295B header.
-- `crates/stream` - the expert streaming core: io_uring fetch engine,
-  LFU host cache with persistent warm state, cross-layer speculative
-  prefetch. The design is the measured-and-proven NeutronStar pipeline,
-  with ownership made explicit. Fetch engine DONE and benched.
-- `crates/kernels` - FFI to the CUDA kernel library (build-time nvcc).
-- `crates/engine` - model graphs (GQA+MoE first: hy-v3, then
-  deepseek/GLM-family MLA), scheduler, multi-GPU expert residency.
-- `crates/serve` - CLI + OpenAI-compatible server.
+Correctness is certified against ds4, not assumed: teacher-forced along
+ds4's greedy path, 15/16 per-position argmax agreement (the one miss is a
+0.086-logit tie), and bit-exact decode determinism on a fixed code path
+(`--decode-consistency`, below).
 
-## Milestones
+## Requirements
 
-1. GGUF reader against production headers. (done)
-2. Disk path parity. (done) Rust io_uring fetcher vs a minimal C
-   liburing reference, byte-identical plans (3000 random expert slabs,
-   4.55 GiB, from the production Hy3 gguf), O_DIRECT, QD 64, matching
-   checksums: C 4.83 GB/s, Rust 4.82 GB/s on a Gen4 NVMe. The language
-   costs nothing on the path that is this engine's entire thesis. Bonus
-   finding: the raw fetch pattern saturates the drive at ~4.8 GB/s while
-   the C engine's in-decode effective feed measures 2.5-2.9 GB/s, so
-   ~2 GB/s is currently lost to engine-side serialization - that gap is
-   pulsar's headroom.
-3. Single-GPU Hy3 decode parity on the 4060 Ti via FFI kernels. (done)
-   Full hy-v3 forward graph in `crates/engine` over the ds4-lineage
-   kernel set (GQA attention, dp4a q8_0 matmul with activation prequant,
-   q8_K integer expert dots, sigmoid router) plus a from-gguf BPE
-   tokenizer with ds4 gold-vector tests. Parity gate: teacher-forced
-   along ds4's greedy path, 15/16 per-position argmax agreement - the
-   one miss sits at ds4's 0.086-logit top1/top2 tie, and pulsar agrees
-   at ds4's 0.013 and 0.002 ties. Decode: 2.01 tok/s streaming
-   (three-tier expert path: VRAM hot-set cache with touch-count
-   admission, LFU host cache, io_uring reads overlapping H2D uploads)
-   vs ds4's 0.64-0.70 on the same box. Remaining niceties tracked
-   separately: batched prefill, cross-layer prefetch.
-   Decode-vs-prefill consistency holds by construction for now: prefill
-   runs the same single-token forward as decode.
-4. Multi-GPU expert residency on 2x RTX 5060 Ti (the reason this engine
-   exists: ~48GB VRAM of resident experts, PCIe P2P where unlockable).
-5. Own quantizer: BF16 -> uniform-slab expert quants without llama.cpp.
+- Linux (io_uring and CUDA are load-bearing; the workspace *compiles* on
+  macOS but the engine is stubbed out there)
+- NVIDIA GPU, Ada (sm_89) by default — edit `-arch` in
+  `crates/kernels/build.rs` for other generations
+- CUDA toolkit with `nvcc` on PATH, plus a host compiler nvcc accepts
+  (gcc-12 works; newer gcc may need `CXX=g++-12` at build time)
+- Rust via [rustup](https://rustup.rs)
+- The model gguf on a fast NVMe — streaming reads it at up to ~4.8GB/s,
+  so the disk *is* the decode speed
+- ~16GB system RAM for the host-side expert cache (12GB default budget)
+
+## Quick start
+
+```sh
+git clone https://github.com/giannisanni/pulsar
+cd pulsar
+
+# build (CXX only needed if your default gcc is too new for nvcc)
+CXX=g++-12 cargo build --release -p engine
+
+# run: greedy generation
+./target/release/pulsar-cli \
+    -m /path/to/Hy3-ds4-IQ2XXS-AttnQ8.gguf \
+    -p "The capital of France is" -n 64
+```
+
+First run is cold. On exit the engine writes a `<model>.gguf.warm`
+sidecar (a popularity census of expert slabs); every later run bulk-loads
+the hot set in a few seconds and decodes noticeably faster.
+
+### CLI flags
+
+| flag | meaning |
+|---|---|
+| `-m FILE` | model gguf (required) |
+| `-p TEXT` | prompt (tokenized, BOS prepended) |
+| `--no-bos` | don't prepend BOS |
+| `--tokens 1,2,3` | feed exact token ids instead of text |
+| `-n N` | tokens to generate (default 16) |
+| `--ctx N` | context size (default 2048) |
+| `--dump-logits FILE` | write next-token logits as JSON and exit |
+| `--teacher-force` | per-position top-5 JSONL along the given ids |
+| `--decode-consistency N` | decode N steps, fresh-prefill the same sequence, compare logits |
+
+### Tuning knobs (env vars)
+
+| var | default | what |
+|---|---|---|
+| `PULSAR_CACHE_GB` | 12 | host RAM budget for the expert LFU cache |
+| `PULSAR_DEV_CACHE_GB` | 3 | VRAM budget for the hot-expert pool |
+| `PULSAR_BATCH` | 256 | prefill chunk size (bigger = fewer corpus passes = faster prefill, more VRAM) |
+| `PULSAR_NO_PREFETCH` | unset | set to disable the cross-layer prefetcher |
+
+### Tests
+
+```sh
+cargo test                                        # host-side (any OS)
+CXX=g++-12 cargo test -p kernels --release -- --ignored   # GPU kernel selftests vs CPU references
+```
+
+## How the streaming works
+
+Three tiers per MoE layer, resolved per token (or per prefill chunk as a
+union across the whole batch):
+
+1. **VRAM hot-set cache** — a fixed pool of expert slabs with
+   touch-count admission: a slab earns a slot only by being hotter than
+   the coldest resident, so the pool holds a *stable* hot set instead of
+   thrashing (one token's working set is bigger than the pool).
+2. **Host LFU cache** — RAM-budgeted, persisted to the `.warm` sidecar.
+3. **io_uring + O_DIRECT** — misses are fetched at queue depth 32, and
+   each completion is uploaded to the GPU while the remaining reads are
+   still in flight.
+
+A background thread additionally **prefetches the next layer's experts**,
+predicted by running the next layer's router on the current layer's
+input.
+
+The MoE kernels never consult global state: every launch receives
+explicit per-(token, slot) device pointers for gate/up/down. Where the
+bytes came from is the host's problem, resolved before launch.
+
+## Fidelity notes
+
+- All matmuls use ds4's exact math: activations quantized to q8_0/q8_K,
+  integer dp4a dots. Logit-level parity with ds4 is within quantization
+  noise.
+- Batched prefill and single-token decode use different reduction
+  orders, so greedy near-ties (top1−top2 < ~0.5 logits) can flip between
+  them — the same class of drift ds4 has between its CUDA and Metal
+  backends. `--decode-consistency N` measures it; with `PULSAR_BATCH=1`
+  the two paths are identical and the comparison is bit-exact (verified:
+  max |Δlogit| = 0.0).
+
+## Status / roadmap
+
+Done: gguf reader · io_uring disk path (parity with C at 4.8GB/s) ·
+hy-v3 forward graph + kernel set with GPU-vs-CPU selftests · from-gguf
+BPE tokenizer (gold-vector parity with ds4) · three-tier streaming ·
+warm-cache persistence · batch prefill · cross-layer prefetch.
+
+Not yet:
+
+- sampling beyond greedy argmax; interactive chat; OpenAI-compatible
+  server (`crates/serve`)
+- other model families (GLM/DeepSeek MLA graphs — the expert/router
+  kernels already cover their quants; the attention graph is the work)
+- multi-GPU expert residency (2× RTX 5060 Ti target — the reason this
+  engine exists)
+- MTP speculative decode (parked until batch-union expert loads, its
+  measured blocker in NeutronStar)
+- own BF16→quant quantizer (removes the last llama.cpp dependency from
+  the model-prep pipeline)
+
+## License
+
+MIT. The CUDA kernels derive from the
+[ds4](https://github.com/antirez/ds4) lineage (MIT) and carry their
+attribution:
+Copyright (c) 2026 The ds4.c authors · Copyright (c) 2023–2026 The ggml
+authors.
