@@ -889,4 +889,292 @@ extern "C" int pulsar_moe_selftest(void) {
            moe_selftest_one(PULSAR_QUANT_IQ2_XXS, "iq2_xxs");
 }
 
+/* ---- forward-graph glue: rms-norm, f32 matmul, swiglu, add, embed ------
+ * Verbatim ports of ds4's elementwise/reduction kernels; together with the
+ * kernels above these cover every op in the Hy3 decode graph. */
+
+__global__ static void rms_norm_weight_kernel(
+        float *out, const float *x, const float *w,
+        uint32_t n, uint32_t rows, float eps) {
+    uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *xr = x + (uint64_t)row * n;
+    float *orow = out + (uint64_t)row * n;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = xr[i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(partial[0] / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
+        orow[i] = xr[i] * scale * w[i];
+    }
+}
+
+extern "C" int pulsar_rms_norm(
+        void *out_dev, const void *x_dev, const void *w_dev,
+        uint32_t n, uint32_t rows, float eps) {
+    if (n == 0 || rows == 0) return 0;
+    rms_norm_weight_kernel<<<rows, 256>>>(
+            (float *)out_dev, (const float *)x_dev, (const float *)w_dev,
+            n, rows, eps);
+    return cuda_ok(cudaGetLastError(), "rms norm launch");
+}
+
+__global__ static void matmul_f32_kernel(
+        float *out, const float *w, const float *x,
+        uint64_t in_dim, uint64_t out_dim, uint64_t n_tok) {
+    uint64_t row = (uint64_t)blockIdx.x;
+    uint64_t tok = (uint64_t)blockIdx.y;
+    if (row >= out_dim || tok >= n_tok) return;
+    float sum = 0.0f;
+    const float *wr = w + row * in_dim;
+    const float *xr = x + tok * in_dim;
+    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        sum += wr[i] * xr[i];
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
+}
+
+extern "C" int pulsar_matmul_f32(
+        void *out_dev, const void *w_dev, const void *x_dev,
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
+    if (in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
+    dim3 grid(out_dim, n_tok, 1);
+    matmul_f32_kernel<<<grid, 256>>>(
+            (float *)out_dev, (const float *)w_dev, (const float *)x_dev,
+            in_dim, out_dim, n_tok);
+    return cuda_ok(cudaGetLastError(), "matmul f32 launch");
+}
+
+__global__ static void swiglu_kernel(
+        float *out, const float *gate, const float *up,
+        uint32_t n, float clamp, float weight) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = gate[i];
+    float u = up[i];
+    if (clamp > 1.0e-6f) {
+        g = fminf(g, clamp);
+        u = fminf(fmaxf(u, -clamp), clamp);
+    }
+    float s = g / (1.0f + expf(-g));
+    out[i] = s * u * weight;
+}
+
+extern "C" int pulsar_swiglu(
+        void *out_dev, const void *gate_dev, const void *up_dev,
+        uint32_t n, float clamp, float weight) {
+    if (n == 0) return 0;
+    swiglu_kernel<<<(n + 255u) / 256u, 256>>>(
+            (float *)out_dev, (const float *)gate_dev, (const float *)up_dev,
+            n, clamp, weight);
+    return cuda_ok(cudaGetLastError(), "swiglu launch");
+}
+
+__global__ static void add_kernel(
+        float *out, const float *a, const float *b, uint32_t n) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = a[i] + b[i];
+}
+
+extern "C" int pulsar_add(
+        void *out_dev, const void *a_dev, const void *b_dev, uint32_t n) {
+    if (n == 0) return 0;
+    add_kernel<<<(n + 255u) / 256u, 256>>>(
+            (float *)out_dev, (const float *)a_dev, (const float *)b_dev, n);
+    return cuda_ok(cudaGetLastError(), "add launch");
+}
+
+__global__ static void embed_tokens_q8_0_kernel(
+        float *out,                /* [n_tok][n_embd] */
+        const unsigned char *w,    /* q8_0 embedding matrix base */
+        const int32_t *tokens,     /* [n_tok] */
+        uint32_t n_embd,
+        uint32_t n_vocab,
+        uint32_t n_tok) {
+    const uint32_t e = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (e >= n_embd || t >= n_tok) return;
+    int32_t tok = tokens[t];
+    if (tok < 0 || (uint32_t)tok >= n_vocab) tok = 0;
+    const uint64_t row_bytes = (uint64_t)(n_embd / 32u) * 34u;
+    const unsigned char *row = w + (uint64_t)(uint32_t)tok * row_bytes;
+    const uint32_t blk = e >> 5;
+    const uint32_t idx = e & 31u;
+    const unsigned char *b = row + (uint64_t)blk * 34u;
+    const float d = f16_to_f32(*(const uint16_t *)b);
+    out[(uint64_t)t * n_embd + e] = d * (float)((const signed char *)(b + 2))[idx];
+}
+
+extern "C" int pulsar_embed_q8_0(
+        void *out_dev, const void *w_dev, const void *tokens_dev,
+        uint32_t n_embd, uint32_t n_vocab, uint32_t n_tok) {
+    if (n_embd == 0 || n_embd % 32u != 0 || n_vocab == 0 || n_tok == 0) return 0;
+    dim3 grid((n_embd + 255u) / 256u, n_tok, 1);
+    embed_tokens_q8_0_kernel<<<grid, 256>>>(
+            (float *)out_dev, (const unsigned char *)w_dev,
+            (const int32_t *)tokens_dev, n_embd, n_vocab, n_tok);
+    return cuda_ok(cudaGetLastError(), "embed q8_0 launch");
+}
+
+/* combined glue selftest vs CPU references */
+extern "C" int pulsar_glue_selftest(void) {
+    const uint32_t n = 512, rows = 3, n_vocab = 64;
+    const float eps = 1e-5f;
+    int ok = 1;
+    float maxd;
+
+    /* rms norm */
+    {
+        float *x = (float *)malloc(rows * n * sizeof(float));
+        float *w = (float *)malloc(n * sizeof(float));
+        float *ref = (float *)malloc(rows * n * sizeof(float));
+        float *gpu = (float *)malloc(rows * n * sizeof(float));
+        for (uint32_t i = 0; i < rows * n; i++) x[i] = gqa_test_randf();
+        for (uint32_t i = 0; i < n; i++) w[i] = gqa_test_randf();
+        for (uint32_t r = 0; r < rows; r++) {
+            double sum = 0.0;
+            for (uint32_t i = 0; i < n; i++) sum += (double)x[r * n + i] * x[r * n + i];
+            float scale = (float)(1.0 / sqrt(sum / n + eps));
+            for (uint32_t i = 0; i < n; i++) ref[r * n + i] = x[r * n + i] * scale * w[i];
+        }
+        void *x_d = NULL, *w_d = NULL, *o_d = NULL;
+        ok = cuda_ok(cudaMalloc(&x_d, rows * n * 4), "x") &&
+             cuda_ok(cudaMalloc(&w_d, n * 4), "w") &&
+             cuda_ok(cudaMalloc(&o_d, rows * n * 4), "o") &&
+             cuda_ok(cudaMemcpy(x_d, x, rows * n * 4, cudaMemcpyHostToDevice), "h2d") &&
+             cuda_ok(cudaMemcpy(w_d, w, n * 4, cudaMemcpyHostToDevice), "h2d") &&
+             pulsar_rms_norm(o_d, x_d, w_d, n, rows, eps) &&
+             cuda_ok(cudaMemcpy(gpu, o_d, rows * n * 4, cudaMemcpyDeviceToHost), "d2h");
+        maxd = 0.0f;
+        if (ok) {
+            for (uint32_t i = 0; i < rows * n; i++)
+                maxd = fmaxf(maxd, fabsf(gpu[i] - ref[i]));
+            ok = maxd <= 1e-5f;
+        }
+        fprintf(stderr, "glue-selftest rms_norm: %s (max diff %.2e)\n",
+                ok ? "PASS" : "FAIL", (double)maxd);
+        cudaFree(x_d); cudaFree(w_d); cudaFree(o_d);
+        free(x); free(w); free(ref); free(gpu);
+        if (!ok) return 0;
+    }
+
+    /* f32 matmul + swiglu + add, chained the way the dense FFN uses them */
+    {
+        const uint32_t in_dim = 512, out_dim = 128, n_tok = 2;
+        float *w = (float *)malloc((uint64_t)out_dim * in_dim * 4);
+        float *x = (float *)malloc((uint64_t)n_tok * in_dim * 4);
+        float *ref_mm = (float *)malloc((uint64_t)n_tok * out_dim * 4);
+        float *ref_sw = (float *)malloc((uint64_t)n_tok * out_dim * 4);
+        float *ref_add = (float *)malloc((uint64_t)n_tok * out_dim * 4);
+        float *gpu = (float *)malloc((uint64_t)n_tok * out_dim * 4);
+        for (uint64_t i = 0; i < (uint64_t)out_dim * in_dim; i++) w[i] = gqa_test_randf();
+        for (uint64_t i = 0; i < (uint64_t)n_tok * in_dim; i++) x[i] = gqa_test_randf();
+        for (uint32_t t = 0; t < n_tok; t++)
+            for (uint32_t r = 0; r < out_dim; r++) {
+                double acc = 0.0;
+                for (uint32_t i = 0; i < in_dim; i++)
+                    acc += (double)w[(uint64_t)r * in_dim + i] * x[(uint64_t)t * in_dim + i];
+                ref_mm[(uint64_t)t * out_dim + r] = (float)acc;
+            }
+        const uint32_t nel = n_tok * out_dim;
+        for (uint32_t i = 0; i < nel; i++) {
+            float g = ref_mm[i], u = ref_mm[i];
+            float s = g / (1.0f + expf(-g));
+            ref_sw[i] = s * u * 1.25f;
+            ref_add[i] = ref_sw[i] + ref_mm[i];
+        }
+        void *w_d = NULL, *x_d = NULL, *mm_d = NULL, *sw_d = NULL, *add_d = NULL;
+        ok = cuda_ok(cudaMalloc(&w_d, (uint64_t)out_dim * in_dim * 4), "w") &&
+             cuda_ok(cudaMalloc(&x_d, (uint64_t)n_tok * in_dim * 4), "x") &&
+             cuda_ok(cudaMalloc(&mm_d, nel * 4), "mm") &&
+             cuda_ok(cudaMalloc(&sw_d, nel * 4), "sw") &&
+             cuda_ok(cudaMalloc(&add_d, nel * 4), "add") &&
+             cuda_ok(cudaMemcpy(w_d, w, (uint64_t)out_dim * in_dim * 4, cudaMemcpyHostToDevice), "h2d") &&
+             cuda_ok(cudaMemcpy(x_d, x, (uint64_t)n_tok * in_dim * 4, cudaMemcpyHostToDevice), "h2d") &&
+             pulsar_matmul_f32(mm_d, w_d, x_d, in_dim, out_dim, n_tok) &&
+             pulsar_swiglu(sw_d, mm_d, mm_d, nel, 0.0f, 1.25f) &&
+             pulsar_add(add_d, sw_d, mm_d, nel) &&
+             cuda_ok(cudaMemcpy(gpu, add_d, nel * 4, cudaMemcpyDeviceToHost), "d2h");
+        maxd = 0.0f;
+        if (ok) {
+            float maxref = 0.0f;
+            for (uint32_t i = 0; i < nel; i++) {
+                maxd = fmaxf(maxd, fabsf(gpu[i] - ref_add[i]));
+                maxref = fmaxf(maxref, fabsf(ref_add[i]));
+            }
+            ok = maxd <= 1e-4f * fmaxf(maxref, 1.0f);
+        }
+        fprintf(stderr, "glue-selftest matmul_f32+swiglu+add: %s (max diff %.2e)\n",
+                ok ? "PASS" : "FAIL", (double)maxd);
+        cudaFree(w_d); cudaFree(x_d); cudaFree(mm_d); cudaFree(sw_d); cudaFree(add_d);
+        free(w); free(x); free(ref_mm); free(ref_sw); free(ref_add); free(gpu);
+        if (!ok) return 0;
+    }
+
+    /* q8_0 embedding lookup */
+    {
+        const uint32_t n_embd = 256, n_tok = 4;
+        const uint64_t row_bytes = (uint64_t)(n_embd / 32u) * 34u;
+        unsigned char *w = (unsigned char *)malloc((uint64_t)n_vocab * row_bytes);
+        int32_t tokens[4] = {0, 5, 63, -1}; /* -1 clamps to 0 */
+        float *ref = (float *)malloc((uint64_t)n_tok * n_embd * 4);
+        float *gpu = (float *)malloc((uint64_t)n_tok * n_embd * 4);
+        for (uint64_t i = 0; i < (uint64_t)n_vocab * row_bytes; i++)
+            w[i] = test_randbyte();
+        for (uint32_t v = 0; v < n_vocab; v++)
+            for (uint32_t blk = 0; blk < n_embd / 32u; blk++) {
+                uint16_t d = f32_to_f16_bits(gqa_test_randf() * 0.05f);
+                memcpy(w + (uint64_t)v * row_bytes + (uint64_t)blk * 34u, &d, 2);
+            }
+        for (uint32_t t = 0; t < n_tok; t++) {
+            int32_t tok = tokens[t];
+            if (tok < 0 || (uint32_t)tok >= n_vocab) tok = 0;
+            const unsigned char *row = w + (uint64_t)(uint32_t)tok * row_bytes;
+            for (uint32_t e = 0; e < n_embd; e++) {
+                const unsigned char *b = row + (uint64_t)(e >> 5) * 34u;
+                uint16_t d16;
+                memcpy(&d16, b, 2);
+                ref[(uint64_t)t * n_embd + e] =
+                    f16_to_f32_host(d16) * (float)((const signed char *)(b + 2))[e & 31u];
+            }
+        }
+        void *w_d = NULL, *t_d = NULL, *o_d = NULL;
+        ok = cuda_ok(cudaMalloc(&w_d, (uint64_t)n_vocab * row_bytes), "w") &&
+             cuda_ok(cudaMalloc(&t_d, sizeof(tokens)), "t") &&
+             cuda_ok(cudaMalloc(&o_d, (uint64_t)n_tok * n_embd * 4), "o") &&
+             cuda_ok(cudaMemcpy(w_d, w, (uint64_t)n_vocab * row_bytes, cudaMemcpyHostToDevice), "h2d") &&
+             cuda_ok(cudaMemcpy(t_d, tokens, sizeof(tokens), cudaMemcpyHostToDevice), "h2d") &&
+             pulsar_embed_q8_0(o_d, w_d, t_d, n_embd, n_vocab, n_tok) &&
+             cuda_ok(cudaMemcpy(gpu, o_d, (uint64_t)n_tok * n_embd * 4, cudaMemcpyDeviceToHost), "d2h");
+        maxd = 0.0f;
+        if (ok) {
+            for (uint64_t i = 0; i < (uint64_t)n_tok * n_embd; i++)
+                maxd = fmaxf(maxd, fabsf(gpu[i] - ref[i]));
+            ok = maxd == 0.0f; /* pure lookup: bit-exact */
+        }
+        fprintf(stderr, "glue-selftest embed_q8_0: %s (max diff %.2e)\n",
+                ok ? "PASS" : "FAIL", (double)maxd);
+        cudaFree(w_d); cudaFree(t_d); cudaFree(o_d);
+        free(w); free(ref); free(gpu);
+    }
+    return ok;
+}
+
 extern "C" int pulsar_gqa_selftest(void) { return ds4_gpu_gqa_selftest(); }

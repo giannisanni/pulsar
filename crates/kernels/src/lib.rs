@@ -8,6 +8,7 @@ mod ffi {
         pub fn pulsar_q8_0_matmul_selftest() -> i32;
         pub fn pulsar_router_selftest() -> i32;
         pub fn pulsar_moe_selftest() -> i32;
+        pub fn pulsar_glue_selftest() -> i32;
     }
 }
 
@@ -39,6 +40,13 @@ pub fn moe_selftest() -> bool {
     unsafe { ffi::pulsar_moe_selftest() != 0 }
 }
 
+/// Run the forward-graph glue self-test (rms-norm, f32 matmul, swiglu,
+/// add, q8_0 embedding lookup vs CPU references). Requires a CUDA device.
+#[cfg(target_os = "linux")]
+pub fn glue_selftest() -> bool {
+    unsafe { ffi::pulsar_glue_selftest() != 0 }
+}
+
 #[cfg(test)]
 mod tests {
     /// GPU-required; run explicitly: cargo test -p kernels -- --ignored
@@ -68,5 +76,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn moe_kernels_match_cpu_reference() {
         assert!(super::moe_selftest());
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    #[cfg(target_os = "linux")]
+    fn glue_kernels_match_cpu_reference() {
+        assert!(super::glue_selftest());
     }
 }
