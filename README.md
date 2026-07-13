@@ -1,5 +1,7 @@
 # pulsar
 
+![pulsar](docs/assets/pulsar-poster.png)
+
 An inference engine for giant Mixture-of-Experts models on hardware that
 has no business running them. The routed experts live on NVMe and stream
 per token; everything that makes decisions stays resident in VRAM. No

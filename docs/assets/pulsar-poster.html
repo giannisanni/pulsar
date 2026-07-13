@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; background: #000; }
+  #poster {
+    position: relative;
+    width: 1600px;
+    height: 900px;
+    background: #06060a;
+    overflow: hidden;
+    font-kerning: normal;
+  }
+  #dots { position: absolute; inset: 0; }
+  .wordmark {
+    position: absolute;
+    top: 44px;
+    left: 68px;
+    font-family: "Didot", serif;
+    font-size: 118px;
+    font-weight: 400;
+    letter-spacing: 0.06em;
+    background: linear-gradient(180deg, #f4f6fb 0%, #c7ccd8 38%, #8a90a3 62%, #dfe3ec 82%, #6b7080 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    z-index: 3;
+  }
+  .tagline {
+    position: absolute;
+    top: 72px;
+    right: 64px;
+    text-align: right;
+    font-family: "Helvetica Neue", sans-serif;
+    font-weight: 500;
+    font-size: 17px;
+    letter-spacing: 0.62em;
+    line-height: 1.55;
+    color: #b9bfce;
+    z-index: 3;
+  }
+  .bottomtag {
+    position: absolute;
+    bottom: 62px;
+    left: 68px;
+    font-family: "Helvetica Neue", sans-serif;
+    font-weight: 500;
+    font-size: 21px;
+    letter-spacing: 0.55em;
+    color: #cdd2df;
+    z-index: 3;
+  }
+</style>
+</head>
+<body>
+<div id="poster">
+  <canvas id="dots" width="1600" height="900"></canvas>
+  <div class="wordmark">PULSAR</div>
+  <div class="tagline">GIANT MODELS<br>ON MODEST HARDWARE<br>REBUILT IN RUST + CUDA</div>
+  <div class="bottomtag">SSD EXPERT STREAMING</div>
+</div>
+<script>
+const cv = document.getElementById('dots');
+const ctx = cv.getContext('2d');
+
+// pulsar center, right of middle like the neutronstar poster
+const CX = 1010, CY = 470;
+const CELL = 17;          // grid pitch
+const R = 6.4;            // dot half-size
+const BEAM_ANGLE = -32 * Math.PI / 180;  // beam axis tilt
+
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+// intensity field: core + two opposed beams + expanding pulse rings
+function field(x, y) {
+  const dx = x - CX, dy = y - CY;
+  const r = Math.hypot(dx, dy);
+
+  // rotate into beam frame
+  const ca = Math.cos(BEAM_ANGLE), sa = Math.sin(BEAM_ANGLE);
+  const u = dx * ca - dy * sa;   // along beam axis
+  const v = dx * sa + dy * ca;   // across beam axis
+
+  // core: tight, white-hot
+  let core = Math.exp(-(r * r) / (2 * 30 * 30)) * 2.4 + Math.exp(-(r * r) / (2 * 68 * 68)) * 0.55;
+
+  // beams: two opposed, tight, crisp; hard fade past 430px
+  const au = Math.abs(u);
+  const width = 5.5 + au * 0.055;
+  let beam = Math.exp(-(v * v) / (2 * width * width)) *
+             Math.exp(-au / 400) * 1.5;
+  if (au > 460) beam *= Math.exp(-(au - 460) / 50);
+
+  // small vertical diffraction sparkle at the core (family echo)
+  const spike = Math.exp(-(dx * dx) / (2 * 7 * 7)) *
+                Math.exp(-Math.abs(dy) / 130) * 0.5;
+
+  // pulse rings: expanding circular wavefronts (the lighthouse pulses)
+  let rings = 0;
+  for (const rr of [140, 235, 340]) {
+    const d = Math.abs(r - rr);
+    rings += Math.exp(-(d * d) / (2 * 7 * 7)) * 1.0 * Math.exp(-rr / 650);
+  }
+  // rings brightest where the beam sweeps through them
+  rings *= 0.35 + 0.65 * Math.exp(-(v * v) / (2 * 130 * 130));
+
+  return { core, beam: beam + spike, rings, spiral: 0, r, u, v };
+}
+
+// palette: white-hot core, cyan/blue beams, violet rings (sibling of neutronstar's blue/purple)
+function colorFor(f) {
+  const total = f.core + f.beam + f.rings;
+  if (total < 0.07) return null;
+
+  const t = clamp(total, 0, 2.2);
+  // mix: core dominates -> white; beam -> cyan/blue; rings -> violet
+  const wCore = f.core / (total + 1e-6);
+  const wBeam = f.beam / (total + 1e-6);
+  const wRing = f.rings / (total + 1e-6);
+
+  let rC = 255 * wCore + 92 * wBeam + 178 * wRing;
+  let gC = 255 * wCore + 170 * wBeam + 106 * wRing;
+  let bC = 255 * wCore + 255 * wBeam + 240 * wRing;
+
+  const bright = clamp(t, 0, 1);
+  return {
+    r: clamp(rC * bright + 255 * Math.max(0, t - 1) , 0, 255),
+    g: clamp(gC * bright + 255 * Math.max(0, t - 1), 0, 255),
+    b: clamp(bC * bright + 255 * Math.max(0, t - 1), 0, 255),
+    a: clamp(bright * 1.02, 0, 1)
+  };
+}
+
+// faint starfield
+ctx.fillStyle = '#06060a';
+ctx.fillRect(0, 0, 1600, 900);
+let seed = 12345;
+function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+for (let i = 0; i < 90; i++) {
+  const x = rnd() * 1600, y = rnd() * 900, a = rnd() * 0.10 + 0.02;
+  ctx.fillStyle = `rgba(190,200,230,${a.toFixed(3)})`;
+  ctx.fillRect(x, y, 1.6, 1.6);
+}
+
+// dot-matrix render
+for (let gy = 0; gy < 900 / CELL; gy++) {
+  for (let gx = 0; gx < 1600 / CELL; gx++) {
+    const x = gx * CELL + CELL / 2;
+    const y = gy * CELL + CELL / 2;
+    const f = field(x, y);
+    const c = colorFor(f);
+    if (!c) {
+      // whisper-faint grid ghost only around the star, like the reference
+      if (f.r < 420) {
+        ctx.fillStyle = `rgba(120,110,180,${(0.055 * Math.exp(-f.r / 260)).toFixed(4)})`;
+        roundRect(x - R, y - R, R * 2, R * 2, 2.4);
+      }
+      continue;
+    }
+    // glow pass for bright dots
+    if (c.a > 0.75) {
+      const g = ctx.createRadialGradient(x, y, 0, x, y, CELL * 1.9);
+      g.addColorStop(0, `rgba(${c.r|0},${c.g|0},${c.b|0},0.30)`);
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = g;
+      ctx.fillRect(x - CELL * 2, y - CELL * 2, CELL * 4, CELL * 4);
+    }
+    ctx.fillStyle = `rgba(${c.r|0},${c.g|0},${c.b|0},${c.a.toFixed(3)})`;
+    roundRect(x - R, y - R, R * 2, R * 2, 2.6);
+  }
+}
+
+function roundRect(x, y, w, h, rad) {
+  ctx.beginPath();
+  ctx.moveTo(x + rad, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rad);
+  ctx.arcTo(x + w, y + h, x, y + h, rad);
+  ctx.arcTo(x, y + h, x, y, rad);
+  ctx.arcTo(x, y, x + w, y, rad);
+  ctx.fill();
+}
+</script>
+</body>
+</html>
