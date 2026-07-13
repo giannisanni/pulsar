@@ -1,10 +1,14 @@
-//! pulsar-cli: greedy Hy3 decode for parity work.
+//! pulsar-cli: Hy3 generation and diagnostics.
 //!
 //!   pulsar-cli -m model.gguf -p "text" -n 32 [--ctx 2048] [--no-bos]
+//!   pulsar-cli -m model.gguf --chat [--system "..."] [--temp 0.9]
 //!   pulsar-cli -m model.gguf --tokens 120000,16883,11 -n 32
 //!
 //! -p tokenizes raw text (BOS prepended unless --no-bos); --tokens feeds
 //! exact ids, which is how A/B runs align with ds4 --dump-tokens output.
+//! --chat is an interactive multi-turn loop with the KV cache retained
+//! across turns; sampling defaults come from the gguf's
+//! general.sampling.* metadata unless --temp/--top-p are given.
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -20,6 +24,107 @@ fn main() {
     }
 }
 
+/// Flush the longest valid UTF-8 prefix of `buf` to stdout, keeping any
+/// incomplete trailing multi-byte sequence for the next token.
+#[cfg(target_os = "linux")]
+fn print_utf8_prefix(buf: &mut Vec<u8>) {
+    use std::io::Write;
+    let valid_len = match std::str::from_utf8(buf) {
+        Ok(_) => buf.len(),
+        Err(e) => e.valid_up_to(),
+    };
+    if valid_len > 0 {
+        let out = std::io::stdout();
+        let mut lock = out.lock();
+        lock.write_all(&buf[..valid_len]).ok();
+        lock.flush().ok();
+        buf.drain(..valid_len);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn run_chat(
+    model: &engine::Model,
+    tok: &tokenizer::Tokenizer,
+    ctx: u32,
+    system: Option<String>,
+    temp: Option<f32>,
+    top_p: Option<f32>,
+    min_p: f32,
+    seed: u64,
+    max_tokens: usize,
+) -> engine::Result {
+    use std::io::BufRead;
+
+    let markers = tokenizer::ChatMarkers::resolve(tok)?;
+    // sampling defaults from the gguf's own metadata (Hy3 ships 0.9/1.0)
+    let meta_f = |k: &str, d: f32| {
+        model.gguf.metadata.get(k).and_then(gguf::Value::as_f32).unwrap_or(d)
+    };
+    let temp = temp.unwrap_or_else(|| meta_f("general.sampling.temp", 0.9));
+    let top_p = top_p.unwrap_or_else(|| meta_f("general.sampling.top_p", 1.0));
+    let mut sampler = engine::Sampler::new(temp, top_p, min_p, seed);
+
+    let mut st = engine::State::new(model, ctx)?;
+    let max_tokens = if max_tokens <= 16 { 1024 } else { max_tokens };
+    eprintln!(
+        "pulsar chat: temp {temp} top-p {top_p} seed {seed}; ctx {ctx}; empty line or Ctrl-D exits"
+    );
+
+    let stdin = std::io::stdin();
+    let mut pos = 0u32;
+    let mut first = true;
+    loop {
+        eprint!("\n> ");
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            break;
+        }
+
+        let mut ids = Vec::new();
+        if first {
+            ids.push(markers.bos);
+            if let Some(sys) = &system {
+                ids.extend(tok.encode(sys));
+            }
+            first = false;
+        }
+        ids.push(markers.user);
+        ids.extend(tok.encode(line));
+        ids.push(markers.assistant);
+        ids.push(markers.think_start);
+        ids.push(markers.think_end);
+
+        if pos + ids.len() as u32 + 2 >= ctx {
+            eprintln!("pulsar chat: context full ({pos}/{ctx}), restart to continue");
+            break;
+        }
+
+        let mut bytes = Vec::new();
+        pos = engine::generate(
+            model,
+            &mut st,
+            &ids,
+            pos,
+            &mut sampler,
+            max_tokens,
+            |id| markers.is_stop(id),
+            |id| {
+                bytes.extend_from_slice(&tok.decode(&[id]));
+                print_utf8_prefix(&mut bytes);
+            },
+        )?;
+        println!();
+    }
+    st.save_warm(model)?;
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn run() -> engine::Result {
     let mut model_path = None;
@@ -31,6 +136,12 @@ fn run() -> engine::Result {
     let mut dump_logits = None;
     let mut teacher_force = false;
     let mut decode_consistency = None;
+    let mut chat = false;
+    let mut system = None;
+    let mut temp = None;
+    let mut top_p = None;
+    let mut min_p = 0.0f32;
+    let mut seed = 42u64;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -45,6 +156,12 @@ fn run() -> engine::Result {
             "--dump-logits" => dump_logits = Some(need("--dump-logits")?),
             "--teacher-force" => teacher_force = true,
             "--decode-consistency" => decode_consistency = Some(need("--decode-consistency")?.parse::<usize>()?),
+            "--chat" => chat = true,
+            "--system" => system = Some(need("--system")?),
+            "--temp" => temp = Some(need("--temp")?.parse::<f32>()?),
+            "--top-p" => top_p = Some(need("--top-p")?.parse::<f32>()?),
+            "--min-p" => min_p = need("--min-p")?.parse::<f32>()?,
+            "--seed" => seed = need("--seed")?.parse::<u64>()?,
             other => return Err(format!("unknown arg {other}").into()),
         }
     }
@@ -64,6 +181,10 @@ fn run() -> engine::Result {
         model.shape.n_expert,
         model.shape.n_expert_used
     );
+
+    if chat {
+        return run_chat(&model, &tok, ctx, system, temp, top_p, min_p, seed, n_predict);
+    }
 
     let prompt_ids: Vec<u32> = match (tokens_arg, prompt) {
         (Some(t), _) => t.split(',').map(|s| s.trim().parse()).collect::<std::result::Result<_, _>>()?,

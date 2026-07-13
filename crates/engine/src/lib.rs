@@ -573,6 +573,10 @@ mod real {
             self.max_batch
         }
 
+        pub fn ctx(&self) -> u32 {
+            self.ctx
+        }
+
         /// Persist the slab popularity census so the next run starts warm.
         pub fn save_warm(&self, m: &Model) -> Result {
             let mut entries: Vec<(u64, u64, u64)> = self
@@ -980,6 +984,41 @@ mod real {
         }
     }
 
+    /// Prefill `prompt` at pos0 (chunked), then sample until `stop`,
+    /// ctx, or max_tokens; each sampled token goes to `on_token` and is
+    /// forwarded into the KV cache (including the stop token, so the
+    /// context stays template-shaped for a next turn). Returns the
+    /// position after everything forwarded.
+    pub fn generate(
+        model: &Model,
+        st: &mut State,
+        prompt: &[u32],
+        pos0: u32,
+        sampler: &mut Sampler,
+        max_tokens: usize,
+        stop: impl Fn(u32) -> bool,
+        mut on_token: impl FnMut(u32),
+    ) -> Result<u32> {
+        let mut pos = pos0;
+        let mut logits = None;
+        for chunk in prompt.chunks(st.max_batch() as usize) {
+            logits = model.forward_batch(st, chunk, pos, true)?;
+            pos += chunk.len() as u32;
+        }
+        for _ in 0..max_tokens {
+            let next = sampler.sample(logits.as_ref().ok_or("no logits")?);
+            if stop(next) || pos + 1 >= st.ctx() {
+                model.forward_batch(st, &[next], pos, false)?;
+                pos += 1;
+                break;
+            }
+            on_token(next);
+            logits = model.forward_batch(st, &[next], pos, true)?;
+            pos += 1;
+        }
+        Ok(pos)
+    }
+
     /// First-max argmax, matching ds4's sample_argmax.
     pub fn argmax(logits: &[f32]) -> u32 {
         let mut best = 0usize;
@@ -989,6 +1028,70 @@ mod real {
             }
         }
         best as u32
+    }
+
+    /// Temperature + nucleus (top-p) + min-p sampling, seeded and
+    /// reproducible. temp <= 0 is greedy.
+    pub struct Sampler {
+        pub temp: f32,
+        pub top_p: f32,
+        pub min_p: f32,
+        state: u64,
+    }
+
+    impl Sampler {
+        pub fn new(temp: f32, top_p: f32, min_p: f32, seed: u64) -> Sampler {
+            Sampler { temp, top_p, min_p, state: seed | 1 }
+        }
+
+        fn randf(&mut self) -> f32 {
+            // xorshift64*
+            let mut x = self.state;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.state = x;
+            ((x.wrapping_mul(0x2545F4914F6CDD1D) >> 40) as f32) / (1u64 << 24) as f32
+        }
+
+        pub fn sample(&mut self, logits: &[f32]) -> u32 {
+            if self.temp <= 0.0 {
+                return argmax(logits);
+            }
+            let mut cand: Vec<(u32, f32)> =
+                logits.iter().enumerate().map(|(i, &l)| (i as u32, l)).collect();
+            cand.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+            // softmax with temperature over the sorted candidates
+            let maxl = cand[0].1;
+            let mut sum = 0f32;
+            for c in cand.iter_mut() {
+                c.1 = ((c.1 - maxl) / self.temp).exp();
+                sum += c.1;
+            }
+            let p0 = cand[0].1 / sum;
+            let mut kept = 0usize;
+            let mut cum = 0f32;
+            for c in &cand {
+                let p = c.1 / sum;
+                if self.min_p > 0.0 && p < self.min_p * p0 && kept > 0 {
+                    break;
+                }
+                cum += p;
+                kept += 1;
+                if self.top_p < 1.0 && cum >= self.top_p {
+                    break;
+                }
+            }
+            let kept_sum: f32 = cand[..kept].iter().map(|c| c.1).sum();
+            let mut r = self.randf() * kept_sum;
+            for c in &cand[..kept] {
+                if r < c.1 {
+                    return c.0;
+                }
+                r -= c.1;
+            }
+            cand[kept - 1].0
+        }
     }
 }
 

@@ -51,6 +51,17 @@ CXX=g++-12 cargo build --release -p engine
 ./target/release/pulsar-cli \
     -m /path/to/Hy3-ds4-IQ2XXS-AttnQ8.gguf \
     -p "The capital of France is" -n 64
+
+# or: interactive chat (multi-turn, KV cache retained across turns)
+./target/release/pulsar-cli -m /path/to/model.gguf --chat
+
+# or: OpenAI-compatible server
+cargo build --release -p serve
+./target/release/pulsar-serve -m /path/to/model.gguf --port 11435
+curl http://127.0.0.1:11435/v1/chat/completions -d '{
+  "messages": [{"role": "user", "content": "Hello!"}],
+  "stream": true
+}'
 ```
 
 First run is cold. On exit the engine writes a `<model>.gguf.warm`
@@ -63,6 +74,9 @@ the hot set in a few seconds and decodes noticeably faster.
 |---|---|
 | `-m FILE` | model gguf (required) |
 | `-p TEXT` | prompt (tokenized, BOS prepended) |
+| `--chat` | interactive multi-turn chat (Hy3 chat template, KV retained) |
+| `--system TEXT` | system prompt for chat mode |
+| `--temp F` / `--top-p F` / `--min-p F` / `--seed N` | sampling (chat defaults to the gguf's `general.sampling.*`; one-shot defaults to greedy) |
 | `--no-bos` | don't prepend BOS |
 | `--tokens 1,2,3` | feed exact token ids instead of text |
 | `-n N` | tokens to generate (default 16) |
@@ -126,12 +140,13 @@ bytes came from is the host's problem, resolved before launch.
 Done: gguf reader · io_uring disk path (parity with C at 4.8GB/s) ·
 hy-v3 forward graph + kernel set with GPU-vs-CPU selftests · from-gguf
 BPE tokenizer (gold-vector parity with ds4) · three-tier streaming ·
-warm-cache persistence · batch prefill · cross-layer prefetch.
+warm-cache persistence · batch prefill · cross-layer prefetch ·
+temp/top-p/min-p sampling · interactive chat · OpenAI-compatible server
+(`pulsar-serve`: `/v1/models`, `/v1/chat/completions` with SSE
+streaming; local single-user, one request at a time).
 
 Not yet:
 
-- sampling beyond greedy argmax; interactive chat; OpenAI-compatible
-  server (`crates/serve`)
 - other model families (GLM/DeepSeek MLA graphs — the expert/router
   kernels already cover their quants; the attention graph is the work)
 - multi-GPU expert residency (2× RTX 5060 Ti target — the reason this

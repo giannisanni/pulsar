@@ -36,6 +36,41 @@ pub struct Tokenizer {
     char_to_byte: HashMap<char, u8>,
     pub bos_id: Option<u32>,
     pub eos_id: Option<u32>,
+    pub eot_id: Option<u32>,
+}
+
+/// The special-token ids a chat loop needs, resolved from the vocab.
+/// Hy3 layout (mirrors ds4's encode_chat_prompt): one turn is
+/// `[bos] [system-text] user <text> assistant think_start think_end`,
+/// and a finished assistant reply is followed by eos in the context.
+#[derive(Debug, Clone, Copy)]
+pub struct ChatMarkers {
+    pub bos: u32,
+    pub eos: u32,
+    pub eot: Option<u32>,
+    pub user: u32,
+    pub assistant: u32,
+    pub think_start: u32,
+    pub think_end: u32,
+}
+
+impl ChatMarkers {
+    pub fn resolve(t: &Tokenizer) -> Result<ChatMarkers, Error> {
+        let find = |s: &'static str| t.find_token(s).ok_or(Error::MissingKey(s));
+        Ok(ChatMarkers {
+            bos: t.bos_id.ok_or(Error::MissingKey("bos_token_id"))?,
+            eos: t.eos_id.ok_or(Error::MissingKey("eos_token_id"))?,
+            eot: t.eot_id,
+            user: find("<｜hy_User:opensource｜>")?,
+            assistant: find("<｜hy_Assistant:opensource｜>")?,
+            think_start: find("<think:opensource>")?,
+            think_end: find("</think:opensource>")?,
+        })
+    }
+
+    pub fn is_stop(&self, id: u32) -> bool {
+        id == self.eos || Some(id) == self.eot
+    }
 }
 
 /// GPT-2's byte<->unicode bijection: printable bytes map to themselves,
@@ -92,6 +127,7 @@ impl Tokenizer {
             char_to_byte,
             bos_id: id_key("tokenizer.ggml.bos_token_id"),
             eos_id: id_key("tokenizer.ggml.eos_token_id"),
+            eot_id: id_key("tokenizer.ggml.eot_token_id"),
         })
     }
 
