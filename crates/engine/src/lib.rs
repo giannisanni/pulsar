@@ -62,6 +62,10 @@ mod real {
         pub qk_rope: u32,
         pub value_mla: u32,
         pub rope_orig_ctx: u32,
+        // DSA lightning indexer (zero when absent -> ctx capped at 2048)
+        pub n_idx_head: u32,
+        pub n_idx_dim: u32,
+        pub n_idx_topk: u32,
     }
 
     impl Shape {
@@ -144,6 +148,9 @@ mod real {
                 qk_rope: 0,
                 value_mla: 0,
                 rope_orig_ctx: 0,
+                n_idx_head: 0,
+                n_idx_dim: 0,
+                n_idx_topk: 0,
             };
             if family == Family::Mla {
                 // GLM-5.2 MLA split from the gguf's own keys (verified
@@ -158,6 +165,9 @@ mod real {
                 s.qk_nope = qk_mla - s.qk_rope;
                 s.value_mla = u("attention.value_length_mla").unwrap_or(256);
                 s.rope_orig_ctx = u("rope.scaling.original_context_length").unwrap_or(1_048_576);
+                s.n_idx_head = u("attention.indexer.head_count").unwrap_or(0);
+                s.n_idx_dim = u("attention.indexer.key_length").unwrap_or(0);
+                s.n_idx_topk = u("attention.indexer.top_k").unwrap_or(0);
             }
             Ok(s)
         }
@@ -230,7 +240,24 @@ mod real {
             kv_a_norm: DeviceBuf,
             k_b: DeviceBuf,
             v_b: DeviceBuf,
+            indexer: Option<IdxW>,
         },
+    }
+
+    /// DSA lightning-indexer weights (small; resident beside the attn stack).
+    struct IdxW {
+        q_b: DeviceBuf,   // q8_0 [n_lora_q][idx_head*idx_dim]
+        k: DeviceBuf,     // q8_0 [n_embd][idx_dim]
+        k_norm: DeviceBuf, // f32 LayerNorm weight [idx_dim]
+        k_norm_b: DeviceBuf, // f32 LayerNorm bias
+        proj: DeviceBuf,  // f32 [n_embd][idx_head]
+    }
+
+    /// GLM-5.2 DSA layer policy: leading dense layers plus every 4th from
+    /// layer 6 run the full indexer; the layers between reuse the last
+    /// indexer layer's selection (verbatim from ds4).
+    fn uses_full_indexer(il: usize, n_leading_dense: u32) -> bool {
+        il < n_leading_dense as usize || (il >= 6 && (il - 6) % 4 == 0)
     }
 
     struct LayerW {
@@ -939,6 +966,19 @@ mod real {
                         kv_a_norm: upload(&file, &gguf, &t("attn_kv_a_norm.weight"))?,
                         k_b: upload_attn(&file, &gguf, &t("attn_k_b.weight"), &mut *no_budget)?,
                         v_b: upload_attn(&file, &gguf, &t("attn_v_b.weight"), &mut *no_budget)?,
+                        indexer: if shape.n_idx_topk > 0
+                            && gguf.tensor(&t("indexer.attn_q_b.weight")).is_some()
+                        {
+                            Some(IdxW {
+                                q_b: upload(&file, &gguf, &t("indexer.attn_q_b.weight"))?,
+                                k: upload(&file, &gguf, &t("indexer.attn_k.weight"))?,
+                                k_norm: upload(&file, &gguf, &t("indexer.k_norm.weight"))?,
+                                k_norm_b: upload(&file, &gguf, &t("indexer.k_norm.bias"))?,
+                                proj: upload(&file, &gguf, &t("indexer.proj.weight"))?,
+                            })
+                        } else {
+                            None
+                        },
                     },
                 };
                 let attn_output = upload_attn(&file, &gguf, &t("attn_output.weight"), &mut *attn_vram_budget)?;
@@ -1192,6 +1232,15 @@ mod real {
         kv_norm: DeviceBuf,
         qk_low: DeviceBuf,
         mla_selected: DeviceBuf,
+        // DSA indexer scratch (1-float dummies when absent): per-indexer-
+        // layer K caches + q/weights/scores; selection count persists
+        // across layers so non-indexer layers reuse the last list
+        idx_kcache: Vec<DeviceBuf>,
+        idx_kraw: DeviceBuf,
+        idx_q: DeviceBuf,
+        idx_w: DeviceBuf,
+        idx_scores: DeviceBuf,
+        idx_last_sel: u32,
         // attn-GPU hop buffers (1-float dummies otherwise): normed input
         // copied primary->attn GPU, attn output copied back
         normed_a: DeviceBuf,
@@ -1405,6 +1454,20 @@ mod real {
             let kv_norm = f32s(mb * s.n_kv_lora.max(1))?;
             let qk_low = f32s(mb * s.n_head * s.n_kv_lora.max(1))?;
             let mla_selected = DeviceBuf::alloc(mb as usize * ctx as usize * 4)?;
+            // DSA indexer buffers live beside the attn stack (same device)
+            let has_idx = s.n_idx_topk > 0 && s.family == Family::Mla;
+            let mut idx_kcache = Vec::new();
+            for il in 0..s.n_exec_layer as usize {
+                idx_kcache.push(if has_idx && uses_full_indexer(il, s.n_leading_dense) {
+                    DeviceBuf::alloc(ctx as usize * s.n_idx_dim as usize * 4)?
+                } else {
+                    f32s(1)?
+                });
+            }
+            let idx_kraw = f32s(if has_idx { mb * s.n_idx_dim } else { 1 })?;
+            let idx_q = f32s(if has_idx { s.n_idx_head * s.n_idx_dim } else { 1 })?;
+            let idx_w = f32s(if has_idx { s.n_idx_head } else { 1 })?;
+            let idx_scores = f32s(if has_idx { ctx } else { 1 })?;
             let (normed_a, attn_out_a) = if m.attn_dev.is_some() {
                 (f32s(mb * s.n_embd)?, f32s(mb * s.n_embd)?)
             } else {
@@ -1496,6 +1559,12 @@ mod real {
                 kv_norm,
                 qk_low,
                 mla_selected,
+                idx_kcache,
+                idx_kraw,
+                idx_q,
+                idx_w,
+                idx_scores,
+                idx_last_sel: 0,
                 normed_a,
                 attn_out_a,
                 tier_ret: if tiers.is_empty() { f32s(1)? } else { f32s(mb * s.n_embd)? },
@@ -1665,7 +1734,7 @@ mod real {
                         kernels::gqa_kv_append(&mut st.vcache[il], &st.v, n_tok, s.n_head_kv, s.head_dim, st.ctx, pos0)?;
                         kernels::gqa_attention(&mut st.heads, &st.q, &st.kcache[il], &st.vcache[il], n_tok, s.n_head, s.n_head_kv, s.head_dim, st.ctx, pos0)?;
                     }
-                    Attn::Mla { q_a, q_a_norm, q_b, kv_a_mqa, kv_a_norm, k_b, v_b } => {
+                    Attn::Mla { q_a, q_a_norm, q_b, kv_a_mqa, kv_a_norm, k_b, v_b, indexer } => {
                         // ds4's GLM compact-KV decode path: q through the
                         // lora bottleneck, latent kv cached once for all
                         // heads, attention over all visible rows. Each
@@ -1706,8 +1775,53 @@ mod real {
                         kernels::matmul_q8_0(&mut st.kv_raw, kv_a_w, xin, s.n_embd, kv_raw_dim, n_tok)?;
                         kernels::mla_kv_lora_rms_norm(&mut st.kv_norm, &st.kv_raw, kv_a_norm, n_tok, kv_raw_dim, s.n_kv_lora, eps)?;
                         kernels::mla_store_compact_kv(&mut st.kcache[il], &mut st.vcache[il], &st.kv_norm, &st.kv_raw, pos0, n_tok, st.ctx, kv_raw_dim, s.n_kv_lora, s.qk_rope)?;
-                        let n_sel = pos0 + n_tok;
-                        kernels::mla_fill_selected_range(&mut st.mla_selected, n_tok, pos0, n_sel, st.ctx)?;
+                        // DSA selection: within top_k every token sees the
+                        // full range (bit-identical to the pre-indexer
+                        // path). Beyond it, indexer layers score + top-k
+                        // their own KV rows and the layers between reuse
+                        // the last selection, exactly like ds4.
+                        let visible = pos0 + n_tok;
+                        let topk = s.n_idx_topk;
+                        let is_idx_layer = uses_full_indexer(il, s.n_leading_dense);
+                        if let (Some(idx), true) = (indexer, is_idx_layer) {
+                            // maintain this layer's indexer K cache (xin =
+                            // the attn-device copy of normed under offload)
+                            kernels::matmul_q8_0(&mut st.idx_kraw, &idx.k, xin, s.n_embd, s.n_idx_dim, n_tok)?;
+                            kernels::idx_store_k(&st.idx_kraw, &idx.k_norm, &idx.k_norm_b, &mut st.idx_kcache[il], pos0, n_tok, st.ctx, s.n_idx_dim, s.qk_rope, s.rms_eps, &s.rope_cfg(), 0.0, 1.0)?;
+                        }
+                        let n_sel = if topk == 0 || visible <= topk {
+                            kernels::mla_fill_selected_range(&mut st.mla_selected, n_tok, pos0, visible, st.ctx)?;
+                            st.idx_last_sel = visible;
+                            visible
+                        } else if is_idx_layer && indexer.is_some() {
+                            if n_tok != 1 {
+                                return Err("indexed batch prefill not yet supported past top_k rows; long prompts need PULSAR_BATCH=1".into());
+                            }
+                            let idx = indexer.as_ref().unwrap();
+                            kernels::matmul_q8_0(&mut st.idx_q, &idx.q_b, &st.q_rank_norm, s.n_lora_q, s.n_idx_head * s.n_idx_dim, 1)?;
+                            kernels::idx_rope0(&mut st.idx_q, 1, s.n_idx_head, s.n_idx_dim, s.qk_rope, pos0, &s.rope_cfg(), 0.0, 1.0)?;
+                            // ds4 feeds proj the pre-norm residual (cur).
+                            // Under attn offload cur is on the primary;
+                            // borrow attn_out_a as the hop buffer - it is
+                            // not written until the output projection.
+                            if self.attn_dev.is_some() {
+                                kernels::copy_across(&mut st.attn_out_a, &st.cur, s.n_embd as usize * 4)?;
+                                kernels::matmul_f32(&mut st.idx_w, &idx.proj, &st.attn_out_a, s.n_embd, s.n_idx_head, 1)?;
+                            } else {
+                                kernels::matmul_f32(&mut st.idx_w, &idx.proj, &st.cur, s.n_embd, s.n_idx_head, 1)?;
+                            }
+                            let scale = 1.0 / ((s.n_idx_dim * s.n_idx_head) as f32).sqrt();
+                            kernels::idx_score_one(&mut st.idx_scores, &st.idx_q, &st.idx_w, &st.idx_kcache[il], visible, s.n_idx_head, s.n_idx_dim, scale)?;
+                            kernels::idx_topk(&mut st.mla_selected, &st.idx_scores, visible, topk)?;
+                            st.idx_last_sel = topk;
+                            topk
+                        } else {
+                            // between indexer layers: reuse the last list
+                            if st.idx_last_sel == 0 {
+                                return Err("indexer selection missing (no indexer weights in gguf?)".into());
+                            }
+                            st.idx_last_sel
+                        };
                         kernels::mla_qk_lowrank(&mut st.qk_low, &st.q, k_b_w, n_tok, s.n_head, s.n_kv_lora, s.qk_nope, s.qk_dim())?;
                         kernels::mla_attention(&mut st.heads, &st.q, &st.qk_low, &st.kcache[il], &st.vcache[il], v_b_w, &st.mla_selected, n_tok, n_sel, st.ctx, s.n_head, s.n_kv_lora, s.qk_nope, s.qk_rope, s.value_mla, &rope)?;
 

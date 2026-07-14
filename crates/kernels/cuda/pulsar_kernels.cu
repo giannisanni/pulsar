@@ -2255,3 +2255,4 @@ extern "C" int pulsar_mla_selftest(void) {
     return mla_selftest_one(1.0f, 0.0f, 0.0f, 0.0f, "plain") &&
            mla_selftest_one(0.5f, 1.0f, 32.0f, 1.0f, "yarn");
 }
+#include "dsa_indexer.inc"
