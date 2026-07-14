@@ -235,6 +235,14 @@ mod real {
         enorm: DeviceBuf,
         hnorm: DeviceBuf,
         head_norm: DeviceBuf,
+        /// ALL of the draft layer's expert slabs resident on the primary
+        /// (~1.4GB Hy3 / ~2.5GB GLM): every draft pass routes through this
+        /// one layer, so streaming its experts made drafting expensive -
+        /// the main reason depth-1 MTP measured net-slower. Keyed by
+        /// absolute file offset -> byte offset in the pool; empty map =
+        /// residency didn't fit, resolve falls back to the caches.
+        res_pool: DeviceBuf,
+        res_map: std::collections::HashMap<u64, usize>,
     }
 
     pub struct Model {
@@ -932,12 +940,49 @@ mod real {
                     eprintln!("pulsar: PULSAR_MTP=1 but the gguf has no nextn block - ignoring");
                     None
                 } else {
+                    let layer = load_layer(il, &mut attn_vram_budget, &mut no_budget)?;
+                    let mut res_pool = DeviceBuf::alloc(1)?;
+                    let mut res_map = std::collections::HashMap::new();
+                    if let Ffn::Moe { gate_exps, up_exps, down_exps, .. } = &layer.ffn {
+                        let total: usize = [gate_exps, up_exps, down_exps]
+                            .iter()
+                            .map(|t| t.expert_bytes as usize * shape.n_expert as usize)
+                            .sum();
+                        match DeviceBuf::alloc(total) {
+                            Ok(mut pool) => {
+                                let mut cursor = 0usize;
+                                let mut slab = Vec::new();
+                                for t in [gate_exps, up_exps, down_exps] {
+                                    for e in 0..shape.n_expert as u64 {
+                                        let off = t.abs_offset + e * t.expert_bytes;
+                                        slab.resize(t.expert_bytes as usize, 0);
+                                        file.read_exact_at(&mut slab, off)?;
+                                        pool.write(cursor, &slab)?;
+                                        res_map.insert(off, cursor);
+                                        cursor += t.expert_bytes as usize;
+                                    }
+                                }
+                                eprintln!(
+                                    "pulsar: MTP draft experts resident ({:.1}GB, all {} triples)",
+                                    total as f64 / 1e9,
+                                    shape.n_expert
+                                );
+                                res_pool = pool;
+                            }
+                            Err(_) => eprintln!(
+                                "pulsar: MTP expert residency didn't fit ({:.1}GB needed) - drafts will stream",
+                                total as f64 / 1e9
+                            ),
+                        }
+                    }
                     let m = MtpLayer {
-                        layer: load_layer(il, &mut attn_vram_budget, &mut no_budget)?,
+                        layer,
                         eh_proj: upload(&file, &gguf, &nextn("eh_proj"))?,
                         enorm: upload(&file, &gguf, &nextn("enorm"))?,
                         hnorm: upload(&file, &gguf, &nextn("hnorm"))?,
                         head_norm: upload(&file, &gguf, &nextn("shared_head_norm"))?,
+                        res_pool,
+                        res_map,
                     };
                     eprintln!("pulsar: MTP draft layer loaded (speculative decode)");
                     Some(m)
@@ -1752,6 +1797,11 @@ mod real {
                         // they are never fetched, cached, or staged here
                         let tier_of = |e: i32| -> Option<(usize, ExpertPtrs)> {
                             let g = gate_exps.abs_offset + e as u64 * gate_exps.expert_bytes;
+                            // resident MTP experts beat a tier copy (same
+                            // device as the compute, no partial gather)
+                            if self.mtp.as_ref().is_some_and(|mt| mt.res_map.contains_key(&g)) {
+                                return None;
+                            }
                             st.tiers.iter().enumerate().find_map(|(ti, t)| {
                                 let gate = *t.map.get(&g)?;
                                 Some((ti, ExpertPtrs {
@@ -1784,6 +1834,14 @@ mod real {
                         let mut resolved = std::collections::HashMap::new();
                         let mut wants = Vec::new();
                         for r in &offsets {
+                            // MTP draft-layer experts are fully resident on
+                            // the primary - never cached, never fetched
+                            if let Some(mt) = &self.mtp {
+                                if let Some(&po) = mt.res_map.get(&r.offset) {
+                                    resolved.insert(r.offset, mt.res_pool.ptr_at(po));
+                                    continue;
+                                }
+                            }
                             match st.dev_cache.get(r.offset, r.len) {
                                 Some(p) => {
                                     resolved.insert(r.offset, p);
