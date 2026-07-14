@@ -46,6 +46,7 @@ mod real {
 
     extern "C" {
         fn cudaSetDevice(dev: i32) -> i32;
+        fn cudaGetDevice(dev: *mut i32) -> i32;
         fn cudaGetDeviceCount(count: *mut i32) -> i32;
         fn cudaDeviceGetAttribute(val: *mut i32, attr: i32, dev: i32) -> i32;
         fn cudaMalloc(ptr: *mut *mut c_void, bytes: usize) -> i32;
@@ -123,6 +124,8 @@ mod real {
         ptr: *mut c_void,
         host: *mut c_void, // null for VRAM allocations
         bytes: usize,
+        /// CUDA device the VRAM lives on (-1 for pinned host memory).
+        dev: i32,
     }
 
     unsafe impl Send for DeviceBuf {}
@@ -167,15 +170,36 @@ mod real {
         });
     }
 
+    /// Switch the calling thread's current CUDA device. Kernel wrappers
+    /// launch on whatever device is current; the engine brackets its
+    /// attn-GPU segments with this.
+    pub fn set_device(dev: i32) -> Result {
+        ensure_device();
+        check_rt(unsafe { cudaSetDevice(dev) }, "cudaSetDevice")
+    }
+
+    pub fn get_device() -> i32 {
+        let mut d = 0;
+        unsafe { cudaGetDevice(&mut d) };
+        d
+    }
+
+    pub fn device_count() -> i32 {
+        let mut n = 0;
+        unsafe { cudaGetDeviceCount(&mut n) };
+        n
+    }
+
     impl DeviceBuf {
         pub fn alloc(bytes: usize) -> Result<Self> {
             ensure_device();
             let mut ptr = std::ptr::null_mut();
             check_rt(unsafe { cudaMalloc(&mut ptr, bytes.max(1)) }, "cudaMalloc")?;
-            Ok(DeviceBuf { ptr, host: std::ptr::null_mut(), bytes })
+            Ok(DeviceBuf { ptr, host: std::ptr::null_mut(), bytes, dev: get_device() })
         }
 
-        /// Mapped pinned host memory; `ptr()` is device-visible.
+        /// Mapped pinned host memory; `ptr()` is device-visible. With UVA
+        /// (64-bit Linux) the pointer is valid on every device.
         pub fn alloc_pinned(bytes: usize) -> Result<Self> {
             ensure_device();
             const MAPPED: u32 = 2; // cudaHostAllocMapped
@@ -183,7 +207,7 @@ mod real {
             check_rt(unsafe { cudaHostAlloc(&mut host, bytes.max(1), MAPPED) }, "cudaHostAlloc")?;
             let mut dev = std::ptr::null_mut();
             check_rt(unsafe { cudaHostGetDevicePointer(&mut dev, host, 0) }, "cudaHostGetDevicePointer")?;
-            Ok(DeviceBuf { ptr: dev, host, bytes })
+            Ok(DeviceBuf { ptr: dev, host, bytes, dev: -1 })
         }
 
         pub fn from_bytes(data: &[u8]) -> Result<Self> {
@@ -274,7 +298,15 @@ mod real {
     impl Drop for DeviceBuf {
         fn drop(&mut self) {
             if self.host.is_null() {
+                // free with the owning device current, restore after
+                let cur = get_device();
+                if self.dev >= 0 && self.dev != cur {
+                    unsafe { cudaSetDevice(self.dev) };
+                }
                 unsafe { cudaFree(self.ptr) };
+                if self.dev >= 0 && self.dev != cur {
+                    unsafe { cudaSetDevice(cur) };
+                }
             } else {
                 unsafe { cudaFreeHost(self.host) };
             }
@@ -407,6 +439,19 @@ mod real {
     }
 
     const D2D: i32 = 3;
+    const MEMCPY_DEFAULT: i32 = 4; // UVA infers direction; works across devices
+
+    /// Copy between buffers on ANY pair of devices (or pinned host).
+    /// Blocking cudaMemcpy: legacy-stream ordered on the current device,
+    /// so issue it with the producer's device current and the consumer
+    /// device's later launches see the data.
+    pub fn copy_across(dst: &mut DeviceBuf, src: &DeviceBuf, bytes: usize) -> Result {
+        assert!(bytes <= dst.bytes() && bytes <= src.bytes());
+        check_rt(
+            unsafe { cudaMemcpy(dst.ptr_mut(), src.ptr(), bytes, MEMCPY_DEFAULT) },
+            "cudaMemcpy across",
+        )
+    }
 
     /// Device-to-device copy between buffers (byte offsets).
     pub fn copy_d2d(dst: &mut DeviceBuf, dst_off: usize, src: &DeviceBuf, src_off: usize, bytes: usize) -> Result {

@@ -218,20 +218,26 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
     if (lane == 0) out[row] = acc;
 }
 
-/* grow-only device scratch for activation prequant.
- * ponytail: single global, single-stream engine; pool it per-stream if
- * pulsar ever runs concurrent graphs. */
-static void *g_preq_scratch;
-static uint64_t g_preq_scratch_cap;
+/* grow-only PER-DEVICE scratch for activation prequant: matmuls run on
+ * whichever device is current (attn GPU vs expert GPU), and VRAM is only
+ * dereferenceable on its own device without P2P.
+ * ponytail: single scratch per device, single-stream engine; pool it
+ * per-stream if pulsar ever runs concurrent graphs. */
+#define PULSAR_MAX_DEVICES 16
+static void *g_preq_scratch[PULSAR_MAX_DEVICES];
+static uint64_t g_preq_scratch_cap[PULSAR_MAX_DEVICES];
 
 static void *preq_scratch(uint64_t bytes) {
-    if (bytes <= g_preq_scratch_cap) return g_preq_scratch;
-    if (g_preq_scratch) (void)cudaFree(g_preq_scratch);
-    g_preq_scratch = NULL;
-    g_preq_scratch_cap = 0;
-    if (!cuda_ok(cudaMalloc(&g_preq_scratch, bytes), "preq scratch alloc")) return NULL;
-    g_preq_scratch_cap = bytes;
-    return g_preq_scratch;
+    int dev = 0;
+    (void)cudaGetDevice(&dev);
+    if (dev < 0 || dev >= PULSAR_MAX_DEVICES) return NULL;
+    if (bytes <= g_preq_scratch_cap[dev]) return g_preq_scratch[dev];
+    if (g_preq_scratch[dev]) (void)cudaFree(g_preq_scratch[dev]);
+    g_preq_scratch[dev] = NULL;
+    g_preq_scratch_cap[dev] = 0;
+    if (!cuda_ok(cudaMalloc(&g_preq_scratch[dev], bytes), "preq scratch alloc")) return NULL;
+    g_preq_scratch_cap[dev] = bytes;
+    return g_preq_scratch[dev];
 }
 
 extern "C" int pulsar_q8_0_matmul(

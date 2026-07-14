@@ -235,6 +235,11 @@ mod real {
         output_norm: DeviceBuf,
         output: DeviceBuf,
         layers: Vec<LayerW>,
+        /// PULSAR_ATTN_GPU: second CUDA device holding ALL attn weights +
+        /// KV resident (Mla only). Attention weights are read every layer
+        /// every token, so residency is the one job a bandwidth-crippled
+        /// PCIe link can still do: only activations cross per layer.
+        pub attn_dev: Option<i32>,
     }
 
     /// v1 StreamingStore (DESIGN-expert-store.md): io_uring batch fetch of
@@ -697,22 +702,44 @@ mod real {
             let output_norm = upload(&file, &gguf, "output_norm.weight")?;
             let output = upload(&file, &gguf, "output.weight")?;
 
+            // PULSAR_ATTN_GPU: park the whole attn stack on a second GPU
+            // (Mla only; Gqa attn always fits beside the experts).
+            let primary = kernels::get_device();
+            let attn_dev = match shape.family {
+                Family::Mla => std::env::var("PULSAR_ATTN_GPU")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<i32>().ok())
+                    .filter(|&d| {
+                        let ok = d != primary && d >= 0 && d < kernels::device_count();
+                        if !ok {
+                            eprintln!("pulsar: ignoring PULSAR_ATTN_GPU={d} (primary is {primary}, {} devices)", kernels::device_count());
+                        }
+                        ok
+                    }),
+                Family::Gqa => None,
+            };
+            if let Some(d) = attn_dev {
+                eprintln!("pulsar: attn weights + KV resident on CUDA device {d}");
+            }
+
             // Mla: spend a VRAM budget on the two big per-layer attn
             // tensors (attn_output ~107MB, q_b ~36MB on GLM-5.2) - they are
             // 80%+ of the per-token pinned-host read traffic. Gqa attn is
-            // small enough to always live in VRAM.
-            let mut attn_vram_budget: i64 = match shape.family {
-                Family::Gqa => i64::MAX,
-                Family::Mla => {
-                    (std::env::var("PULSAR_ATTN_VRAM_GB")
-                        .ok()
-                        .and_then(|v| v.parse::<i64>().ok())
-                        .unwrap_or(6))
-                        << 30
-                }
+            // small enough to always live in VRAM. With a dedicated attn
+            // GPU the whole stack (~14GB q8) goes resident by default -
+            // pinned overflow would be read over that card's own link.
+            let env_budget = std::env::var("PULSAR_ATTN_VRAM_GB")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .map(|v| v << 30);
+            let mut attn_vram_budget: i64 = match (shape.family, attn_dev) {
+                (Family::Gqa, _) => i64::MAX,
+                (Family::Mla, Some(_)) => env_budget.unwrap_or(i64::MAX),
+                (Family::Mla, None) => env_budget.unwrap_or(6 << 30),
             };
-            // small Mla attn tensors always go pinned (not worth budget)
-            let mut no_budget: i64 = 0;
+            // small Mla attn tensors always go pinned (not worth budget) -
+            // except on a dedicated attn GPU, where everything is resident
+            let mut no_budget: i64 = if attn_dev.is_some() { i64::MAX } else { 0 };
 
             let mut layers = Vec::with_capacity(shape.n_exec_layer as usize);
             for il in 0..shape.n_exec_layer {
@@ -747,6 +774,9 @@ mod real {
                         down_exps: exps("ffn_down_exps.weight")?,
                     }
                 };
+                if let Some(d) = attn_dev {
+                    kernels::set_device(d)?;
+                }
                 let attn = match shape.family {
                     Family::Gqa => Attn::Gqa {
                         attn_q: upload_attn(&file, &gguf, &t("attn_q.weight"), &mut attn_vram_budget)?,
@@ -765,10 +795,14 @@ mod real {
                         v_b: upload_attn(&file, &gguf, &t("attn_v_b.weight"), &mut no_budget)?,
                     },
                 };
+                let attn_output = upload_attn(&file, &gguf, &t("attn_output.weight"), &mut attn_vram_budget)?;
+                if attn_dev.is_some() {
+                    kernels::set_device(primary)?;
+                }
                 layers.push(LayerW {
                     attn_norm: upload(&file, &gguf, &t("attn_norm.weight"))?,
                     attn,
-                    attn_output: upload_attn(&file, &gguf, &t("attn_output.weight"), &mut attn_vram_budget)?,
+                    attn_output,
                     ffn_norm: upload(&file, &gguf, &t("ffn_norm.weight"))?,
                     ffn,
                 });
@@ -781,6 +815,7 @@ mod real {
                 output_norm,
                 output,
                 layers,
+                attn_dev,
             })
         }
     }
@@ -826,23 +861,28 @@ mod real {
         /// Cumulative per-stage wall time (PULSAR_PROFILE=1 to print).
         pub prof: Prof,
         stages: Option<[AttnStage; 2]>,
-        // MLA scratch (dummies for Gqa)
+        // MLA scratch (dummies for Gqa); on the attn GPU when one is set
         q_rank: DeviceBuf,
         q_rank_norm: DeviceBuf,
         kv_raw: DeviceBuf,
         kv_norm: DeviceBuf,
         qk_low: DeviceBuf,
         mla_selected: DeviceBuf,
+        // attn-GPU hop buffers (1-float dummies otherwise): normed input
+        // copied primary->attn GPU, attn output copied back
+        normed_a: DeviceBuf,
+        attn_out_a: DeviceBuf,
     }
 
     impl State {
         pub fn new(m: &Model, ctx: u32) -> Result<State> {
             // Mla keeps ~12GB of pinned attn weights in RAM; leave the
-            // host expert cache smaller so the two fit in 30GB together
+            // host expert cache smaller so the two fit in 30GB together.
+            // With an attn GPU that RAM is free again - spend it on experts.
             let gb = std::env::var("PULSAR_CACHE_GB")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(12);
+                .unwrap_or(if m.attn_dev.is_some() { 22 } else { 12 });
             Self::with_cache(m, ctx, gb << 30)
         }
 
@@ -948,13 +988,6 @@ mod real {
                     ctx as usize * s.qk_rope as usize * 4,
                 ),
             };
-            let mut kcache = Vec::new();
-            let mut vcache = Vec::new();
-            for _ in 0..s.n_exec_layer {
-                kcache.push(DeviceBuf::alloc(k_bytes)?);
-                vcache.push(DeviceBuf::alloc(v_bytes)?);
-            }
-
             // batch prefill: activations sized for max_batch tokens; the
             // logits/lm-head path stays single-row (last token only)
             // big default: each prefill chunk costs roughly one pass over
@@ -965,6 +998,35 @@ mod real {
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(256)
                 .max(1);
+
+            // everything the attn segment touches lives on the attn GPU
+            // when one is set: KV, MLA scratch, q/heads, hop buffers
+            let primary = kernels::get_device();
+            if let Some(d) = m.attn_dev {
+                kernels::set_device(d)?;
+            }
+            let mut kcache = Vec::new();
+            let mut vcache = Vec::new();
+            for _ in 0..s.n_exec_layer {
+                kcache.push(DeviceBuf::alloc(k_bytes)?);
+                vcache.push(DeviceBuf::alloc(v_bytes)?);
+            }
+            let q = f32s(mb * s.n_head * s.head_dim.max(s.qk_dim()))?;
+            let heads = f32s(mb * s.heads_dim().max(s.n_head * s.head_dim))?;
+            let q_rank = f32s(mb * s.n_lora_q.max(1))?;
+            let q_rank_norm = f32s(mb * s.n_lora_q.max(1))?;
+            let kv_raw = f32s(mb * (s.n_kv_lora + s.qk_rope).max(1))?;
+            let kv_norm = f32s(mb * s.n_kv_lora.max(1))?;
+            let qk_low = f32s(mb * s.n_head * s.n_kv_lora.max(1))?;
+            let mla_selected = DeviceBuf::alloc(mb as usize * ctx as usize * 4)?;
+            let (normed_a, attn_out_a) = if m.attn_dev.is_some() {
+                (f32s(mb * s.n_embd)?, f32s(mb * s.n_embd)?)
+            } else {
+                (f32s(1)?, f32s(1)?)
+            };
+            if m.attn_dev.is_some() {
+                kernels::set_device(primary)?;
+            }
             let mut st = State {
                 ctx,
                 max_batch: mb,
@@ -972,10 +1034,10 @@ mod real {
                 last_row: f32s(s.n_embd)?,
                 cur: f32s(mb * s.n_embd)?,
                 normed: f32s(mb * s.n_embd)?,
-                q: f32s(mb * s.n_head * s.head_dim.max(s.qk_dim()))?,
+                q,
                 k: f32s(mb * s.n_head_kv * s.head_dim)?,
                 v: f32s(mb * s.n_head_kv * s.head_dim)?,
-                heads: f32s(mb * s.heads_dim().max(s.n_head * s.head_dim))?,
+                heads,
                 attn_out: f32s(mb * s.n_embd)?,
                 after_attn: f32s(mb * s.n_embd)?,
                 gate_act: f32s(mb * s.n_ff_dense.max(s.n_ff_exp))?,
@@ -1019,19 +1081,23 @@ mod real {
                 pred_selected: DeviceBuf::alloc(n_used * 4)?,
                 pred_weights: f32s(s.n_expert_used)?,
                 prof: Prof::default(),
+                // ping-pong staging exists to hide PINNED attn reads; with
+                // a dedicated attn GPU nothing is pinned, so no stages
                 stages: match s.family {
-                    Family::Mla => Some([
+                    Family::Mla if m.attn_dev.is_none() => Some([
                         AttnStage::new(&m.layers[0])?,
                         AttnStage::new(&m.layers[0])?,
                     ]),
-                    Family::Gqa => None,
+                    _ => None,
                 },
-                q_rank: f32s(mb * s.n_lora_q.max(1))?,
-                q_rank_norm: f32s(mb * s.n_lora_q.max(1))?,
-                kv_raw: f32s(mb * (s.n_kv_lora + s.qk_rope).max(1))?,
-                kv_norm: f32s(mb * s.n_kv_lora.max(1))?,
-                qk_low: f32s(mb * s.n_head * s.n_kv_lora.max(1))?,
-                mla_selected: DeviceBuf::alloc(mb as usize * ctx as usize * 4)?,
+                q_rank,
+                q_rank_norm,
+                kv_raw,
+                kv_norm,
+                qk_low,
+                mla_selected,
+                normed_a,
+                attn_out_a,
             };
             let t0 = std::time::Instant::now();
             let warmed = st.load_warm(m)?;
@@ -1077,6 +1143,7 @@ mod real {
                 return Err("position exceeds context".into());
             }
             let eps = s.rms_eps;
+            let primary = kernels::get_device();
             let toks_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
             st.tok.write(0, kernels::as_bytes(&toks_i32))?;
             kernels::embed_q8_0(&mut st.cur, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, n_tok)?;
@@ -1129,22 +1196,42 @@ mod real {
                             }
                         }
 
+                        // attn-GPU offload: hop the normed input over,
+                        // run the whole segment there. Blocking copies are
+                        // legacy-stream ordered on the issuing device, so
+                        // producer kernels have landed before they run.
+                        if let Some(d) = self.attn_dev {
+                            kernels::copy_across(&mut st.normed_a, &st.normed, (n_tok * s.n_embd) as usize * 4)?;
+                            kernels::set_device(d)?;
+                        }
+                        let xin = if self.attn_dev.is_some() { &st.normed_a } else { &st.normed };
+
                         let rope = s.rope_cfg();
                         let kv_raw_dim = s.n_kv_lora + s.qk_rope;
-                        kernels::matmul_q8_0(&mut st.q_rank, q_a_w, &st.normed, s.n_embd, s.n_lora_q, n_tok)?;
+                        kernels::matmul_q8_0(&mut st.q_rank, q_a_w, xin, s.n_embd, s.n_lora_q, n_tok)?;
                         kernels::rms_norm(&mut st.q_rank_norm, &st.q_rank, q_a_norm, s.n_lora_q, n_tok, eps)?;
                         kernels::matmul_q8_0(&mut st.q, q_b_w, &st.q_rank_norm, s.n_lora_q, s.n_head * s.qk_dim(), n_tok)?;
                         kernels::mla_rope_tail(&mut st.q, n_tok, s.n_head, s.qk_dim(), s.qk_rope, pos0, &rope)?;
-                        kernels::matmul_q8_0(&mut st.kv_raw, kv_a_w, &st.normed, s.n_embd, kv_raw_dim, n_tok)?;
+                        kernels::matmul_q8_0(&mut st.kv_raw, kv_a_w, xin, s.n_embd, kv_raw_dim, n_tok)?;
                         kernels::mla_kv_lora_rms_norm(&mut st.kv_norm, &st.kv_raw, kv_a_norm, n_tok, kv_raw_dim, s.n_kv_lora, eps)?;
                         kernels::mla_store_compact_kv(&mut st.kcache[il], &mut st.vcache[il], &st.kv_norm, &st.kv_raw, pos0, n_tok, st.ctx, kv_raw_dim, s.n_kv_lora, s.qk_rope)?;
                         let n_sel = pos0 + n_tok;
                         kernels::mla_fill_selected_range(&mut st.mla_selected, n_tok, pos0, n_sel, st.ctx)?;
                         kernels::mla_qk_lowrank(&mut st.qk_low, &st.q, k_b_w, n_tok, s.n_head, s.n_kv_lora, s.qk_nope, s.qk_dim())?;
                         kernels::mla_attention(&mut st.heads, &st.q, &st.qk_low, &st.kcache[il], &st.vcache[il], v_b_w, &st.mla_selected, n_tok, n_sel, st.ctx, s.n_head, s.n_kv_lora, s.qk_nope, s.qk_rope, s.value_mla, &rope)?;
+
+                        // output projection on the attn GPU, hop back,
+                        // restore the primary for the ffn/expert half
+                        if self.attn_dev.is_some() {
+                            kernels::matmul_q8_0(&mut st.attn_out_a, attn_output_w, &st.heads, s.heads_dim(), s.n_embd, n_tok)?;
+                            kernels::copy_across(&mut st.attn_out, &st.attn_out_a, (n_tok * s.n_embd) as usize * 4)?;
+                            kernels::set_device(primary)?;
+                        }
                     }
                 }
-                kernels::matmul_q8_0(&mut st.attn_out, attn_output_w, &st.heads, s.heads_dim(), s.n_embd, n_tok)?;
+                if self.attn_dev.is_none() {
+                    kernels::matmul_q8_0(&mut st.attn_out, attn_output_w, &st.heads, s.heads_dim(), s.n_embd, n_tok)?;
+                }
                 kernels::add(&mut st.after_attn, &st.cur, &st.attn_out, n_tok * s.n_embd)?;
 
                 // ffn
