@@ -48,6 +48,7 @@ mod real {
         fn cudaSetDevice(dev: i32) -> i32;
         fn cudaGetDevice(dev: *mut i32) -> i32;
         fn cudaGetDeviceCount(count: *mut i32) -> i32;
+        fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
         fn cudaDeviceGetAttribute(val: *mut i32, attr: i32, dev: i32) -> i32;
         fn cudaMalloc(ptr: *mut *mut c_void, bytes: usize) -> i32;
         fn cudaFree(ptr: *mut c_void) -> i32;
@@ -188,6 +189,17 @@ mod real {
         let mut n = 0;
         unsafe { cudaGetDeviceCount(&mut n) };
         n
+    }
+
+    /// (free, total) VRAM in bytes on `dev`. Restores the current device.
+    pub fn mem_info(dev: i32) -> Result<(usize, usize)> {
+        let cur = get_device();
+        set_device(dev)?;
+        let (mut free, mut total) = (0usize, 0usize);
+        let r = check_rt(unsafe { cudaMemGetInfo(&mut free, &mut total) }, "cudaMemGetInfo");
+        set_device(cur)?;
+        r?;
+        Ok((free, total))
     }
 
     impl DeviceBuf {

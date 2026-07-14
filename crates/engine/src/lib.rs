@@ -702,20 +702,74 @@ mod real {
             let output_norm = upload(&file, &gguf, "output_norm.weight")?;
             let output = upload(&file, &gguf, "output.weight")?;
 
-            // PULSAR_ATTN_GPU: park the whole attn stack on a second GPU
-            // (Mla only; Gqa attn always fits beside the experts).
+            // Attn placement: park the whole stack on a second GPU when
+            // one has room (Mla only; Gqa attn always fits beside the
+            // experts). Roles by capability: expert streaming needs link
+            // bandwidth (the primary, CUDA's fastest card), attn residency
+            // only needs capacity - a bandwidth-crippled slot still serves
+            // it at full speed, paying only once at load.
+            // PULSAR_ATTN_GPU=<idx> forces, =off disables auto-detection.
             let primary = kernels::get_device();
             let attn_dev = match shape.family {
-                Family::Mla => std::env::var("PULSAR_ATTN_GPU")
-                    .ok()
-                    .and_then(|v| v.trim().parse::<i32>().ok())
-                    .filter(|&d| {
+                Family::Mla => match std::env::var("PULSAR_ATTN_GPU").ok().as_deref() {
+                    Some("off") | Some("-1") => None,
+                    Some(v) => v.trim().parse::<i32>().ok().filter(|&d| {
                         let ok = d != primary && d >= 0 && d < kernels::device_count();
                         if !ok {
                             eprintln!("pulsar: ignoring PULSAR_ATTN_GPU={d} (primary is {primary}, {} devices)", kernels::device_count());
                         }
                         ok
                     }),
+                    None => {
+                        // auto: largest-free secondary that fits the stack
+                        let mut need = 0u64;
+                        for il in 0..shape.n_exec_layer {
+                            for suf in [
+                                "attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight",
+                                "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight",
+                                "attn_k_b.weight", "attn_v_b.weight", "attn_output.weight",
+                            ] {
+                                if let Some(ti) = gguf.tensor(&format!("blk.{il}.{suf}")) {
+                                    need += ti.byte_size().unwrap_or(0);
+                                }
+                            }
+                        }
+                        // reserve: compact KV at ctx 4096 (both caches span
+                        // n_kv_lora + qk_rope) + scratch/hop buffers + CUDA
+                        // context overhead. Pinned overflow would be read
+                        // over the attn card's own link, so it must FIT.
+                        let kv = shape.n_exec_layer as u64
+                            * 4096
+                            * (shape.n_kv_lora + shape.qk_rope) as u64
+                            * 4;
+                        need += kv + (1 << 30);
+                        let mut best: Option<(usize, i32)> = None;
+                        for d in 0..kernels::device_count() {
+                            if d == primary {
+                                continue;
+                            }
+                            if let Ok((free, _)) = kernels::mem_info(d) {
+                                if free as u64 >= need && best.is_none_or(|(bf, _)| free > bf) {
+                                    best = Some((free, d));
+                                } else if (free as u64) < need {
+                                    eprintln!(
+                                        "pulsar: CUDA device {d} skipped for attn ({:.1}GB free < {:.1}GB needed)",
+                                        free as f64 / 1e9,
+                                        need as f64 / 1e9
+                                    );
+                                }
+                            }
+                        }
+                        best.map(|(free, d)| {
+                            eprintln!(
+                                "pulsar: auto-detected attn GPU: CUDA device {d} ({:.1}GB free, attn stack needs {:.1}GB)",
+                                free as f64 / 1e9,
+                                need as f64 / 1e9
+                            );
+                            d
+                        })
+                    }
+                },
                 Family::Gqa => None,
             };
             if let Some(d) = attn_dev {
