@@ -63,6 +63,23 @@ determinism on a fixed code path (`--decode-consistency`, below).
 - ~16GB system RAM for the host-side expert cache (more helps; the cache
   budget is the single biggest knob after the disk)
 
+## Get a model
+
+Pulsar runs ds4-recipe ggufs (mixed precision: ~2-bit routed experts,
+q8 attention). Two are published and known-good:
+
+```sh
+# Hy3 295B - 85GB, the friendlier starting point
+curl -L -C - -o Hy3-ds4-IQ2XXS-AttnQ8.gguf \
+  "https://huggingface.co/giannisan/Hy3-ds4-gguf/resolve/main/Hy3-ds4-IQ2XXS-AttnQ8.gguf"
+
+# GLM-5.2 743B - 197GB, needs a second 16GB GPU for the attention stack
+curl -L -C - -o GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf \
+  "https://huggingface.co/antirez/GLM-5.2-GGUF/resolve/main/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf"
+```
+
+Put the file on your fastest NVMe - decode speed is read speed.
+
 ## Quick start
 
 ```sh
