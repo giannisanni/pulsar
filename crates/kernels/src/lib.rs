@@ -45,6 +45,9 @@ mod real {
     const D2H: i32 = 2;
 
     extern "C" {
+        fn cudaSetDevice(dev: i32) -> i32;
+        fn cudaGetDeviceCount(count: *mut i32) -> i32;
+        fn cudaDeviceGetAttribute(val: *mut i32, attr: i32, dev: i32) -> i32;
         fn cudaMalloc(ptr: *mut *mut c_void, bytes: usize) -> i32;
         fn cudaFree(ptr: *mut c_void) -> i32;
         fn cudaHostAlloc(ptr: *mut *mut c_void, bytes: usize, flags: u32) -> i32;
@@ -124,8 +127,49 @@ mod real {
 
     unsafe impl Send for DeviceBuf {}
 
+    const ATTR_CC_MAJOR: i32 = 75;
+    const ATTR_CC_MINOR: i32 = 76;
+
+    /// Pick the GPU once, before the first allocation.
+    ///
+    /// CUDA's default device is index 0 under its own "fastest first" ordering,
+    /// which is NOT PCI bus order and does not agree with nvidia-smi. On a mixed
+    /// box it can hand us the wrong card: substrate ranks an Ada 4060 Ti ahead of
+    /// a Blackwell 5060 Ti, and the 4060 Ti sits on a PCIe x1 link (0.8 GB/s vs
+    /// 28.8 GB/s). Expert streaming is H2D-bound, so accepting the default costs
+    /// ~36x. Choose the highest compute capability; PULSAR_GPU overrides with a
+    /// CUDA device index.
+    fn ensure_device() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let pick = std::env::var("PULSAR_GPU").ok().and_then(|s| s.trim().parse::<i32>().ok());
+            let dev = pick.unwrap_or_else(|| {
+                let mut n = 0;
+                if unsafe { cudaGetDeviceCount(&mut n) } != 0 || n <= 1 {
+                    return 0;
+                }
+                let cc = |d: i32| -> i32 {
+                    let (mut maj, mut min) = (0, 0);
+                    unsafe {
+                        cudaDeviceGetAttribute(&mut maj, ATTR_CC_MAJOR, d);
+                        cudaDeviceGetAttribute(&mut min, ATTR_CC_MINOR, d);
+                    }
+                    maj * 10 + min
+                };
+                (0..n).max_by_key(|&d| (cc(d), -d)).unwrap_or(0)
+            });
+            if unsafe { cudaSetDevice(dev) } != 0 {
+                eprintln!("pulsar: cudaSetDevice({dev}) failed, falling back to CUDA default");
+            } else if std::env::var_os("PULSAR_QUIET").is_none() {
+                eprintln!("pulsar: using CUDA device {dev}");
+            }
+        });
+    }
+
     impl DeviceBuf {
         pub fn alloc(bytes: usize) -> Result<Self> {
+            ensure_device();
             let mut ptr = std::ptr::null_mut();
             check_rt(unsafe { cudaMalloc(&mut ptr, bytes.max(1)) }, "cudaMalloc")?;
             Ok(DeviceBuf { ptr, host: std::ptr::null_mut(), bytes })
@@ -133,6 +177,7 @@ mod real {
 
         /// Mapped pinned host memory; `ptr()` is device-visible.
         pub fn alloc_pinned(bytes: usize) -> Result<Self> {
+            ensure_device();
             const MAPPED: u32 = 2; // cudaHostAllocMapped
             let mut host = std::ptr::null_mut();
             check_rt(unsafe { cudaHostAlloc(&mut host, bytes.max(1), MAPPED) }, "cudaHostAlloc")?;
@@ -250,6 +295,7 @@ mod real {
     }
 
     pub fn pinned_alloc(bytes: usize) -> *mut u8 {
+        ensure_device();
         if let Some(ptr) = pinned_pool()
             .lock()
             .unwrap()
@@ -312,6 +358,7 @@ mod real {
 
     impl CopyStream {
         pub fn new() -> Result<CopyStream> {
+            ensure_device();
             const NON_BLOCKING: u32 = 1;
             const DISABLE_TIMING: u32 = 2;
             let mut stream = std::ptr::null_mut();
