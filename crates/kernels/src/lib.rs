@@ -60,6 +60,7 @@ mod real {
         fn cudaFreeHost(ptr: *mut c_void) -> i32;
         fn cudaHostGetDevicePointer(dev: *mut *mut c_void, host: *mut c_void, flags: u32) -> i32;
         fn cudaMemcpy(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32) -> i32;
+        fn cudaMemset(ptr: *mut c_void, value: i32, bytes: usize) -> i32;
         fn cudaDeviceSynchronize() -> i32;
 
         fn pulsar_embed_q8_0(out: *mut c_void, w: *const c_void, tokens: *const c_void, n_embd: u32, n_vocab: u32, n_tok: u32) -> i32;
@@ -78,6 +79,9 @@ mod real {
         fn pulsar_quantize_q8_K(out: *mut c_void, x: *const c_void, in_dim: u32, n_rows: u32) -> i32;
         fn pulsar_moe_pair_swiglu(mid: *mut c_void, ptrs: *const c_void, weights: *const c_void, x: *const c_void, in_dim: u32, mid_dim: u32, n_used: u32, n_tok: u32, row_bytes: u64, quant: u32) -> i32;
         fn pulsar_moe_down(out: *mut c_void, ptrs: *const c_void, mid: *const c_void, mid_dim: u32, out_dim: u32, n_used: u32, n_tok: u32, row_bytes: u64, quant: u32) -> i32;
+        fn pulsar_moe_pair_swiglu_grouped(mid: *mut c_void, gptrs: *const c_void, starts: *const c_void, pairs: *const c_void, weights: *const c_void, xq: *const c_void, in_dim: u32, mid_dim: u32, n_used: u32, n_group: u32, row_bytes: u64, quant: u32) -> i32;
+        fn pulsar_moe_down_grouped(partial: *mut c_void, gptrs: *const c_void, starts: *const c_void, pairs: *const c_void, midq: *const c_void, mid_dim: u32, out_dim: u32, n_used: u32, n_group: u32, row_bytes: u64, quant: u32) -> i32;
+        fn pulsar_moe_slot_sum(out: *mut c_void, partial: *const c_void, out_dim: u32, n_used: u32, n_tok: u32) -> i32;
         fn pulsar_gqa_head_rms_norm(x: *mut c_void, w: *const c_void, rows: u32, head_dim: u32, eps: f32) -> i32;
         fn pulsar_gqa_rope(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, pos0: u32, theta: f32) -> i32;
         fn pulsar_gqa_kv_append(cache: *mut c_void, kv: *const c_void, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32) -> i32;
@@ -648,6 +652,24 @@ mod real {
 
     pub fn swiglu(out: &mut DeviceBuf, gate: &DeviceBuf, up: &DeviceBuf, n: u32, clamp: f32, weight: f32) -> Result {
         check(unsafe { pulsar_swiglu(out.ptr_mut(), gate.ptr(), up.ptr(), n, clamp, weight) }, "swiglu")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_pair_swiglu_grouped(mid: &mut DeviceBuf, gptrs: &DeviceBuf, starts: &DeviceBuf, pairs: &DeviceBuf, weights: &DeviceBuf, xq: &DeviceBuf, in_dim: u32, mid_dim: u32, n_used: u32, n_group: u32, row_bytes: u64, quant: u32) -> Result {
+        check(unsafe { pulsar_moe_pair_swiglu_grouped(mid.ptr_mut(), gptrs.ptr(), starts.ptr(), pairs.ptr(), weights.ptr(), xq.ptr(), in_dim, mid_dim, n_used, n_group, row_bytes, quant) }, "moe_pair_swiglu_grouped")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_grouped(partial: &mut DeviceBuf, gptrs: &DeviceBuf, starts: &DeviceBuf, pairs: &DeviceBuf, midq: &DeviceBuf, mid_dim: u32, out_dim: u32, n_used: u32, n_group: u32, row_bytes: u64, quant: u32) -> Result {
+        check(unsafe { pulsar_moe_down_grouped(partial.ptr_mut(), gptrs.ptr(), starts.ptr(), pairs.ptr(), midq.ptr(), mid_dim, out_dim, n_used, n_group, row_bytes, quant) }, "moe_down_grouped")
+    }
+
+    pub fn zero(buf: &mut DeviceBuf, bytes: usize) -> Result {
+        check_rt(unsafe { cudaMemset(buf.ptr_mut(), 0, bytes) }, "cudaMemset")
+    }
+
+    pub fn moe_slot_sum(out: &mut DeviceBuf, partial: &DeviceBuf, out_dim: u32, n_used: u32, n_tok: u32) -> Result {
+        check(unsafe { pulsar_moe_slot_sum(out.ptr_mut(), partial.ptr(), out_dim, n_used, n_tok) }, "moe_slot_sum")
     }
 
     pub fn add(out: &mut DeviceBuf, a: &DeviceBuf, b: &DeviceBuf, n: u32) -> Result {

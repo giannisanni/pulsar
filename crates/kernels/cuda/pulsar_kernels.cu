@@ -1102,6 +1102,202 @@ enum {
     PULSAR_QUANT_Q3_K = 5,
 };
 
+/* ---- grouped batch MoE: amortize weight reads across the prefill batch.
+ * The plain kernels re-read each expert row once per (token, slot); in a
+ * 256-token chunk an expert typically serves ~10 tokens, so rows are read
+ * ~10x. Here tokens are grouped by expert (CSR: starts[], pairs[] packing
+ * token*256+slot), each block stages its weight rows in shared memory
+ * ONCE, and all of the group's tokens dot against the staged copy. Same
+ * DOT templates, so every quant format inherits it. Down partials land in
+ * mid-layout [token][slot][out_dim] and a deterministic slot-sum follows
+ * (no atomics: prefill logits stay reproducible). */
+
+#define PULSAR_GROUP_SMEM 49152 /* dynamic smem default ceiling */
+
+template <typename DOT>
+__global__ static void moe_pair_swiglu_grouped_kernel(
+        float *mid,                     /* [n_tok][n_used][mid_dim] */
+        const pulsar_expert_ptrs *gptrs, /* [n_group] */
+        const uint32_t *starts,          /* [n_group+1] */
+        const uint32_t *pairs,           /* token*16+slot (n_used <= 16) */
+        const float *weights,            /* [n_tok][n_used] */
+        const block_q8_K *xq,            /* [n_tok][in_blocks] */
+        uint32_t in_blocks,
+        uint32_t mid_dim,
+        uint32_t n_used,
+        uint64_t row_bytes) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t row = blockIdx.x * blockDim.y + threadIdx.y;
+    const uint32_t group = blockIdx.y;
+    const pulsar_expert_ptrs p = gptrs[group];
+    if (!p.gate || !p.up) return;
+    extern __shared__ char smem[];
+    char *gate_s = smem + (uint64_t)threadIdx.y * 2u * row_bytes;
+    char *up_s = gate_s + row_bytes;
+    if (row < mid_dim) {
+        const char *gate_g = (const char *)p.gate + (uint64_t)row * row_bytes;
+        const char *up_g = (const char *)p.up + (uint64_t)row * row_bytes;
+        for (uint32_t b = lane; b < row_bytes; b += 32u) {
+            gate_s[b] = gate_g[b];
+            up_s[b] = up_g[b];
+        }
+    }
+    __syncwarp();
+    if (row >= mid_dim) return;
+    const uint32_t s0 = starts[group], s1 = starts[group + 1];
+    for (uint32_t i = s0; i < s1; i++) {
+        const uint32_t pr = pairs[i];
+        const uint32_t token = pr >> 4;
+        const uint32_t slot = pr & 0x0fu;
+        const block_q8_K *txq = xq + (uint64_t)token * in_blocks;
+        float ag = 0.0f, au = 0.0f;
+        for (uint32_t b = lane; b < in_blocks; b += 32u) {
+            ag += DOT::block(gate_s, txq, b);
+            au += DOT::block(up_s, txq, b);
+        }
+        #pragma unroll
+        for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
+            ag += __shfl_xor_sync(0xffffffffu, ag, mask);
+            au += __shfl_xor_sync(0xffffffffu, au, mask);
+        }
+        if (lane == 0) {
+            const float sw = ag / (1.0f + expf(-ag));
+            mid[((uint64_t)token * n_used + slot) * mid_dim + row] =
+                sw * au * weights[(uint64_t)token * n_used + slot];
+        }
+    }
+}
+
+template <typename DOT>
+__global__ static void moe_down_grouped_kernel(
+        float *partial,                  /* [n_tok][n_used][out_dim] */
+        const pulsar_expert_ptrs *gptrs,
+        const uint32_t *starts,
+        const uint32_t *pairs,
+        const block_q8_K *midq,          /* [n_tok][n_used][mid_blocks] */
+        uint32_t mid_blocks,
+        uint32_t out_dim,
+        uint32_t n_used,
+        uint64_t row_bytes) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t row = blockIdx.x * blockDim.y + threadIdx.y;
+    const uint32_t group = blockIdx.y;
+    const pulsar_expert_ptrs p = gptrs[group];
+    if (!p.down) return;
+    extern __shared__ char smem[];
+    char *down_s = smem + (uint64_t)threadIdx.y * row_bytes;
+    if (row < out_dim) {
+        const char *down_g = (const char *)p.down + (uint64_t)row * row_bytes;
+        for (uint32_t b = lane; b < row_bytes; b += 32u) {
+            down_s[b] = down_g[b];
+        }
+    }
+    __syncwarp();
+    if (row >= out_dim) return;
+    const uint32_t s0 = starts[group], s1 = starts[group + 1];
+    for (uint32_t i = s0; i < s1; i++) {
+        const uint32_t pr = pairs[i];
+        const uint32_t token = pr >> 4;
+        const uint32_t slot = pr & 0x0fu;
+        const block_q8_K *smq = midq + ((uint64_t)token * n_used + slot) * mid_blocks;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < mid_blocks; b += 32u) {
+            acc += DOT::block(down_s, smq, b);
+        }
+        #pragma unroll
+        for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
+            acc += __shfl_xor_sync(0xffffffffu, acc, mask);
+        }
+        if (lane == 0) {
+            partial[((uint64_t)token * n_used + slot) * out_dim + row] = acc;
+        }
+    }
+}
+
+/* deterministic slot reduce: out[t][r] = sum_s partial[t][s][r]; slots
+ * with NULL down never wrote - engine zeroes partial for those first */
+__global__ static void moe_slot_sum_kernel(
+        float *out, const float *partial, uint32_t out_dim, uint32_t n_used,
+        uint32_t n_tok) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t total = (uint64_t)n_tok * out_dim;
+    if (gid >= total) return;
+    const uint32_t token = (uint32_t)(gid / out_dim);
+    const uint32_t row = (uint32_t)(gid - (uint64_t)token * out_dim);
+    float acc = 0.0f;
+    for (uint32_t s = 0; s < n_used; s++) {
+        acc += partial[((uint64_t)token * n_used + s) * out_dim + row];
+    }
+    out[gid] = acc;
+}
+
+#define PULSAR_GROUPED_DISPATCH(kern, ...)                                    \
+    do {                                                                      \
+        switch (quant) {                                                      \
+        case PULSAR_QUANT_Q2_K:    kern<dot_q2_K><<<grid, block, shmem>>>(__VA_ARGS__); break; \
+        case PULSAR_QUANT_IQ2_XXS: kern<dot_iq2_xxs><<<grid, block, shmem>>>(__VA_ARGS__); break; \
+        case PULSAR_QUANT_Q3_K:    kern<dot_q3_K><<<grid, block, shmem>>>(__VA_ARGS__); break; \
+        case PULSAR_QUANT_Q4_K:    kern<dot_q4_K><<<grid, block, shmem>>>(__VA_ARGS__); break; \
+        case PULSAR_QUANT_Q5_K:    kern<dot_q5_K><<<grid, block, shmem>>>(__VA_ARGS__); break; \
+        case PULSAR_QUANT_Q6_K:    kern<dot_q6_K><<<grid, block, shmem>>>(__VA_ARGS__); break; \
+        default: return 0;                                                    \
+        }                                                                     \
+    } while (0)
+
+extern "C" int pulsar_moe_pair_swiglu_grouped(
+        void *mid_dev, const void *gptrs_dev, const void *starts_dev,
+        const void *pairs_dev, const void *weights_dev, const void *xq_dev,
+        uint32_t in_dim, uint32_t mid_dim, uint32_t n_used, uint32_t n_group,
+        uint64_t row_bytes, uint32_t quant) {
+    if (in_dim == 0 || in_dim % PULSAR_QK_K != 0 || mid_dim == 0 ||
+        n_used == 0 || n_group == 0 || row_bytes == 0 ||
+        2u * row_bytes * 4u > PULSAR_GROUP_SMEM) {
+        return 0;
+    }
+    const uint32_t in_blocks = in_dim / PULSAR_QK_K;
+    dim3 block(32, 4, 1);
+    dim3 grid((mid_dim + 3u) / 4u, n_group, 1);
+    const uint32_t shmem = 2u * (uint32_t)row_bytes * 4u;
+    PULSAR_GROUPED_DISPATCH(moe_pair_swiglu_grouped_kernel,
+            (float *)mid_dev, (const pulsar_expert_ptrs *)gptrs_dev,
+            (const uint32_t *)starts_dev, (const uint32_t *)pairs_dev,
+            (const float *)weights_dev, (const block_q8_K *)xq_dev,
+            in_blocks, mid_dim, n_used, row_bytes);
+    return cuda_ok(cudaGetLastError(), "moe pair swiglu grouped launch");
+}
+
+extern "C" int pulsar_moe_down_grouped(
+        void *partial_dev, const void *gptrs_dev, const void *starts_dev,
+        const void *pairs_dev, const void *midq_dev,
+        uint32_t mid_dim, uint32_t out_dim, uint32_t n_used, uint32_t n_group,
+        uint64_t row_bytes, uint32_t quant) {
+    if (mid_dim == 0 || mid_dim % PULSAR_QK_K != 0 || out_dim == 0 ||
+        n_used == 0 || n_group == 0 || row_bytes == 0 ||
+        row_bytes * 4u > PULSAR_GROUP_SMEM) {
+        return 0;
+    }
+    const uint32_t mid_blocks = mid_dim / PULSAR_QK_K;
+    dim3 block(32, 4, 1);
+    dim3 grid((out_dim + 3u) / 4u, n_group, 1);
+    const uint32_t shmem = (uint32_t)row_bytes * 4u;
+    PULSAR_GROUPED_DISPATCH(moe_down_grouped_kernel,
+            (float *)partial_dev, (const pulsar_expert_ptrs *)gptrs_dev,
+            (const uint32_t *)starts_dev, (const uint32_t *)pairs_dev,
+            (const block_q8_K *)midq_dev, mid_blocks, out_dim, n_used,
+            row_bytes);
+    return cuda_ok(cudaGetLastError(), "moe down grouped launch");
+}
+
+extern "C" int pulsar_moe_slot_sum(
+        void *out_dev, const void *partial_dev, uint32_t out_dim,
+        uint32_t n_used, uint32_t n_tok) {
+    if (out_dim == 0 || n_used == 0 || n_tok == 0) return 0;
+    const uint64_t total = (uint64_t)n_tok * out_dim;
+    moe_slot_sum_kernel<<<(uint32_t)((total + 255u) / 256u), 256>>>(
+            (float *)out_dev, (const float *)partial_dev, out_dim, n_used, n_tok);
+    return cuda_ok(cudaGetLastError(), "moe slot sum launch");
+}
+
 /* Dense matmul over a K-quant weight matrix vs q8_K activations - the
  * lm-head of K-quant ggufs (AngelSlim Q4_K_M keeps output.weight q6_K).
  * Same warp-per-row shape as moe_down, single weight matrix. */

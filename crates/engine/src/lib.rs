@@ -1472,6 +1472,11 @@ mod real {
         // buffer their partial outputs are gathered into
         pub tiers: Vec<ExpertTier>,
         tier_ret: DeviceBuf,
+        // grouped batch-MoE scratch (grow-only; prefill chunks only)
+        grp_ptrs: DeviceBuf,
+        grp_starts: DeviceBuf,
+        grp_pairs: DeviceBuf,
+        grp_partial: DeviceBuf,
         // MTP scratch (1-float dummies without PULSAR_MTP=1): the draft
         // block's input pipeline + the last real token's hidden state
         mtp_e_raw: DeviceBuf,
@@ -1792,6 +1797,10 @@ mod real {
                 attn_out_a,
                 tier_ret: if tiers.is_empty() { f32s(1)? } else { f32s(mb * s.n_embd)? },
                 tiers,
+                grp_ptrs: DeviceBuf::alloc(s.n_expert.max(1) as usize * std::mem::size_of::<ExpertPtrs>())?,
+                grp_starts: DeviceBuf::alloc((s.n_expert as usize + 1) * 4)?,
+                grp_pairs: DeviceBuf::alloc(mb as usize * n_used * 4)?,
+                grp_partial: f32s(1)?, // grows on first grouped prefill
                 mtp_e_raw: f32s(if m.mtp.is_some() { mb * s.n_embd } else { 1 })?,
                 mtp_e: f32s(if m.mtp.is_some() { mb * s.n_embd } else { 1 })?,
                 mtp_h: f32s(if m.mtp.is_some() { mb * s.n_embd } else { 1 })?,
@@ -2346,6 +2355,51 @@ mod real {
                             });
                         }
                         st.expert_ptrs.write(0, kernels::as_bytes(&ptrs))?;
+
+                        // grouped batch MoE (prefill): CSR of tokens per
+                        // expert so each weight row is staged in shared
+                        // memory once instead of re-read per token
+                        let smem_ok = 2 * gate_exps.row_bytes.max(up_exps.row_bytes) * 4 <= 49152
+                            && down_exps.row_bytes * 4 <= 49152;
+                        let grouped = n_tok >= 16 && s.n_expert_used <= 16 && smem_ok
+                            && std::env::var_os("PULSAR_NO_GROUPED").is_none();
+                        let mut n_group = 0u32;
+                        if grouped {
+                            let mut gid: std::collections::HashMap<*const std::ffi::c_void, u32> =
+                                std::collections::HashMap::new();
+                            let mut gptrs: Vec<ExpertPtrs> = Vec::new();
+                            let mut members: Vec<Vec<u32>> = Vec::new();
+                            for (si, p) in ptrs.iter().enumerate() {
+                                if p.gate.is_null() {
+                                    continue;
+                                }
+                                let g = *gid.entry(p.gate).or_insert_with(|| {
+                                    gptrs.push(*p);
+                                    members.push(Vec::new());
+                                    (gptrs.len() - 1) as u32
+                                });
+                                let token = (si / s.n_expert_used as usize) as u32;
+                                let slot = (si % s.n_expert_used as usize) as u32;
+                                members[g as usize].push((token << 4) | slot);
+                            }
+                            n_group = gptrs.len() as u32;
+                            if n_group > 0 {
+                                let mut starts = Vec::with_capacity(n_group as usize + 1);
+                                let mut pairs = Vec::with_capacity(n_tok as usize * s.n_expert_used as usize);
+                                starts.push(0u32);
+                                for m in &members {
+                                    pairs.extend_from_slice(m);
+                                    starts.push(pairs.len() as u32);
+                                }
+                                st.grp_ptrs.write(0, kernels::as_bytes(&gptrs))?;
+                                st.grp_starts.write(0, kernels::as_bytes(&starts))?;
+                                st.grp_pairs.write(0, kernels::as_bytes(&pairs))?;
+                                let need = n_tok as usize * s.n_expert_used as usize * s.n_embd as usize * 4;
+                                if st.grp_partial.bytes() < need {
+                                    st.grp_partial = DeviceBuf::alloc(need)?;
+                                }
+                            }
+                        }
                         st.prof.resolve += t_resolve.elapsed();
                         st.prof.calls += 1;
 
@@ -2378,15 +2432,31 @@ mod real {
 
                         // routed experts: activations quantized to q8_K,
                         // integer dp4a dots (ds4's exact math)
-                        kernels::moe_pair_swiglu(
-                            &mut st.moe_mid, &st.expert_ptrs, &st.router_weights, &st.xq,
-                            s.n_embd, s.n_ff_exp, s.n_expert_used, n_tok, gate_exps.row_bytes, gate_exps.quant,
-                        )?;
-                        kernels::quantize_q8_k(&mut st.midq, &st.moe_mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
-                        kernels::moe_down(
-                            &mut st.moe_out, &st.expert_ptrs, &st.midq,
-                            s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
-                        )?;
+                        if grouped && n_group > 0 {
+                            kernels::moe_pair_swiglu_grouped(
+                                &mut st.moe_mid, &st.grp_ptrs, &st.grp_starts, &st.grp_pairs,
+                                &st.router_weights, &st.xq,
+                                s.n_embd, s.n_ff_exp, s.n_expert_used, n_group, gate_exps.row_bytes, gate_exps.quant,
+                            )?;
+                            kernels::quantize_q8_k(&mut st.midq, &st.moe_mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
+                            let pbytes = n_tok as usize * s.n_expert_used as usize * s.n_embd as usize * 4;
+                            kernels::zero(&mut st.grp_partial, pbytes)?;
+                            kernels::moe_down_grouped(
+                                &mut st.grp_partial, &st.grp_ptrs, &st.grp_starts, &st.grp_pairs, &st.midq,
+                                s.n_ff_exp, s.n_embd, s.n_expert_used, n_group, down_exps.row_bytes, down_exps.quant,
+                            )?;
+                            kernels::moe_slot_sum(&mut st.moe_out, &st.grp_partial, s.n_embd, s.n_expert_used, n_tok)?;
+                        } else {
+                            kernels::moe_pair_swiglu(
+                                &mut st.moe_mid, &st.expert_ptrs, &st.router_weights, &st.xq,
+                                s.n_embd, s.n_ff_exp, s.n_expert_used, n_tok, gate_exps.row_bytes, gate_exps.quant,
+                            )?;
+                            kernels::quantize_q8_k(&mut st.midq, &st.moe_mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
+                            kernels::moe_down(
+                                &mut st.moe_out, &st.expert_ptrs, &st.midq,
+                                s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
+                            )?;
+                        }
 
                         // gather tier partials (blocking copy issued on the
                         // tier's device = ordered after its kernels).
