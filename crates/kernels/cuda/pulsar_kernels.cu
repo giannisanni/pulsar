@@ -1666,32 +1666,102 @@ __device__ __forceinline__ static void mma_s8_16x8x16(
 }
 #endif
 
-/* unpack 16 elements (chunk c of a 256-superblock) of one iq2_xxs row
- * into int8[16] + one float scale */
-__device__ __forceinline__ static void unpack16_iq2_xxs(
-        const char *block, uint32_t c, int32_t out[4], float *scale) {
-    const block_iq2_xxs *x = (const block_iq2_xxs *)block;
-    const uint16_t *q2 = x->qs + (c >> 1) * 4u;
-    const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
-    const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
-    const uint32_t h = c & 1u;
-    dev_iq2_i8x8_lut(cuda_iq2xxs_grid, cuda_ksigns_iq2xs,
-                     (uint8_t)((aux0 >> (16u * h)) & 0xffu),
-                     (aux1 >> (14u * h)) & 127u, &out[0], &out[1]);
-    dev_iq2_i8x8_lut(cuda_iq2xxs_grid, cuda_ksigns_iq2xs,
-                     (uint8_t)((aux0 >> (16u * h + 8u)) & 0xffu),
-                     (aux1 >> (14u * h + 7u)) & 127u, &out[2], &out[3]);
-    const float ls = (float)(2u * (aux1 >> 28) + 1u);
-    *scale = 0.125f * f16_to_f32(x->d) * ls;
-}
+/* unpacker functors: 16 elements (chunk c of a 256-superblock) of one
+ * row into int8[16] + one float scale. SB_BYTES = the superblock's byte
+ * footprint in the row. Formats with per-superblock minima (q2_K, q4_K,
+ * q5_K, q5_1) need a bsum term the harness doesn't carry yet. */
+struct unpack_iq2_xxs {
+    static const uint32_t SB_BYTES = sizeof(block_iq2_xxs);
+    __device__ __forceinline__ static void chunk16(
+            const char *block, uint32_t c, int32_t out[4], float *scale) {
+        const block_iq2_xxs *x = (const block_iq2_xxs *)block;
+        const uint16_t *q2 = x->qs + (c >> 1) * 4u;
+        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+        const uint32_t h = c & 1u;
+        dev_iq2_i8x8_lut(cuda_iq2xxs_grid, cuda_ksigns_iq2xs,
+                         (uint8_t)((aux0 >> (16u * h)) & 0xffu),
+                         (aux1 >> (14u * h)) & 127u, &out[0], &out[1]);
+        dev_iq2_i8x8_lut(cuda_iq2xxs_grid, cuda_ksigns_iq2xs,
+                         (uint8_t)((aux0 >> (16u * h + 8u)) & 0xffu),
+                         (aux1 >> (14u * h + 7u)) & 127u, &out[2], &out[3]);
+        const float ls = (float)(2u * (aux1 >> 28) + 1u);
+        *scale = 0.125f * f16_to_f32(x->d) * ls;
+    }
+};
+
+struct unpack_iq2_xs {
+    static const uint32_t SB_BYTES = sizeof(block_iq2_xs);
+    __device__ __forceinline__ static void chunk16(
+            const char *block, uint32_t c, int32_t out[4], float *scale) {
+        const block_iq2_xs *x = (const block_iq2_xs *)block;
+        const uint32_t g = c >> 1;
+        const uint32_t h = c & 1u;
+        #pragma unroll
+        for (uint32_t j = 0; j < 2; j++) {
+            const uint16_t q = x->qs[g * 4u + h * 2u + j];
+            const uint64_t gr = cuda_iq2xs_grid[q & 511u];
+            const uint32_t sgn = dev_unpack_iq2_signs(cuda_ksigns_iq2xs[q >> 9]);
+            const int32_t sm0 = __vcmpne4(sgn & 0x08040201u, 0);
+            const int32_t sm1 = __vcmpne4(sgn & 0x80402010u, 0);
+            out[j * 2u] = __vsub4((int32_t)(uint32_t)gr ^ sm0, sm0);
+            out[j * 2u + 1u] = __vsub4((int32_t)(uint32_t)(gr >> 32) ^ sm1, sm1);
+        }
+        const float ls = (float)(2u * ((x->scales[g] >> (4u * h)) & 0x0fu) + 1u);
+        *scale = 0.125f * f16_to_f32(x->d) * ls;
+    }
+};
+
+struct unpack_iq3_xxs {
+    static const uint32_t SB_BYTES = sizeof(block_iq3_xxs);
+    __device__ __forceinline__ static void chunk16(
+            const char *block, uint32_t c, int32_t out[4], float *scale) {
+        const block_iq3_xxs *x = (const block_iq3_xxs *)block;
+        const uint32_t g = c >> 1;
+        const uint32_t h = c & 1u;
+        uint32_t aux;
+        memcpy(&aux, x->qs + 64u + 4u * g, 4u);
+        #pragma unroll
+        for (uint32_t j = 0; j < 2; j++) {
+            const uint32_t sj = h * 2u + j; /* sub-group of 8 within g */
+            const uint32_t sgn = dev_unpack_iq2_signs(
+                    cuda_ksigns_iq2xs[(aux >> (7u * sj)) & 127u]);
+            const int32_t sm0 = __vcmpne4(sgn & 0x08040201u, 0);
+            const int32_t sm1 = __vcmpne4(sgn & 0x80402010u, 0);
+            uint32_t g0, g1;
+            memcpy(&g0, &cuda_iq3xxs_grid[x->qs[g * 8u + sj * 2u]], 4u);
+            memcpy(&g1, &cuda_iq3xxs_grid[x->qs[g * 8u + sj * 2u + 1u]], 4u);
+            out[j * 2u] = __vsub4((int32_t)g0 ^ sm0, sm0);
+            out[j * 2u + 1u] = __vsub4((int32_t)g1 ^ sm1, sm1);
+        }
+        *scale = f16_to_f32(x->d) * (0.5f + (float)(aux >> 28)) * 0.5f;
+    }
+};
+
+struct unpack_q4_0 {
+    static const uint32_t SB_BYTES = 8u * sizeof(block_q4_0);
+    __device__ __forceinline__ static void chunk16(
+            const char *block, uint32_t c, int32_t out[4], float *scale) {
+        const block_q4_0 *x = (const block_q4_0 *)block + (c >> 1);
+        const uint32_t shift = (c & 1u) * 4u; /* low / high nibbles */
+        #pragma unroll
+        for (uint32_t j = 0; j < 4; j++) {
+            uint32_t v;
+            memcpy(&v, x->qs + j * 4u, 4u);
+            /* (nib - 8) per byte lane */
+            out[j] = __vsub4((int32_t)((v >> shift) & 0x0f0f0f0fu), 0x08080808);
+        }
+        *scale = f16_to_f32(x->d);
+    }
+};
 
 #define PULSAR_MMA_TPW 4u /* token tiles per warp: 8 warps x 4 x 8 = 256 */
 
 /* One block: 16 weight rows of one expert group vs all its tokens.
  * kind 0 = pair (gate+up staged interleaved, swiglu+route-weight at the
  * end), kind 1 = down (midq activations, partial write for slot-sum). */
-template <int KIND>
-__global__ static void moe_grouped_mma_iq2xxs_kernel(
+template <int KIND, typename UNPACK>
+__global__ static void moe_grouped_mma_kernel(
         float *out,                      /* pair: mid / down: partial */
         const pulsar_expert_ptrs *gptrs,
         const uint32_t *starts,
@@ -1746,9 +1816,9 @@ __global__ static void moe_grouped_mma_iq2xxs_kernel(
                     int32_t w4[4] = {0, 0, 0, 0};
                     float sc = 0.0f;
                     if (r0 + r < n_rows) {
-                        unpack16_iq2_xxs(base + (uint64_t)(r0 + r) * row_bytes
-                                                 + (uint64_t)sb * sizeof(block_iq2_xxs),
-                                         c, w4, &sc);
+                        UNPACK::chunk16(base + (uint64_t)(r0 + r) * row_bytes
+                                                + (uint64_t)sb * UNPACK::SB_BYTES,
+                                        c, w4, &sc);
                     }
                     *(int4 *)&a_s[pl][r][c * 16u] = *(const int4 *)w4;
                     s_w[pl][r][c] = sc;
@@ -1879,15 +1949,24 @@ extern "C" int pulsar_moe_pair_swiglu_grouped(
         return 0;
     }
     const uint32_t in_blocks = in_dim / PULSAR_QK_K;
-    if (quant == PULSAR_QUANT_IQ2_XXS && pulsar_device_cc_major() >= 8 &&
-        !getenv("PULSAR_NO_MMA")) {
+    if (pulsar_device_cc_major() >= 8 && !getenv("PULSAR_NO_MMA")) {
         dim3 mgrid((mid_dim + 15u) / 16u, n_group, 1);
-        moe_grouped_mma_iq2xxs_kernel<0><<<mgrid, 256>>>(
-                (float *)mid_dev, (const pulsar_expert_ptrs *)gptrs_dev,
-                (const uint32_t *)starts_dev, (const uint32_t *)pairs_dev,
-                (const float *)weights_dev, xq_dev,
-                in_blocks, mid_dim, n_used, row_bytes, act_op);
-        return cuda_ok(cudaGetLastError(), "moe pair mma launch");
+        switch (quant) {
+#define PULSAR_MMA_PAIR(Q, U)                                                  \
+        case Q:                                                                \
+            moe_grouped_mma_kernel<0, U><<<mgrid, 256>>>(                      \
+                    (float *)mid_dev, (const pulsar_expert_ptrs *)gptrs_dev,   \
+                    (const uint32_t *)starts_dev, (const uint32_t *)pairs_dev, \
+                    (const float *)weights_dev, xq_dev,                        \
+                    in_blocks, mid_dim, n_used, row_bytes, act_op);            \
+            return cuda_ok(cudaGetLastError(), "moe pair mma launch")
+        PULSAR_MMA_PAIR(PULSAR_QUANT_IQ2_XXS, unpack_iq2_xxs);
+        PULSAR_MMA_PAIR(PULSAR_QUANT_IQ2_XS, unpack_iq2_xs);
+        PULSAR_MMA_PAIR(PULSAR_QUANT_IQ3_XXS, unpack_iq3_xxs);
+        PULSAR_MMA_PAIR(PULSAR_QUANT_Q4_0, unpack_q4_0);
+#undef PULSAR_MMA_PAIR
+        default: break;
+        }
     }
     dim3 block(32, 4, 1);
     dim3 grid((mid_dim + 3u) / 4u, n_group, 1);
@@ -1913,14 +1992,24 @@ extern "C" int pulsar_moe_down_grouped(
         return 0;
     }
     const uint32_t mid_blocks = mid_dim / PULSAR_QK_K;
-    if (quant == PULSAR_QUANT_IQ2_XXS && pulsar_device_cc_major() >= 8 &&
-        !getenv("PULSAR_NO_MMA")) {
+    if (pulsar_device_cc_major() >= 8 && !getenv("PULSAR_NO_MMA") &&
+        mid_dim % PULSAR_QK_K == 0) {
         dim3 mgrid((out_dim + 15u) / 16u, n_group, 1);
-        moe_grouped_mma_iq2xxs_kernel<1><<<mgrid, 256>>>(
-                (float *)partial_dev, (const pulsar_expert_ptrs *)gptrs_dev,
-                (const uint32_t *)starts_dev, (const uint32_t *)pairs_dev,
-                NULL, midq_dev, mid_blocks, out_dim, n_used, row_bytes, 0);
-        return cuda_ok(cudaGetLastError(), "moe down mma launch");
+        switch (quant) {
+#define PULSAR_MMA_DOWN(Q, U)                                                  \
+        case Q:                                                                \
+            moe_grouped_mma_kernel<1, U><<<mgrid, 256>>>(                      \
+                    (float *)partial_dev, (const pulsar_expert_ptrs *)gptrs_dev, \
+                    (const uint32_t *)starts_dev, (const uint32_t *)pairs_dev, \
+                    NULL, midq_dev, mid_blocks, out_dim, n_used, row_bytes, 0); \
+            return cuda_ok(cudaGetLastError(), "moe down mma launch")
+        PULSAR_MMA_DOWN(PULSAR_QUANT_IQ2_XXS, unpack_iq2_xxs);
+        PULSAR_MMA_DOWN(PULSAR_QUANT_IQ2_XS, unpack_iq2_xs);
+        PULSAR_MMA_DOWN(PULSAR_QUANT_IQ3_XXS, unpack_iq3_xxs);
+        PULSAR_MMA_DOWN(PULSAR_QUANT_Q4_0, unpack_q4_0);
+#undef PULSAR_MMA_DOWN
+        default: break;
+        }
     }
     dim3 block(32, 4, 1);
     dim3 grid((out_dim + 3u) / 4u, n_group, 1);
