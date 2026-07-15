@@ -281,30 +281,34 @@ static void gqa_ref_attention(float *out, const float *q,
                               const float *kc, const float *vc,
                               uint32_t n_tok, uint32_t n_head,
                               uint32_t n_kv_head, uint32_t hd,
-                              uint32_t cap, uint32_t pos0) {
-    float scale = 1.0f / sqrtf((float)hd);
+                              uint32_t cap, uint32_t pos0,
+                              float scale, uint32_t window,
+                              const float *rel, uint32_t rel_ext) {
     uint32_t group = n_head / n_kv_head;
     float *scores = (float *)malloc((size_t)(pos0 + n_tok) * sizeof(float));
     for (uint32_t t = 0; t < n_tok; t++)
     for (uint32_t h = 0; h < n_head; h++) {
         uint32_t kvh = h / group;
         uint32_t n_rows = pos0 + t + 1u;
+        uint32_t row0 = (window != 0u && n_rows > window) ? n_rows - window : 0u;
         const float *qh = q + ((uint64_t)t * n_head + h) * hd;
         const float *kh = kc + (uint64_t)kvh * cap * hd;
         const float *vh = vc + (uint64_t)kvh * cap * hd;
+        const float *rr = rel ? rel + ((uint64_t)t * n_head + h) * rel_ext : NULL;
         float m = -INFINITY;
-        for (uint32_t r = 0; r < n_rows; r++) {
+        for (uint32_t r = row0; r < n_rows; r++) {
             float dot = 0.0f;
             for (uint32_t d = 0; d < hd; d++) dot += qh[d] * kh[(uint64_t)r * hd + d];
             scores[r] = dot * scale;
+            if (rr && (pos0 + t) - r < rel_ext) scores[r] += rr[(pos0 + t) - r];
             if (scores[r] > m) m = scores[r];
         }
         float den = 0.0f;
-        for (uint32_t r = 0; r < n_rows; r++) den += expf(scores[r] - m);
+        for (uint32_t r = row0; r < n_rows; r++) den += expf(scores[r] - m);
         float *oh = out + ((uint64_t)t * n_head + h) * hd;
         for (uint32_t d = 0; d < hd; d++) {
             float acc = 0.0f;
-            for (uint32_t r = 0; r < n_rows; r++) {
+            for (uint32_t r = row0; r < n_rows; r++) {
                 acc += expf(scores[r] - m) / den * vh[(uint64_t)r * hd + d];
             }
             oh[d] = acc;
@@ -391,7 +395,8 @@ extern "C" int ds4_gpu_gqa_selftest(void) {
             ref_vc[((uint64_t)h * cap + pos0 + t) * hd + d] = v[((uint64_t)t * n_kv_head + h) * hd + d];
         }
         float *ref_out = (float *)malloc(q_elems * sizeof(float));
-        gqa_ref_attention(ref_out, q, ref_kc, ref_vc, n_tok, n_head, n_kv_head, hd, cap, pos0);
+        gqa_ref_attention(ref_out, q, ref_kc, ref_vc, n_tok, n_head, n_kv_head, hd, cap, pos0,
+                          1.0f / sqrtf((float)hd), 0u, NULL, 0u);
 
         /* kernel pipeline */
         int ok = ds4_gpu_gqa_head_rms_norm_weight(g_q, g_qnw, n_tok * n_head, hd, eps) &&
@@ -414,6 +419,62 @@ extern "C" int ds4_gpu_gqa_selftest(void) {
         free(q); free(k); free(v); free(ref_out); free(gpu_out);
         ds4_gpu_tensor_free(g_q); ds4_gpu_tensor_free(g_k);
         ds4_gpu_tensor_free(g_v); ds4_gpu_tensor_free(g_out);
+    }
+
+    /* Phase 5 (inkling): rel-pos bias + sliding window over the populated
+     * 215-row cache. rel_ext 64 < visible rows, so the out-of-band zero
+     * path and the window clamp both execute; muP 1/head_dim scale. */
+    {
+        const uint32_t n_tok = 3, pos0 = 215, rel_ext = 64, window = 96;
+        const float scale = 1.0f / (float)hd;
+        uint64_t q_elems = (uint64_t)n_tok * n_head * hd;
+        uint64_t kv_elems = (uint64_t)n_tok * n_kv_head * hd;
+        uint64_t rel_elems = (uint64_t)n_tok * n_head * rel_ext;
+        float *q = (float *)malloc(q_elems * sizeof(float));
+        float *k = (float *)malloc(kv_elems * sizeof(float));
+        float *v = (float *)malloc(kv_elems * sizeof(float));
+        float *rel = (float *)malloc(rel_elems * sizeof(float));
+        for (uint64_t i = 0; i < q_elems; i++) q[i] = gqa_test_randf();
+        for (uint64_t i = 0; i < kv_elems; i++) { k[i] = gqa_test_randf(); v[i] = gqa_test_randf(); }
+        for (uint64_t i = 0; i < rel_elems; i++) rel[i] = gqa_test_randf() * 2.0f;
+
+        ds4_gpu_tensor *g_q = ds4_gpu_tensor_alloc(q_elems * sizeof(float));
+        ds4_gpu_tensor *g_k = ds4_gpu_tensor_alloc(kv_elems * sizeof(float));
+        ds4_gpu_tensor *g_v = ds4_gpu_tensor_alloc(kv_elems * sizeof(float));
+        ds4_gpu_tensor *g_rel = ds4_gpu_tensor_alloc(rel_elems * sizeof(float));
+        ds4_gpu_tensor *g_out = ds4_gpu_tensor_alloc(q_elems * sizeof(float));
+        ds4_gpu_tensor_write(g_q, 0, q, q_elems * sizeof(float));
+        ds4_gpu_tensor_write(g_k, 0, k, kv_elems * sizeof(float));
+        ds4_gpu_tensor_write(g_v, 0, v, kv_elems * sizeof(float));
+        ds4_gpu_tensor_write(g_rel, 0, rel, rel_elems * sizeof(float));
+
+        /* no norm/rope: inkling feeds pre-normed, unrotated q/k */
+        for (uint32_t t = 0; t < n_tok; t++)
+        for (uint32_t h = 0; h < n_kv_head; h++)
+        for (uint32_t d = 0; d < hd; d++) {
+            ref_kc[((uint64_t)h * cap + pos0 + t) * hd + d] = k[((uint64_t)t * n_kv_head + h) * hd + d];
+            ref_vc[((uint64_t)h * cap + pos0 + t) * hd + d] = v[((uint64_t)t * n_kv_head + h) * hd + d];
+        }
+        float *ref_out = (float *)malloc(q_elems * sizeof(float));
+        gqa_ref_attention(ref_out, q, ref_kc, ref_vc, n_tok, n_head, n_kv_head, hd, cap, pos0,
+                          scale, window, rel, rel_ext);
+
+        int ok = ds4_gpu_gqa_kv_cache_append(g_kc, g_k, n_tok, n_kv_head, hd, cap, pos0) &&
+                 ds4_gpu_gqa_kv_cache_append(g_vc, g_v, n_tok, n_kv_head, hd, cap, pos0) &&
+                 ds4_gpu_gqa_attention(g_out, g_q, g_kc, g_vc, n_tok, n_head, n_kv_head, hd, cap, pos0,
+                                       scale, window, g_rel, rel_ext) &&
+                 cuda_ok(cudaDeviceSynchronize(), "gqa rel selftest sync");
+        float *gpu_out = (float *)malloc(q_elems * sizeof(float));
+        if (ok) ok = ds4_gpu_tensor_read(g_out, 0, gpu_out, q_elems * sizeof(float)) != 0;
+        float diff = ok ? gqa_max_abs_diff(ref_out, gpu_out, q_elems) : INFINITY;
+        int pass = ok && diff < 2e-4f;
+        fprintf(stderr, "gqa-selftest phase 5 rel+window (n_tok=%u pos0=%u ext=%u win=%u): %s (max diff %.2e)\n",
+                n_tok, pos0, rel_ext, window, pass ? "PASS" : "FAIL", diff);
+        if (!pass) all_ok = 0;
+
+        free(q); free(k); free(v); free(rel); free(ref_out); free(gpu_out);
+        ds4_gpu_tensor_free(g_q); ds4_gpu_tensor_free(g_k); ds4_gpu_tensor_free(g_v);
+        ds4_gpu_tensor_free(g_rel); ds4_gpu_tensor_free(g_out);
     }
 
     free(qn_w); free(kn_w); free(ref_kc); free(ref_vc);
