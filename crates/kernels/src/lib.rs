@@ -48,6 +48,7 @@ mod real {
     pub const QUANT_IQ3_XXS: u32 = 7;
     pub const QUANT_Q4_0: u32 = 8;
     pub const QUANT_Q5_1: u32 = 9;
+    pub const QUANT_Q8_0: u32 = 10;
 
     const H2D: i32 = 1;
     const D2H: i32 = 2;

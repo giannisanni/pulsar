@@ -1347,6 +1347,30 @@ __device__ static float dev_dot_q5_1_q8_K_block(const char *row, const block_q8_
     return y->d * sumf;
 }
 
+/* q8_0 (Gemma 4 down_exps): eight 32-element blocks per q8_K super-block.
+ * values are already int8 - no nibble unpack, no offset, no minima - just
+ * dp4a and scale by the block's f16 d. (weight qs is 2-byte aligned, so
+ * memcpy the 4-byte word like q4_0; the q8_K side is 4-aligned.) */
+__device__ static float dev_dot_q8_0_q8_K_block(const char *row, const block_q8_K *y) {
+    const q8_0_block *xb = (const q8_0_block *)row;
+    const int8_t *q8 = y->qs;
+    float sumf = 0.0f;
+    for (int b = 0; b < 8; b++) {
+        const q8_0_block *x = xb + b;
+        int sumi = 0;
+        #pragma unroll
+        for (int i = 0; i < 32; i += 4) {
+            int32_t wv;
+            memcpy(&wv, x->q + i, 4);
+            sumi = __dp4a(wv, *(const int32_t *)(q8 + b * 32 + i), sumi);
+        }
+        /* tail guard (see q5_1): zero-quantized activation block dots to 0;
+         * skipping keeps overread garbage f16 scales from minting NaNs */
+        if (sumi != 0) sumf += f16_to_f32(x->scale_f16) * (float)sumi;
+    }
+    return y->d * sumf;
+}
+
 /* per-block dot functors for the templated MoE kernels */
 struct dot_iq2_xxs {
     __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b) {
@@ -1382,6 +1406,13 @@ struct dot_q4_0 {
 struct dot_q5_1 {
     __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b) {
         return dev_dot_q5_1_q8_K_block(row + (uint64_t)b * 8u * sizeof(block_q5_1), xq + b);
+    }
+};
+
+struct dot_q8_0 {
+    __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b) {
+        /* 8 q8_0 blocks per 256-element q8_K block */
+        return dev_dot_q8_0_q8_K_block(row + (uint64_t)b * 8u * sizeof(q8_0_block), xq + b);
     }
 };
 
@@ -1512,6 +1543,7 @@ enum {
     PULSAR_QUANT_IQ3_XXS = 7,
     PULSAR_QUANT_Q4_0 = 8,
     PULSAR_QUANT_Q5_1 = 9,
+    PULSAR_QUANT_Q8_0 = 10,
 };
 
 /* ---- grouped batch MoE: amortize weight reads across the prefill batch.
@@ -1934,6 +1966,7 @@ __global__ static void moe_grouped_mma_kernel(
         case PULSAR_QUANT_IQ3_XXS: kern<dot_iq3_xxs><<<grid, block, shmem>>>(__VA_ARGS__); break; \
         case PULSAR_QUANT_Q4_0:    kern<dot_q4_0><<<grid, block, shmem>>>(__VA_ARGS__); break; \
         case PULSAR_QUANT_Q5_1:    kern<dot_q5_1><<<grid, block, shmem>>>(__VA_ARGS__); break; \
+        case PULSAR_QUANT_Q8_0:    kern<dot_q8_0><<<grid, block, shmem>>>(__VA_ARGS__); break; \
         default: return 0;                                                    \
         }                                                                     \
     } while (0)
@@ -2181,6 +2214,12 @@ extern "C" int pulsar_moe_pair_swiglu(
                 (const float *)weights_dev, (const block_q8_K *)xq_dev,
                 in_blocks, mid_dim, n_used, n_tok, row_bytes, act_op);
         break;
+    case PULSAR_QUANT_Q8_0:
+        moe_pair_swiglu_kernel<dot_q8_0><<<grid, block>>>(
+                (float *)mid_dev, (const pulsar_expert_ptrs *)ptrs_dev,
+                (const float *)weights_dev, (const block_q8_K *)xq_dev,
+                in_blocks, mid_dim, n_used, n_tok, row_bytes, act_op);
+        break;
     default:
         return 0;
     }
@@ -2264,6 +2303,12 @@ extern "C" int pulsar_moe_down(
         break;
     case PULSAR_QUANT_Q5_1:
         moe_down_kernel<dot_q5_1><<<grid, block>>>(
+                (float *)out_dev, (const pulsar_expert_ptrs *)ptrs_dev,
+                (const block_q8_K *)midq_dev, mid_blocks, out_dim, n_used,
+                n_tok, row_bytes);
+        break;
+    case PULSAR_QUANT_Q8_0:
+        moe_down_kernel<dot_q8_0><<<grid, block>>>(
                 (float *)out_dev, (const pulsar_expert_ptrs *)ptrs_dev,
                 (const block_q8_K *)midq_dev, mid_blocks, out_dim, n_used,
                 n_tok, row_bytes);
@@ -2459,6 +2504,20 @@ static float host_dot_q4_0_block(const char *row, const block_q8_K *xq, uint32_t
     return y->d * sumf;
 }
 
+static float host_dot_q8_0_block(const char *row, const block_q8_K *xq, uint32_t bi) {
+    const q8_0_block *xb = (const q8_0_block *)(row + (uint64_t)bi * 8u * sizeof(q8_0_block));
+    const block_q8_K *y = xq + bi;
+    const int8_t *q8 = y->qs;
+    float sumf = 0.0f;
+    for (int b = 0; b < 8; b++) {
+        const q8_0_block *x = xb + b;
+        int sumi = 0;
+        for (int i = 0; i < 32; i++) sumi += (int)x->q[i] * (int)q8[b * 32 + i];
+        if (sumi != 0) sumf += f16_to_f32_host(x->scale_f16) * (float)sumi;
+    }
+    return y->d * sumf;
+}
+
 static float host_dot_q3_K_block(const char *row, const block_q8_K *xq, uint32_t bi) {
     const block_q3_K *x = (const block_q3_K *)row + bi;
     const block_q8_K *y = xq + bi;
@@ -2644,6 +2703,14 @@ static void fill_slab(char *slab, uint32_t n_rows, uint32_t n_el,
                 }
                 break;
             }
+            case PULSAR_QUANT_Q8_0: {
+                if (blk == 0) {
+                    q8_0_block *q = (q8_0_block *)row;
+                    for (uint32_t k = 0; k < n_el / 32u; k++)
+                        q[k].scale_f16 = f32_to_f16_bits(fabsf(gqa_test_randf()) * 0.05f + 0.001f);
+                }
+                break;
+            }
             case PULSAR_QUANT_Q3_K: {
                 block_q3_K *q = (block_q3_K *)row + blk;
                 q->d = dv;
@@ -2740,6 +2807,7 @@ static int moe_selftest_one2(uint32_t quant, const char *name, uint32_t mid_dim)
     case PULSAR_QUANT_IQ3_XXS: block_bytes = sizeof(block_iq3_xxs); dot = host_dot_iq3_xxs_block; break;
     case PULSAR_QUANT_Q4_0:   block_bytes = 8 * sizeof(block_q4_0); dot = host_dot_q4_0_block;   break;
     case PULSAR_QUANT_Q5_1:   block_bytes = 8 * sizeof(block_q5_1); dot = host_dot_q5_1_block;   break;
+    case PULSAR_QUANT_Q8_0:   block_bytes = 8 * sizeof(q8_0_block); dot = host_dot_q8_0_block;   break;
     case PULSAR_QUANT_Q4_K:   block_bytes = sizeof(block_q4_K);    dot = host_dot_q4_K_block;    break;
     case PULSAR_QUANT_Q5_K:   block_bytes = sizeof(block_q5_K);    dot = host_dot_q5_K_block;    break;
     case PULSAR_QUANT_Q6_K:   block_bytes = sizeof(block_q6_K);    dot = host_dot_q6_K_block;    break;
@@ -2747,7 +2815,8 @@ static int moe_selftest_one2(uint32_t quant, const char *name, uint32_t mid_dim)
     }
     /* sub-block quants (q4_0/q5_1) pack rows exactly (22 blocks for 704),
      * not per-superblock - mirror the real gguf row layout */
-    const int subblock = quant == PULSAR_QUANT_Q4_0 || quant == PULSAR_QUANT_Q5_1;
+    const int subblock = quant == PULSAR_QUANT_Q4_0 || quant == PULSAR_QUANT_Q5_1 ||
+                         quant == PULSAR_QUANT_Q8_0;
     const uint64_t pair_row_bytes = (uint64_t)in_blocks * block_bytes;
     const uint64_t down_row_bytes = subblock
             ? (uint64_t)(mid_dim / 32) * (block_bytes / 8)
@@ -3002,8 +3071,10 @@ extern "C" int pulsar_moe_selftest(void) {
            moe_selftest_one(PULSAR_QUANT_IQ3_XXS, "iq3_xxs") &&
            moe_selftest_one(PULSAR_QUANT_Q4_0, "q4_0") &&
            moe_selftest_one(PULSAR_QUANT_Q5_1, "q5_1") &&
+           moe_selftest_one(PULSAR_QUANT_Q8_0, "q8_0") &&
            /* gemma4 shape: 704-wide experts, ceil-superblock tail */
-           moe_selftest_one2(PULSAR_QUANT_Q5_1, "q5_1-704", 704);
+           moe_selftest_one2(PULSAR_QUANT_Q5_1, "q5_1-704", 704) &&
+           moe_selftest_one2(PULSAR_QUANT_Q8_0, "q8_0-704", 704);
 }
 
 /* ---- forward-graph glue: rms-norm, f32 matmul, swiglu, add, embed ------
