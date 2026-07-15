@@ -1644,6 +1644,213 @@ __global__ static void moe_slot_sum_kernel(
     out[gid] = acc;
 }
 
+/* ---- mmq-style tensor-core MoE (sm_80+, phase 3) -----------------------
+ * The grouped CSR already amortizes weight traffic across a prefill
+ * chunk's tokens; here it also amortizes DEQUANT: each block unpacks one
+ * superblock of its 16 weight rows to int8 in shared memory (plus a
+ * per-16-chunk float scale), then every token tile consumes the unpacked
+ * copy through mma.m16n8k16 s8s8s32, rescaling per chunk in registers
+ * via the documented PTX fragment mapping. k=16 chunks make ONE uniform
+ * inner loop legal for every quant format - per-format code is only the
+ * 16-element unpacker. v1 formats: iq2_xxs (Hy3/GLM routed experts). */
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+__device__ __forceinline__ static void mma_s8_16x8x16(
+        int32_t d[4], const int32_t a[2], const int32_t b) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%8,%9,%10};"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(b),
+          "r"(0), "r"(0), "r"(0), "r"(0));
+}
+#endif
+
+/* unpack 16 elements (chunk c of a 256-superblock) of one iq2_xxs row
+ * into int8[16] + one float scale */
+__device__ __forceinline__ static void unpack16_iq2_xxs(
+        const char *block, uint32_t c, int32_t out[4], float *scale) {
+    const block_iq2_xxs *x = (const block_iq2_xxs *)block;
+    const uint16_t *q2 = x->qs + (c >> 1) * 4u;
+    const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+    const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+    const uint32_t h = c & 1u;
+    dev_iq2_i8x8_lut(cuda_iq2xxs_grid, cuda_ksigns_iq2xs,
+                     (uint8_t)((aux0 >> (16u * h)) & 0xffu),
+                     (aux1 >> (14u * h)) & 127u, &out[0], &out[1]);
+    dev_iq2_i8x8_lut(cuda_iq2xxs_grid, cuda_ksigns_iq2xs,
+                     (uint8_t)((aux0 >> (16u * h + 8u)) & 0xffu),
+                     (aux1 >> (14u * h + 7u)) & 127u, &out[2], &out[3]);
+    const float ls = (float)(2u * (aux1 >> 28) + 1u);
+    *scale = 0.125f * f16_to_f32(x->d) * ls;
+}
+
+#define PULSAR_MMA_TPW 4u /* token tiles per warp: 8 warps x 4 x 8 = 256 */
+
+/* One block: 16 weight rows of one expert group vs all its tokens.
+ * kind 0 = pair (gate+up staged interleaved, swiglu+route-weight at the
+ * end), kind 1 = down (midq activations, partial write for slot-sum). */
+template <int KIND>
+__global__ static void moe_grouped_mma_iq2xxs_kernel(
+        float *out,                      /* pair: mid / down: partial */
+        const pulsar_expert_ptrs *gptrs,
+        const uint32_t *starts,
+        const uint32_t *pairs,
+        const float *weights,            /* [n_tok][n_used] (pair only) */
+        const void *actq,                /* block_q8_K rows */
+        uint32_t n_blocks,               /* superblocks along k */
+        uint32_t n_rows,                 /* mid_dim (pair) / out_dim (down) */
+        uint32_t n_used,
+        uint64_t row_bytes,
+        uint32_t act_op) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const uint32_t group = blockIdx.y;
+    const uint32_t r0 = blockIdx.x * 16u;
+    const pulsar_expert_ptrs p = gptrs[group];
+    if (KIND == 0 ? (!p.gate || !p.up) : !p.down) return;
+    const uint32_t s0 = starts[group];
+    const uint32_t len = starts[group + 1] - s0;
+    if (len == 0 || r0 >= n_rows) return;
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t g = lane >> 2u;
+    const uint32_t tg = lane & 3u;
+
+    /* A rows for this block's tile, gate and up as two planes */
+    __shared__ int8_t a_s[2][16][256];
+    __shared__ float s_w[2][16][16];
+    const uint32_t planes = KIND == 0 ? 2u : 1u;
+
+    const uint32_t n_tiles = (len + 7u) / 8u;
+    const uint32_t tiles_per_round = 8u * PULSAR_MMA_TPW;
+
+    for (uint32_t round = 0; round * tiles_per_round < n_tiles; round++) {
+        float accg[PULSAR_MMA_TPW][4];
+        float accu[PULSAR_MMA_TPW][4];
+        #pragma unroll
+        for (uint32_t t = 0; t < PULSAR_MMA_TPW; t++) {
+            #pragma unroll
+            for (uint32_t i = 0; i < 4; i++) { accg[t][i] = 0.0f; accu[t][i] = 0.0f; }
+        }
+
+        for (uint32_t sb = 0; sb < n_blocks; sb++) {
+            __syncthreads();
+            /* 256 threads unpack 16 rows x 16 chunks per plane */
+            {
+                const uint32_t r = threadIdx.x >> 4u;
+                const uint32_t c = threadIdx.x & 15u;
+                for (uint32_t pl = 0; pl < planes; pl++) {
+                    const char *base = (const char *)(KIND == 0
+                            ? (pl == 0 ? p.gate : p.up) : p.down);
+                    int32_t w4[4] = {0, 0, 0, 0};
+                    float sc = 0.0f;
+                    if (r0 + r < n_rows) {
+                        unpack16_iq2_xxs(base + (uint64_t)(r0 + r) * row_bytes
+                                                 + (uint64_t)sb * sizeof(block_iq2_xxs),
+                                         c, w4, &sc);
+                    }
+                    *(int4 *)&a_s[pl][r][c * 16u] = *(const int4 *)w4;
+                    s_w[pl][r][c] = sc;
+                }
+            }
+            __syncthreads();
+
+            for (uint32_t t = 0; t < PULSAR_MMA_TPW; t++) {
+                const uint32_t tile = round * tiles_per_round + warp * PULSAR_MMA_TPW + t;
+                if (tile >= n_tiles) break;
+                /* lane j < 8 holds pair j of the tile; shfl distributes */
+                uint32_t pr_own = 0xffffffffu;
+                if (lane < 8u && tile * 8u + lane < len) {
+                    pr_own = pairs[s0 + tile * 8u + lane];
+                }
+                const uint32_t pr_b = __shfl_sync(0xffffffffu, pr_own, (int)g);
+                const uint32_t pr_c0 = __shfl_sync(0xffffffffu, pr_own, (int)(tg * 2u));
+                const uint32_t pr_c1 = __shfl_sync(0xffffffffu, pr_own, (int)(tg * 2u + 1u));
+                /* activation row: pair kernel reads token rows, down reads
+                 * (token*n_used + slot) mid rows */
+                const uint32_t arow_b = KIND == 0 ? (pr_b >> 4) : (pr_b >> 4) * n_used + (pr_b & 15u);
+                const uint32_t arow_c0 = KIND == 0 ? (pr_c0 >> 4) : (pr_c0 >> 4) * n_used + (pr_c0 & 15u);
+                const uint32_t arow_c1 = KIND == 0 ? (pr_c1 >> 4) : (pr_c1 >> 4) * n_used + (pr_c1 & 15u);
+                const char *yb = pr_b != 0xffffffffu
+                        ? (const char *)actq + ((uint64_t)arow_b * n_blocks + sb) * sizeof(block_q8_K)
+                        : NULL;
+                const float d0 = pr_c0 != 0xffffffffu
+                        ? ((const block_q8_K *)((const char *)actq + ((uint64_t)arow_c0 * n_blocks + sb) * sizeof(block_q8_K)))->d
+                        : 0.0f;
+                const float d1 = pr_c1 != 0xffffffffu
+                        ? ((const block_q8_K *)((const char *)actq + ((uint64_t)arow_c1 * n_blocks + sb) * sizeof(block_q8_K)))->d
+                        : 0.0f;
+
+                #pragma unroll
+                for (uint32_t ch = 0; ch < 16u; ch++) {
+                    const int32_t b = yb
+                            ? *(const int32_t *)(yb + 4u + ch * 16u + tg * 4u)
+                            : 0;
+                    int32_t a[2], dsum[4];
+                    a[0] = *(const int32_t *)&a_s[0][g][ch * 16u + tg * 4u];
+                    a[1] = *(const int32_t *)&a_s[0][g + 8u][ch * 16u + tg * 4u];
+                    mma_s8_16x8x16(dsum, a, b);
+                    const float sg0 = s_w[0][g][ch];
+                    const float sg8 = s_w[0][g + 8u][ch];
+                    accg[t][0] += (float)dsum[0] * sg0 * d0;
+                    accg[t][1] += (float)dsum[1] * sg0 * d1;
+                    accg[t][2] += (float)dsum[2] * sg8 * d0;
+                    accg[t][3] += (float)dsum[3] * sg8 * d1;
+                    if (KIND == 0) {
+                        a[0] = *(const int32_t *)&a_s[1][g][ch * 16u + tg * 4u];
+                        a[1] = *(const int32_t *)&a_s[1][g + 8u][ch * 16u + tg * 4u];
+                        mma_s8_16x8x16(dsum, a, b);
+                        const float su0 = s_w[1][g][ch];
+                        const float su8 = s_w[1][g + 8u][ch];
+                        accu[t][0] += (float)dsum[0] * su0 * d0;
+                        accu[t][1] += (float)dsum[1] * su0 * d1;
+                        accu[t][2] += (float)dsum[2] * su8 * d0;
+                        accu[t][3] += (float)dsum[3] * su8 * d1;
+                    }
+                }
+            }
+        }
+
+        /* writeback this round's tiles */
+        for (uint32_t t = 0; t < PULSAR_MMA_TPW; t++) {
+            const uint32_t tile = round * tiles_per_round + warp * PULSAR_MMA_TPW + t;
+            if (tile >= n_tiles) break;
+            uint32_t pr_own = 0xffffffffu;
+            if (lane < 8u && tile * 8u + lane < len) {
+                pr_own = pairs[s0 + tile * 8u + lane];
+            }
+            #pragma unroll
+            for (uint32_t half = 0; half < 2u; half++) {
+                const uint32_t col = tg * 2u + half;
+                const uint32_t pr = __shfl_sync(0xffffffffu, pr_own, (int)col);
+                if (pr == 0xffffffffu) continue;
+                const uint32_t token = pr >> 4;
+                const uint32_t slot = pr & 15u;
+                const uint64_t srow = (uint64_t)token * n_used + slot;
+                #pragma unroll
+                for (uint32_t rh = 0; rh < 2u; rh++) {
+                    const uint32_t row = r0 + g + rh * 8u;
+                    if (row >= n_rows) continue;
+                    const uint32_t ci = rh * 2u + half;
+                    if (KIND == 0) {
+                        const float sw = pulsar_gate_act(accg[t][ci], act_op);
+                        out[srow * n_rows + row] =
+                            sw * accu[t][ci] * weights[srow];
+                    } else {
+                        out[srow * n_rows + row] = accg[t][ci];
+                    }
+                }
+            }
+        }
+    }
+#else
+    (void)out; (void)gptrs; (void)starts; (void)pairs; (void)weights;
+    (void)actq; (void)n_blocks; (void)n_rows; (void)n_used; (void)row_bytes;
+    (void)act_op;
+#endif
+}
+
 #define PULSAR_GROUPED_DISPATCH(kern, ...)                                    \
     do {                                                                      \
         switch (quant) {                                                      \
@@ -1672,6 +1879,16 @@ extern "C" int pulsar_moe_pair_swiglu_grouped(
         return 0;
     }
     const uint32_t in_blocks = in_dim / PULSAR_QK_K;
+    if (quant == PULSAR_QUANT_IQ2_XXS && pulsar_device_cc_major() >= 8 &&
+        !getenv("PULSAR_NO_MMA")) {
+        dim3 mgrid((mid_dim + 15u) / 16u, n_group, 1);
+        moe_grouped_mma_iq2xxs_kernel<0><<<mgrid, 256>>>(
+                (float *)mid_dev, (const pulsar_expert_ptrs *)gptrs_dev,
+                (const uint32_t *)starts_dev, (const uint32_t *)pairs_dev,
+                (const float *)weights_dev, xq_dev,
+                in_blocks, mid_dim, n_used, row_bytes, act_op);
+        return cuda_ok(cudaGetLastError(), "moe pair mma launch");
+    }
     dim3 block(32, 4, 1);
     dim3 grid((mid_dim + 3u) / 4u, n_group, 1);
     const uint32_t shmem = 2u * (uint32_t)row_bytes * 4u;
@@ -1696,6 +1913,15 @@ extern "C" int pulsar_moe_down_grouped(
         return 0;
     }
     const uint32_t mid_blocks = mid_dim / PULSAR_QK_K;
+    if (quant == PULSAR_QUANT_IQ2_XXS && pulsar_device_cc_major() >= 8 &&
+        !getenv("PULSAR_NO_MMA")) {
+        dim3 mgrid((out_dim + 15u) / 16u, n_group, 1);
+        moe_grouped_mma_iq2xxs_kernel<1><<<mgrid, 256>>>(
+                (float *)partial_dev, (const pulsar_expert_ptrs *)gptrs_dev,
+                (const uint32_t *)starts_dev, (const uint32_t *)pairs_dev,
+                NULL, midq_dev, mid_blocks, out_dim, n_used, row_bytes, 0);
+        return cuda_ok(cudaGetLastError(), "moe down mma launch");
+    }
     dim3 block(32, 4, 1);
     dim3 grid((out_dim + 3u) / 4u, n_group, 1);
     const uint32_t shmem = (uint32_t)row_bytes * 4u;
@@ -2568,6 +2794,84 @@ static int moe_selftest_one2(uint32_t quant, const char *name, uint32_t mid_dim)
         }
         ok = mid_maxd <= 1e-3f * (mid_maxref > 1.0f ? mid_maxref : 1.0f) &&
              out_maxd <= 1e-3f * (out_maxref > 1.0f ? out_maxref : 1.0f);
+    }
+
+    /* grouped-path crosscheck (mma variant on iq2_xxs/sm_80+): CSR of the
+     * same routing, compared against the (host-validated) plain output.
+     * Tolerance is looser: the mma path reorders float accumulation. */
+    if (ok && mid_dim % PULSAR_QK_K == 0) {
+        uint32_t gsel[64];
+        uint32_t n_group = 0;
+        uint32_t starts_h[65];
+        uint32_t pairs_h[64];
+        pulsar_expert_ptrs gptrs_h[64];
+        /* group by expert (matches the engine's pointer-keyed grouping) */
+        for (uint32_t si = 0; si < n_tok * n_used; si++) {
+            if (sel[si] < 0) continue;
+            uint32_t gi = n_group;
+            for (uint32_t k2 = 0; k2 < n_group; k2++) {
+                if (gsel[k2] == (uint32_t)sel[si]) { gi = k2; break; }
+            }
+            if (gi == n_group) gsel[n_group++] = (uint32_t)sel[si];
+        }
+        uint32_t cursor = 0;
+        for (uint32_t k2 = 0; k2 < n_group; k2++) {
+            starts_h[k2] = cursor;
+            const uint32_t e = gsel[k2];
+            gptrs_h[k2].gate = (char *)gate_dev + (uint64_t)e * mid_dim * pair_row_bytes;
+            gptrs_h[k2].up = (char *)up_dev + (uint64_t)e * mid_dim * pair_row_bytes;
+            gptrs_h[k2].down = (char *)down_dev + (uint64_t)e * out_dim * down_row_bytes;
+            for (uint32_t si = 0; si < n_tok * n_used; si++) {
+                if (sel[si] == (int32_t)e) {
+                    pairs_h[cursor++] = ((si / n_used) << 4) | (si % n_used);
+                }
+            }
+        }
+        starts_h[n_group] = cursor;
+        void *gp_d = NULL, *st_d = NULL, *pr_d = NULL, *partial_d = NULL;
+        float *mid2 = (float *)malloc((uint64_t)n_tok * n_used * mid_dim * 4);
+        float *out2 = (float *)malloc((uint64_t)n_tok * out_dim * 4);
+        const uint64_t partial_bytes = (uint64_t)n_tok * n_used * out_dim * 4;
+        ok = cuda_ok(cudaMalloc(&gp_d, sizeof(gptrs_h)), "gp") &&
+             cuda_ok(cudaMalloc(&st_d, sizeof(starts_h)), "st") &&
+             cuda_ok(cudaMalloc(&pr_d, sizeof(pairs_h)), "pr") &&
+             cuda_ok(cudaMalloc(&partial_d, partial_bytes), "partial") &&
+             cuda_ok(cudaMemcpy(gp_d, gptrs_h, sizeof(gptrs_h), cudaMemcpyHostToDevice), "gp h2d") &&
+             cuda_ok(cudaMemcpy(st_d, starts_h, sizeof(starts_h), cudaMemcpyHostToDevice), "st h2d") &&
+             cuda_ok(cudaMemcpy(pr_d, pairs_h, sizeof(pairs_h), cudaMemcpyHostToDevice), "pr h2d") &&
+             cuda_ok(cudaMemset(mid_dev, 0, (uint64_t)n_tok * n_used * mid_dim * 4), "mid clear") &&
+             cuda_ok(cudaMemset(partial_d, 0, partial_bytes), "partial clear") &&
+             pulsar_moe_pair_swiglu_grouped(mid_dev, gp_d, st_d, pr_d, w_dev, xq_dev,
+                                            in_dim, mid_dim, n_used, n_group,
+                                            pair_row_bytes, quant, 0) &&
+             pulsar_moe_down_grouped(partial_d, gp_d, st_d, pr_d, midq_dev,
+                                     mid_dim, out_dim, n_used, n_group,
+                                     down_row_bytes, quant) &&
+             pulsar_moe_slot_sum(out_dev, partial_d, out_dim, n_used, n_tok) &&
+             cuda_ok(cudaDeviceSynchronize(), "gsync") &&
+             cuda_ok(cudaMemcpy(mid2, mid_dev, (uint64_t)n_tok * n_used * mid_dim * 4, cudaMemcpyDeviceToHost), "mid2 d2h") &&
+             cuda_ok(cudaMemcpy(out2, out_dev, (uint64_t)n_tok * out_dim * 4, cudaMemcpyDeviceToHost), "out2 d2h");
+        float gmaxd = 0.0f;
+        if (ok) {
+            for (uint64_t i = 0; i < (uint64_t)n_tok * n_used * mid_dim; i++) {
+                /* NULL-slot rows are zero in grouped, nonzero-garbage-free
+                 * in plain (plain writes 0 too) - direct compare ok */
+                const float d = fabsf(mid2[i] - mid_gpu[i]);
+                if (d > gmaxd) gmaxd = d;
+            }
+            for (uint64_t i = 0; i < (uint64_t)n_tok * out_dim; i++) {
+                const float d = fabsf(out2[i] - out_gpu[i]);
+                if (d > gmaxd) gmaxd = d;
+            }
+            ok = gmaxd <= 5e-3f * (out_maxref > 1.0f ? out_maxref : 1.0f);
+            fprintf(stderr, "moe-selftest %s grouped/mma crosscheck: %s (max diff vs plain %.2e)\n",
+                    name, ok ? "PASS" : "FAIL", (double)gmaxd);
+        }
+        if (gp_d) cudaFree(gp_d);
+        if (st_d) cudaFree(st_d);
+        if (pr_d) cudaFree(pr_d);
+        if (partial_d) cudaFree(partial_d);
+        free(mid2); free(out2);
     }
     fprintf(stderr, "moe-selftest %s: %s (mid max diff %.2e, out max diff %.2e, max |out ref| %.2e)\n",
             name, ok ? "PASS" : "FAIL", (double)mid_maxd, (double)out_maxd,
