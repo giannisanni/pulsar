@@ -13,18 +13,27 @@ a neutron star that spins fast and emits beams.
 
 ## What it does today
 
-Three model families on consumer GPUs — **Hy3 295B** (hy-v3, GQA),
-**GLM-5.2 743B** (glm-dsa, MLA + DSA sparse attention), and
-**Kimi K2.7 1T** (deepseek2, MLA). Reference box: RTX 5060 Ti 16GB +
-RTX 4060 Ti 16GB, Ryzen 9900X, 30GB RAM, one Gen5 NVMe.
+Six model architectures on consumer GPUs — running: **Hy3 295B** (hy-v3,
+GQA), **GLM-5.2 743B** (glm-dsa, MLA + DSA sparse attention), and
+**Kimi K2.7 1T** (deepseek2, MLA + YaRN); code-complete, first runs
+pending: **MiniMax M3** (partial rotary), **Qwen3-235B/30B**
+(qwen3moe, softmax router), **Gemma 4 26B-A4B** (interleaved
+sliding-window attention, dual GELU FFN). Reference box: RTX 5060 Ti
+16GB + RTX 4060 Ti 16GB, Ryzen 9900X, 30GB RAM, one Gen5 NVMe.
 
 | decode | pulsar | reference engine (same box) |
 |---|---|---|
 | Kimi K2.7-Code 1T (339GB, 8-shard split gguf) | **1.3 tok/s** | – |
 | Hy3 295B (85GB gguf) | **7.2 tok/s** | 0.64–0.70 (ds4) |
 | GLM-5.2 743B (197GB gguf) | **2.0 tok/s** | 0.40 (ds4) |
-| Hy3 long-prompt prefill | **7.9+ tok/s** | 0.44 (ds4) |
+| Hy3 long-prompt prefill | **28 tok/s** (tensor cores) | 0.44 (ds4) |
 | warm start | hot experts bulk-load in **~3s** | – |
+
+Prefill runs the quantized weights through int8 tensor cores on
+sm_80+ (`mma.m16n8k32` dense GEMM + mmq-style grouped MoE that unpacks
+each expert superblock to shared memory once per prefill chunk and
+rescales per quant block in registers) — 1.8× over the dp4a kernels,
+which remain the path on older GPUs.
 
 GLM runs contexts past its naive 2048-row ceiling via a port of the
 DSA lightning indexer (top-k row selection per token), validated
@@ -73,16 +82,18 @@ determinism on a fixed code path (`--decode-consistency`, below).
 
 ## Get a model
 
-Pulsar reads standard llama.cpp ggufs: nine routed-expert quant
-formats (q2_K, q3_K, q4_0, q4_K, q5_K, q6_K, iq2_xxs, iq2_xs,
-iq3_xxs), K-quant dense tensors (requantized to q8_0 at load), split
--00001-of-000NN shard sets (point `-m` at the first shard), and both
-converter dialects (ds4-lineage and upstream). Known-good starters:
+Pulsar reads standard llama.cpp ggufs: ten routed-expert quant
+formats (q2_K, q3_K, q4_0, q4_K, q5_K, q5_1, q6_K, iq2_xxs, iq2_xs,
+iq3_xxs — including fused gate_up tensors and non-256-multiple expert
+widths), K-quant dense tensors (requantized to q8_0 at load), tied
+embeddings, split -00001-of-000NN shard sets (point `-m` at the first
+shard), and both converter dialects (ds4-lineage and upstream).
+Known-good starters:
 
 ```sh
-# Hy3 295B - 85GB, the friendlier starting point
-curl -L -C - -o Hy3-ds4-IQ2XXS-AttnQ8.gguf \
-  "https://huggingface.co/giannisan/Hy3-ds4-gguf/resolve/main/Hy3-ds4-IQ2XXS-AttnQ8.gguf"
+# Hy3 295B - 85GB, the friendlier starting point (fromBF16 = current build)
+curl -L -C - -o Hy3-ds4-IQ2XXS-AttnQ8-fromBF16.gguf \
+  "https://huggingface.co/giannisan/Hy3-ds4-gguf/resolve/main/Hy3-ds4-IQ2XXS-AttnQ8-fromBF16.gguf"
 
 # GLM-5.2 743B - 197GB, needs a second 16GB GPU for the attention stack
 curl -L -C - -o GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf \
@@ -222,12 +233,19 @@ GPUs · temp/top-p/min-p sampling · interactive chat · OpenAI-compatible
 server (`pulsar-serve`: `/v1/models`, `/v1/chat/completions` with SSE
 streaming; local single-user, one request at a time).
 
+Done since: DSA lightning indexer (GLM contexts past 2048) · Kimi
+K2.7/deepseek2 with llama.cpp-exact YaRN · split-gguf loading · MTP +
+draft-free n-gram speculation (built, measured honestly: net-slower
+until the host cache outruns the disk; `PULSAR_MTP=1` /
+`PULSAR_NGRAM=n` to experiment) · style-aware chat templates
+(Hy3/Kimi/ChatML/Gemma) · int8 tensor-core prefill (dense GEMM +
+grouped MoE) · MiniMax M3, Qwen3, Gemma 4 forward graphs.
+
 Not yet:
 
-- DeepSeek-family bring-up (same MLA plumbing as GLM; the DSA indexer for
-  long contexts is unported — GLM runs full attention up to ctx 2048)
-- MTP speculative decode (parked until batch-union expert loads, its
-  measured blocker in NeutronStar)
+- tensor-core unpackers for the remaining expert formats (iq2_xs,
+  iq3_xxs, q4_K, q5_1, q2_K, q3_K — the harness takes one ~40-line
+  unpacker per format)
 - own BF16→quant quantizer (removes the last llama.cpp dependency from
   the model-prep pipeline)
 
