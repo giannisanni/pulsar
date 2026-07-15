@@ -128,7 +128,7 @@ fn run() -> engine::Result {
     let mut tokens_arg = None;
     let mut n_predict = 16usize;
     let mut ctx = 2048u32;
-    let mut bos = true;
+    let mut bos: Option<bool> = None; // None = model default (add_bos KV)
     let mut dump_logits = None;
     let mut teacher_force = false;
     let mut decode_consistency = None;
@@ -148,7 +148,8 @@ fn run() -> engine::Result {
             "--tokens" => tokens_arg = Some(need("--tokens")?),
             "-n" => n_predict = need("-n")?.parse()?,
             "--ctx" => ctx = need("--ctx")?.parse()?,
-            "--no-bos" => bos = false,
+            "--no-bos" => bos = Some(false),
+            "--bos" => bos = Some(true),
             "--dump-logits" => dump_logits = Some(need("--dump-logits")?),
             "--teacher-force" => teacher_force = true,
             "--decode-consistency" => decode_consistency = Some(need("--decode-consistency")?.parse::<usize>()?),
@@ -186,7 +187,7 @@ fn run() -> engine::Result {
         (Some(t), _) => t.split(',').map(|s| s.trim().parse()).collect::<std::result::Result<_, _>>()?,
         (None, Some(p)) => {
             let mut ids = Vec::new();
-            if bos {
+            if bos.unwrap_or(tok.add_bos) {
                 ids.push(tok.bos_id.ok_or("model has no BOS id")?);
             }
             ids.extend(tok.encode(&p));

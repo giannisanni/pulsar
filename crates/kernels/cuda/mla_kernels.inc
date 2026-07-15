@@ -489,7 +489,8 @@ extern "C" int pulsar_mla_attention(
         float ext_factor,
         float attn_factor,
         float beta_fast,
-        float beta_slow) {
+        float beta_slow,
+        float kq_mult) {
     if (!heads_dev || !q_dev || !qk_low_dev || !kv_lora_cache_dev ||
         !k_rope_cache_dev || !v_b_dev || !selected_dev ||
         n_tokens == 0 || n_selected == 0 || cache_cap == 0 ||
@@ -518,7 +519,7 @@ extern "C" int pulsar_mla_attention(
             n_tokens, n_selected, cache_cap,
             n_head, kv_lora_dim, qk_nope, qk_rope, value_dim, n_ctx_orig,
             (uint32_t)mla_q8_row_bytes(kv_lora_dim),
-            1.0f / sqrtf((float)qk_dim),
+            kq_mult / sqrtf((float)qk_dim),
             freq_base, freq_scale, ext_factor, attn_factor,
             beta_fast, beta_slow);
     return cuda_ok(cudaGetLastError(), "mla attention launch");

@@ -37,6 +37,9 @@ pub struct Tokenizer {
     pub bos_id: Option<u32>,
     pub eos_id: Option<u32>,
     pub eot_id: Option<u32>,
+    /// Whether a raw prompt gets a leading bos (llama.cpp semantics:
+    /// tokenizer.ggml.add_bos_token if present, else SPM yes / BPE no).
+    pub add_bos: bool,
     pre: Pre,
 }
 
@@ -268,6 +271,11 @@ impl Tokenizer {
             bos_id: id_key("tokenizer.ggml.bos_token_id"),
             eos_id: id_key("tokenizer.ggml.eos_token_id"),
             eot_id: id_key("tokenizer.ggml.eot_token_id"),
+            add_bos: match g.metadata.get("tokenizer.ggml.add_bos_token") {
+                Some(Value::Bool(b)) => *b,
+                _ => g.metadata.get("tokenizer.ggml.model").and_then(Value::as_str)
+                    == Some("llama"),
+            },
             pre: match g.metadata.get("tokenizer.ggml.pre").and_then(Value::as_str) {
                 Some("glm4") => Pre::Glm4,
                 Some("kimi-k2") => Pre::KimiK2,

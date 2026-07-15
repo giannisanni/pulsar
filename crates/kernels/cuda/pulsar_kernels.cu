@@ -2899,7 +2899,7 @@ static int mla_selftest_one(float freq_scale, float ext_factor,
                                   kv_lora, qk_nope, qk_rope, value_dim,
                                   n_ctx_orig, freq_base, freq_scale,
                                   ext_factor, attn_factor, beta_fast,
-                                  beta_slow);
+                                  beta_slow, 1.0f);
     }
     ok = ok && cuda_ok(cudaDeviceSynchronize(), "sync") &&
          cuda_ok(cudaMemcpy(gpu_heads, heads_d,

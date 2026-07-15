@@ -96,15 +96,24 @@ mod real {
             // mscale (llama.cpp deepseek2 convention). NEEDS teacher-forced
             // parity validation on the first Kimi run.
             if self.rope_scale_factor > 1.0 {
-                let mscale = 1.0 + self.rope_yarn_log_mult * self.rope_scale_factor.ln();
+                // llama.cpp deepseek2 YaRN (validated vs the fork's
+                // deepseek2.cpp [TAG_DEEPSEEK2_YARN_LOG_MUL_FIX]): the rope
+                // kernel internally multiplies mscale by (1 + 0.1 ln f), so
+                // pass its reciprocal - rotated dims stay UNIT-scaled - and
+                // apply the real magnitude correction mscale^2 on the whole
+                // qk product (kq_mult), nope and rope dims alike, where
+                // mscale = 1 + 0.1 * yarn_log_multiplier * ln f.
+                let f = self.rope_scale_factor;
+                let mscale = 1.0 + 0.1 * self.rope_yarn_log_mult * f.ln();
                 kernels::RopeCfg {
                     n_ctx_orig: self.rope_orig_ctx,
                     freq_base: self.rope_freq_base,
-                    freq_scale: 1.0 / self.rope_scale_factor,
+                    freq_scale: 1.0 / f,
                     ext_factor: 1.0,
-                    attn_factor: mscale,
+                    attn_factor: 1.0 / (1.0 + 0.1 * f.ln()),
                     beta_fast: 32.0,
                     beta_slow: 1.0,
+                    kq_mult: mscale * mscale,
                 }
             } else {
                 kernels::RopeCfg {
@@ -115,6 +124,7 @@ mod real {
                     attn_factor: 1.0,
                     beta_fast: 0.0,
                     beta_slow: 0.0,
+                    kq_mult: 1.0,
                 }
             }
         }
@@ -1238,7 +1248,7 @@ mod real {
                             upload(&file, &gguf, &probs_b_name)?
                         } else {
                             let mut z = DeviceBuf::alloc(shape.n_expert as usize * 4)?;
-                            kernels::zero(&mut z)?;
+                            kernels::zero(&mut z, shape.n_expert as usize * 4)?;
                             z
                         },
                         shexp: if gguf.tensor(&t("ffn_gate_shexp.weight")).is_some() {
