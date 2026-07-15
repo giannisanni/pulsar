@@ -16,7 +16,11 @@ fn main() {
     //
     // PULSAR_CUDA_ARCH overrides (e.g. "89" for a fast dev build, or
     // "89,120" once the toolkit codegens Blackwell SASS natively).
-    let archs = std::env::var("PULSAR_CUDA_ARCH").unwrap_or_else(|_| "61,75,86,89".into());
+    // 80 must stay in the list: the int8 mma prefill GEMM gates on
+    // cc >= 8 at runtime, so every >= 8.0 device needs a fatbin entry
+    // compiled with __CUDA_ARCH__ >= 800 (A100 falling back to the
+    // compute_61 floor PTX would silently run the empty stub)
+    let archs = std::env::var("PULSAR_CUDA_ARCH").unwrap_or_else(|_| "61,75,80,86,89".into());
     let mut build = cc::Build::new();
     build.cuda(true).flag("-O3").flag("--use_fast_math");
     // nvcc rejects host compilers newer than its toolkit supports (e.g.

@@ -285,6 +285,109 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
     if (lane == 0) out[row] = acc;
 }
 
+/* tensor-core prefill GEMM (sm_80+): one mma.m16n8k32 s8s8s32 covers
+ * exactly one q8_0 quant block (k=32), so the integer accumulator can be
+ * rescaled by scale_w[row][blk] * scale_x[tok][blk] in registers using
+ * the DOCUMENTED PTX fragment mapping (the opaque WMMA API can't do
+ * per-block rescale). Warp tile: 16 rows x 8 tokens; block: 8 warps in a
+ * 4x2 grid = 64 rows x 16 tokens. No smem: A/B reuse across the warp
+ * grid rides L1/L2 (v1; smem staging is the next lever). */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+__device__ __forceinline__ static void mma_s8_16x8x32(
+        int32_t d[4], const int32_t a[4], const int32_t b[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]),
+          "r"(0), "r"(0), "r"(0), "r"(0));
+}
+#endif
+
+__device__ __forceinline__ static float f16_bytes_to_f32(const unsigned char *p) {
+    unsigned short h = (unsigned short)(p[0] | (p[1] << 8));
+    return __half2float(__ushort_as_half(h));
+}
+
+__global__ static void matmul_q8_0_preq_mma_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        uint32_t blocks) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const uint32_t warp = threadIdx.x >> 5u;   /* 0..7 */
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t g = lane >> 2u;             /* row group / B col 0..7 */
+    const uint32_t tg = lane & 3u;             /* thread-in-group 0..3 */
+    /* 4 row-warps x 2 token-warps */
+    const uint32_t r0 = blockIdx.x * 64u + (warp >> 1u) * 16u;
+    const uint32_t t0 = blockIdx.y * 16u + (warp & 1u) * 8u;
+    if (r0 >= out_dim || t0 >= n_tok) return;
+
+    const uint32_t row_a = r0 + g;       /* a0/a2 row */
+    const uint32_t row_b = r0 + g + 8u;  /* a1/a3 row */
+    const uint32_t tok_b0 = t0 + g;      /* B load column */
+    const uint32_t col0 = t0 + tg * 2u;  /* C columns */
+    const uint32_t col1 = col0 + 1u;
+    const bool ra_ok = row_a < out_dim;
+    const bool rb_ok = row_b < out_dim;
+    const bool tb_ok = tok_b0 < n_tok;
+
+    const unsigned char *wr_a = w + (uint64_t)row_a * blocks * 34u;
+    const unsigned char *wr_b = w + (uint64_t)row_b * blocks * 34u;
+    const int8_t *xr = xq + (uint64_t)tok_b0 * blocks * 32u;
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint32_t blk = 0; blk < blocks; blk++) {
+        int32_t a[4], b[2], d[4];
+        const unsigned char *ba = wr_a + blk * 34u;
+        const unsigned char *bb = wr_b + blk * 34u;
+        a[0] = ra_ok ? load_i8x4_i32_unaligned((const int8_t *)(ba + 2u + tg * 4u)) : 0;
+        a[1] = rb_ok ? load_i8x4_i32_unaligned((const int8_t *)(bb + 2u + tg * 4u)) : 0;
+        a[2] = ra_ok ? load_i8x4_i32_unaligned((const int8_t *)(ba + 18u + tg * 4u)) : 0;
+        a[3] = rb_ok ? load_i8x4_i32_unaligned((const int8_t *)(bb + 18u + tg * 4u)) : 0;
+        b[0] = tb_ok ? *(const int32_t *)(xr + blk * 32u + tg * 4u) : 0;
+        b[1] = tb_ok ? *(const int32_t *)(xr + blk * 32u + 16u + tg * 4u) : 0;
+        mma_s8_16x8x32(d, a, b);
+        const float wsa = ra_ok ? f16_bytes_to_f32(ba) : 0.0f;
+        const float wsb = rb_ok ? f16_bytes_to_f32(bb) : 0.0f;
+        const float xs0 = col0 < n_tok ? xscale[(uint64_t)col0 * blocks + blk] : 0.0f;
+        const float xs1 = col1 < n_tok ? xscale[(uint64_t)col1 * blocks + blk] : 0.0f;
+        acc0 += (float)d[0] * wsa * xs0;
+        acc1 += (float)d[1] * wsa * xs1;
+        acc2 += (float)d[2] * wsb * xs0;
+        acc3 += (float)d[3] * wsb * xs1;
+    }
+    if (ra_ok && col0 < n_tok) out[(uint64_t)col0 * out_dim + row_a] = acc0;
+    if (ra_ok && col1 < n_tok) out[(uint64_t)col1 * out_dim + row_a] = acc1;
+    if (rb_ok && col0 < n_tok) out[(uint64_t)col0 * out_dim + row_b] = acc2;
+    if (rb_ok && col1 < n_tok) out[(uint64_t)col1 * out_dim + row_b] = acc3;
+#else
+    (void)out; (void)w; (void)xq; (void)xscale;
+    (void)out_dim; (void)n_tok; (void)blocks;
+#endif
+}
+
+static int pulsar_device_cc_major(void) {
+    static int cached[16] = {-1, -1, -1, -1, -1, -1, -1, -1,
+                             -1, -1, -1, -1, -1, -1, -1, -1};
+    int dev = 0;
+    (void)cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) return 0;
+    if (cached[dev] < 0) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            major = 0;
+        }
+        cached[dev] = major;
+    }
+    return cached[dev];
+}
+
 /* grow-only PER-DEVICE scratch for activation prequant: matmuls run on
  * whichever device is current (attn GPU vs expert GPU), and VRAM is only
  * dereferenceable on its own device without P2P.
@@ -331,6 +434,12 @@ extern "C" int pulsar_q8_0_matmul(
         matmul_q8_0_preq_warp8_kernel<<<(out_dim + 7u) / 8u, 256>>>(
                 (float *)out_dev, (const unsigned char *)w_dev, xq, xscale,
                 in_dim, out_dim, blocks);
+    } else if (n_tok >= 16 && pulsar_device_cc_major() >= 8 &&
+               !getenv("PULSAR_NO_MMA")) {
+        dim3 grid((out_dim + 63u) / 64u, (n_tok + 15u) / 16u, 1);
+        matmul_q8_0_preq_mma_kernel<<<grid, 256>>>(
+                (float *)out_dev, (const unsigned char *)w_dev, xq, xscale,
+                out_dim, n_tok, (uint32_t)blocks);
     } else if (n_tok >= 8) {
         dim3 grid((unsigned)((out_dim + 7u) / 8u),
                   (unsigned)((n_tok + PULSAR_Q8_TILE_TOK - 1u) / PULSAR_Q8_TILE_TOK), 1);
@@ -375,10 +484,11 @@ static uint16_t f32_to_f16_bits(float f) {
     return (uint16_t)(sign | ((uint32_t)exp << 10) | half_man);
 }
 
-extern "C" int pulsar_q8_0_matmul_selftest(void) {
-    /* n_tok 19 exercises the tiled path (>= 8) incl. a partial 3-token
-     * tile; in_dim 4256 -> 133 blocks, a partial 5-block weight slab */
-    const uint32_t in_dim = 4256, out_dim = 512, n_tok = 19;
+static int q8_0_matmul_selftest_one(uint32_t n_tok) {
+    /* n_tok 9 = tiled path incl. partial tile; 19/40 = tensor-core mma on
+     * sm_80+ (partial + multi 16-token tiles), tiled elsewhere; in_dim
+     * 4256 -> 133 blocks, a partial 5-block weight slab */
+    const uint32_t in_dim = 4256, out_dim = 512;
     const uint32_t blocks = in_dim / 32u;
     q8_0_block *w = (q8_0_block *)malloc((uint64_t)out_dim * blocks * sizeof(*w));
     float *wf = (float *)malloc((uint64_t)out_dim * in_dim * sizeof(float));
@@ -465,8 +575,8 @@ extern "C" int pulsar_q8_0_matmul_selftest(void) {
         }
         ok = maxd <= 1e-3f * (maxref > 1.0f ? maxref : 1.0f);
     }
-    fprintf(stderr, "q8_0-matmul-selftest: %s (max abs diff %.2e, max |ref| %.2e)\n",
-            ok ? "PASS" : "FAIL", (double)maxd, (double)maxref);
+    fprintf(stderr, "q8_0-matmul-selftest n_tok=%u: %s (max abs diff %.2e, max |ref| %.2e)\n",
+            n_tok, ok ? "PASS" : "FAIL", (double)maxd, (double)maxref);
     if (w_dev) cudaFree(w_dev);
     if (x_dev) cudaFree(x_dev);
     if (out_dev) cudaFree(out_dev);
@@ -474,6 +584,11 @@ extern "C" int pulsar_q8_0_matmul_selftest(void) {
     return ok;
 }
 
+extern "C" int pulsar_q8_0_matmul_selftest(void) {
+    return q8_0_matmul_selftest_one(9) &&
+           q8_0_matmul_selftest_one(19) &&
+           q8_0_matmul_selftest_one(40);
+}
 
 /* ---- sigmoid router + top-k select ------------------------------------
  * Warp-per-token select, derived from ds4's glm_router_select_kernel (the
