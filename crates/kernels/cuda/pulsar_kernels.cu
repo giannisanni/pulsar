@@ -111,6 +111,19 @@ __device__ __forceinline__ static float pulsar_gate_act(float g, uint32_t op) {
     return op ? pulsar_gelu(g) : g / (1.0f + expf(-g));
 }
 
+/* Gated-FFN combine: act(gate) * up by act_op.
+ *   0 = silu (swiglu), 1 = gelu tanh, 2 = swiglu_oai (gpt-oss / MiniMax
+ *   M3): gate one-side clamped to 7, up clamped to +-7, alpha-sharpened
+ *   sigmoid (1.702), and the +1 on up - llama.cpp ggml_swiglu_oai. */
+__device__ __forceinline__ static float pulsar_glu(float g, float u, uint32_t op) {
+    if (op == 2u) {
+        g = fminf(g, 7.0f);
+        u = fminf(fmaxf(u, -7.0f), 7.0f);
+        return g / (1.0f + expf(-1.702f * g)) * (u + 1.0f);
+    }
+    return pulsar_gate_act(g, op) * u;
+}
+
 __device__ static float warp_sum_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         v += __shfl_down_sync(0xffffffffu, v, offset);
@@ -1539,8 +1552,7 @@ __global__ static void moe_pair_swiglu_kernel(
         acc_up += __shfl_xor_sync(0xffffffffu, acc_up, mask);
     }
     if (lane == 0) {
-        const float sw = pulsar_gate_act(acc_gate, act_op);
-        mid[mid_off] = sw * acc_up * weights[slot_off];
+        mid[mid_off] = pulsar_glu(acc_gate, acc_up, act_op) * weights[slot_off];
     }
 }
 
@@ -1652,9 +1664,8 @@ __global__ static void moe_pair_swiglu_grouped_kernel(
             au += __shfl_xor_sync(0xffffffffu, au, mask);
         }
         if (lane == 0) {
-            const float sw = pulsar_gate_act(ag, act_op);
             mid[((uint64_t)token * n_used + slot) * mid_dim + row] =
-                sw * au * weights[(uint64_t)token * n_used + slot];
+                pulsar_glu(ag, au, act_op) * weights[(uint64_t)token * n_used + slot];
         }
     }
 }
@@ -1982,9 +1993,8 @@ __global__ static void moe_grouped_mma_kernel(
                     if (row >= n_rows) continue;
                     const uint32_t ci = rh * 2u + half;
                     if (KIND == 0) {
-                        const float sw = pulsar_gate_act(accg[t][ci], act_op);
                         out[srow * n_rows + row] =
-                            sw * accu[t][ci] * weights[srow];
+                            pulsar_glu(accg[t][ci], accu[t][ci], act_op) * weights[srow];
                     } else {
                         out[srow * n_rows + row] = accg[t][ci];
                     }
@@ -2916,12 +2926,14 @@ static int moe_selftest_one2(uint32_t quant, const char *name, uint32_t mid_dim)
     const uint64_t gate_slab_bytes = (uint64_t)n_expert * mid_dim * pair_row_bytes;
     const uint64_t down_slab_bytes = (uint64_t)n_expert * out_dim * down_row_bytes;
 
-    char *gate = (char *)malloc(gate_slab_bytes + 64);
-    char *up = (char *)malloc(gate_slab_bytes + 64);
-    char *down = (char *)malloc(down_slab_bytes + 64);
-    memset(gate + gate_slab_bytes, 0, 64);
-    memset(up + gate_slab_bytes, 0, 64);
-    memset(down + down_slab_bytes, 0, 64);
+    /* +256: host reference dots read phantom tail sub-blocks past the last
+     * row (up to 68B for q8_0 at 704) - mirror the engine's SLAB_SLACK */
+    char *gate = (char *)malloc(gate_slab_bytes + 256);
+    char *up = (char *)malloc(gate_slab_bytes + 256);
+    char *down = (char *)malloc(down_slab_bytes + 256);
+    memset(gate + gate_slab_bytes, 0, 256);
+    memset(up + gate_slab_bytes, 0, 256);
+    memset(down + down_slab_bytes, 0, 256);
     float *x = (float *)malloc((uint64_t)n_tok * in_dim * sizeof(float));
     float *w = (float *)malloc((uint64_t)n_tok * n_used * sizeof(float));
     int32_t *sel = (int32_t *)malloc((uint64_t)n_tok * n_used * sizeof(int32_t));
@@ -2958,9 +2970,10 @@ static int moe_selftest_one2(uint32_t quant, const char *name, uint32_t mid_dim)
     pulsar_expert_ptrs ptrs[n_tok * n_used];
     const uint64_t xq_bytes = (uint64_t)n_tok * in_blocks * sizeof(block_q8_K);
     const uint64_t midq_bytes = (uint64_t)n_tok * n_used * mid_blocks * sizeof(block_q8_K);
-    int ok = cuda_ok(cudaMalloc(&gate_dev, gate_slab_bytes), "gate alloc") &&
-             cuda_ok(cudaMalloc(&up_dev, gate_slab_bytes), "up alloc") &&
-             cuda_ok(cudaMalloc(&down_dev, down_slab_bytes), "down alloc") &&
+    /* +256: the device dots read the same phantom tail as the host ones */
+    int ok = cuda_ok(cudaMalloc(&gate_dev, gate_slab_bytes + 256), "gate alloc") &&
+             cuda_ok(cudaMalloc(&up_dev, gate_slab_bytes + 256), "up alloc") &&
+             cuda_ok(cudaMalloc(&down_dev, down_slab_bytes + 256), "down alloc") &&
              cuda_ok(cudaMalloc(&xq_dev, xq_bytes), "xq alloc") &&
              cuda_ok(cudaMalloc(&midq_dev, midq_bytes), "midq alloc") &&
              cuda_ok(cudaMalloc(&w_dev, (uint64_t)n_tok * n_used * sizeof(float)), "w alloc") &&
@@ -3254,8 +3267,7 @@ __global__ static void swiglu_kernel(
         g = fminf(g, clamp);
         u = fminf(fmaxf(u, -clamp), clamp);
     }
-    float s = pulsar_gate_act(g, act_op);
-    out[i] = s * u * weight;
+    out[i] = pulsar_glu(g, u, act_op) * weight;
 }
 
 extern "C" int pulsar_swiglu(

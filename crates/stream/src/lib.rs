@@ -200,9 +200,10 @@ pub mod uring {
                     .iter()
                     .position(|s| s.is_none())
                     .expect("free slot when inflight < qd");
-                // +64: integer-dot kernels may read one sub-block group
-                // past a row that ends at the slab edge (see PULSAR_SLAB_SLACK)
-                let buf = Aligned::new(disk_len as usize + 64, align as usize)
+                // +256: integer-dot kernels may read phantom tail sub-blocks
+                // past a row that ends at the slab edge - up to 7 x 34B for
+                // q8_0 (see SLAB_SLACK in engine)
+                let buf = Aligned::new(disk_len as usize + 256, align as usize)
                     .ok_or_else(|| {
                         std::io::Error::from(std::io::ErrorKind::OutOfMemory)
                     })?;
@@ -362,7 +363,8 @@ pub mod fetch {
                     let aligned_off = local & !(ALIGN - 1);
                     let payload_off = (local - aligned_off) as usize;
                     let disk_len = (payload_off as u64 + r.len).next_multiple_of(ALIGN);
-                    let buf = Aligned::new_with(disk_len as usize + 64, ALIGN as usize, self.buf_alloc)
+                    // +256: phantom-tail slack, same invariant as the fetch path
+                    let buf = Aligned::new_with(disk_len as usize + 256, ALIGN as usize, self.buf_alloc)
                         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
                     let sqe = opcode::Read::new(fd, buf.ptr(), disk_len as u32)
                         .offset(aligned_off)

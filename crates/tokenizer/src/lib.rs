@@ -77,6 +77,9 @@ enum ChatStyle {
     /// <start_of_turn>user\ntext<end_of_turn>\n ... (Gemma; roles are
     /// "user"/"model", bos prepended)
     Gemma,
+    /// ]~b]user\ntext[e~[ ... (MiniMax M3; roles are "user"/"ai" plain
+    /// text after the ]~b] marker; ]~!b[ opens the conversation)
+    MiniMax,
 }
 
 pub struct ChatMarkers {
@@ -117,6 +120,25 @@ impl ChatMarkers {
                 assistant: find("<start_of_turn>")?,
                 aux0: find("<end_of_turn>")?,
                 aux1: find("<end_of_turn>")?,
+            });
+        }
+        if t.find_token("]~b]").is_some() {
+            // MiniMax M3: ]~!b[ (bod) opens, ]~b]<role>\n starts a turn,
+            // [e~[ + \n ends it; roles are plain text ("system"/"user"/
+            // "ai"). aux1 = <mm:think>: the assistant opener forces the
+            // thinking-enabled prefix - the adaptive branch (no prefix)
+            // greedily emits eos on the 2-bit quants.
+            return Ok(ChatMarkers {
+                style: ChatStyle::MiniMax,
+                // the CLI seeds the context with bos - for M3 that seat
+                // belongs to the beginning-of-dialog marker
+                bos: t.find_token("]~!b["),
+                eos: t.eos_id.ok_or(Error::MissingKey("eos_token_id"))?,
+                eot: t.find_token("[e~["),
+                user: find("]~b]")?,
+                assistant: find("]~b]")?,
+                aux0: find("[e~[")?,
+                aux1: find("<mm:think>")?,
             });
         }
         if t.find_token("<|im_start|>").is_some() {
@@ -171,6 +193,13 @@ impl ChatMarkers {
                 v.extend(self.eot);
                 v
             }
+            ChatStyle::MiniMax => {
+                let mut v = vec![self.user];
+                v.extend(t.encode(&format!("system\n{text}")));
+                v.push(self.aux0);
+                v.extend(t.encode("\n"));
+                v
+            }
         }
     }
 
@@ -191,6 +220,13 @@ impl ChatMarkers {
                 v
             }
             ChatStyle::ChatMl | ChatStyle::Gemma => {
+                let mut v = vec![self.user];
+                v.extend(t.encode(&format!("user\n{text}")));
+                v.push(self.aux0);
+                v.extend(t.encode("\n"));
+                v
+            }
+            ChatStyle::MiniMax => {
                 let mut v = vec![self.user];
                 v.extend(t.encode(&format!("user\n{text}")));
                 v.push(self.aux0);
@@ -222,6 +258,12 @@ impl ChatMarkers {
                 v.extend(t.encode("model\n"));
                 v
             }
+            ChatStyle::MiniMax => {
+                let mut v = vec![self.assistant];
+                v.extend(t.encode("ai\n"));
+                v.push(self.aux1); // <mm:think>: thinking-enabled prefix
+                v
+            }
         }
     }
 
@@ -230,7 +272,7 @@ impl ChatMarkers {
         let mut v = self.open_assistant(t);
         v.extend(t.encode(text));
         v.push(self.eot.unwrap_or(self.eos));
-        if matches!(self.style, ChatStyle::ChatMl | ChatStyle::Gemma) {
+        if matches!(self.style, ChatStyle::ChatMl | ChatStyle::Gemma | ChatStyle::MiniMax) {
             v.extend(t.encode("\n"));
         }
         v

@@ -95,6 +95,9 @@ fn run_chat(
             first = false;
         }
         ids.extend(markers.render_user_turn(tok, line));
+        if std::env::var_os("PULSAR_DEBUG_IDS").is_some() {
+            eprintln!("pulsar chat: turn ids {ids:?}");
+        }
 
         if pos + ids.len() as u32 + 2 >= ctx {
             eprintln!("pulsar chat: context full ({pos}/{ctx}), restart to continue");
@@ -109,8 +112,17 @@ fn run_chat(
             pos,
             &mut sampler,
             max_tokens,
-            |id| markers.is_stop(id),
             |id| {
+                let stop = markers.is_stop(id);
+                if stop && std::env::var_os("PULSAR_DEBUG_IDS").is_some() {
+                    eprintln!("pulsar chat: stop token {id} (eos {}, eot {:?})", markers.eos, markers.eot);
+                }
+                stop
+            },
+            |id| {
+                if std::env::var_os("PULSAR_DEBUG_IDS").is_some() {
+                    eprint!("[{id}]");
+                }
                 bytes.extend_from_slice(&tok.decode(&[id]));
                 print_utf8_prefix(&mut bytes);
             },

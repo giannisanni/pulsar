@@ -205,7 +205,14 @@ mod real {
                 // absent on qwen3moe (no scaling) - default 1.0
                 expert_weight_scale: f("expert_weights_scale").unwrap_or(1.0),
                 router_softmax: matches!(g.architecture(), Some("qwen3moe") | Some("gemma4")),
-                moe_act_op: (g.architecture() == Some("gemma4")) as u32,
+                // gated-FFN op: 1 = gelu (gemma4), 2 = swiglu_oai (MiniMax
+                // M3: clamp 7, alpha 1.702, up+1 - llama.cpp PR 24523),
+                // 0 = plain silu everywhere else
+                moe_act_op: match g.architecture() {
+                    Some("gemma4") => 1,
+                    Some("minimax-m3") => 2,
+                    _ => 0,
+                },
                 rope_freq_base: f("rope.freq_base")?,
                 rms_eps: f("attention.layer_norm_rms_epsilon")?,
                 n_lora_q: 0,
@@ -291,10 +298,11 @@ mod real {
     }
 
     /// Tail slack after every expert slab: quants with sub-256 blocks
-    /// (q5_1/q4_0) on non-256-multiple rows (gemma4's 704) let the dot
-    /// read up to 48 bytes past the last row. The math is exact (the q8
+    /// (q8_0/q5_1/q4_0) on non-256-multiple rows (gemma4's 704) let the
+    /// dot read past the last row - up to 7 phantom sub-blocks x 34 bytes
+    /// (q8_0) = 238 for a dim = 32 mod 256. The math is exact (the q8
     /// tail is zero-quantized) - the slack only keeps the READ in bounds.
-    const SLAB_SLACK: usize = 64;
+    const SLAB_SLACK: usize = 256;
 
     /// Byte-offset a device pointer (fused gate_up: up rows sit
     /// fused_up_off bytes into the gate slab).
@@ -2463,7 +2471,9 @@ mod real {
                     Ffn::Dense { gate, up, down } => {
                         kernels::matmul_q8_0(&mut st.gate_act, gate, &st.normed, s.n_embd, s.n_ff_dense, n_tok)?;
                         kernels::matmul_q8_0(&mut st.up_act, up, &st.normed, s.n_embd, s.n_ff_dense, n_tok)?;
-                        kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, n_tok * s.n_ff_dense, 0.0, 1.0, 0)?;
+                        // leading-dense layers share the arch's gated-FFN op
+                        // (M3: swiglu_oai on dense AND experts AND shexp)
+                        kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, n_tok * s.n_ff_dense, 0.0, 1.0, s.moe_act_op)?;
                         kernels::matmul_q8_0(&mut st.ffn_out, down, &st.ffn_mid, s.n_ff_dense, s.n_embd, n_tok)?;
                         kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, n_tok * s.n_embd)?;
                     }
