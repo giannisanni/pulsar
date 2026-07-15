@@ -290,7 +290,9 @@ fn run() -> engine::Result {
 
     // MTP speculative decode routes through engine::generate (the spec
     // loop lives there); greedy-only, so the one-shot default applies
-    if std::env::var("PULSAR_MTP").ok().as_deref() == Some("1") && dump_logits.is_none() {
+    if (std::env::var("PULSAR_MTP").ok().as_deref() == Some("1")
+        || std::env::var("PULSAR_NGRAM").is_ok())
+        && dump_logits.is_none() {
         let mut generated: Vec<u32> = Vec::new();
         let mut t_first: Option<std::time::Instant> = None;
         let mut sampler = engine::Sampler::new(0.0, 1.0, 0.0, 1);

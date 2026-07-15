@@ -1712,6 +1712,15 @@ mod real {
             // big default: each prefill chunk costs roughly one pass over
             // the expert corpus regardless of chunk size, so fewer chunks
             // win; activations at 512 cost only ~150MB
+            let spec_rows = (m.mtp_depth + 1)
+                .max(2)
+                .max(
+                    std::env::var("PULSAR_NGRAM")
+                        .ok()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .map(|d| d.clamp(1, 15) + 1)
+                        .unwrap_or(0),
+                );
             let mb = std::env::var("PULSAR_BATCH")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
@@ -1775,8 +1784,8 @@ mod real {
                 ctx,
                 max_batch: mb,
                 tok: DeviceBuf::alloc(mb as usize * 4)?,
-                // spec verify reads depth+1 trailing rows
-                last_row: f32s((m.mtp_depth + 1).max(2) * s.n_embd)?,
+                // spec verify reads depth+1 trailing rows (MTP or n-gram)
+                last_row: f32s((spec_rows) * s.n_embd)?,
                 cur: f32s(mb * s.n_embd)?,
                 normed: f32s(mb * s.n_embd)?,
                 q,
@@ -1831,7 +1840,7 @@ mod real {
                 )?,
                 kcache,
                 vcache,
-                logits: f32s((m.mtp_depth + 1).max(2) * s.n_vocab)?,
+                logits: f32s(spec_rows * s.n_vocab)?,
                 store: StreamingStore::open(&m.shards, cache_bytes)?,
                 prefetcher: Prefetcher::spawn(&m.shards)?,
                 pred_logits: f32s(s.n_expert)?,
@@ -1884,7 +1893,7 @@ mod real {
                 mtp_accepted: 0,
                 head_xq: if m.output_kq.is_some() {
                     DeviceBuf::alloc(
-                        (m.mtp_depth + 1).max(2) as usize * s.n_embd as usize
+                        spec_rows as usize * s.n_embd as usize
                             / kernels::Q8_K_BLOCK_ELEMS
                             * kernels::Q8_K_BLOCK_BYTES,
                     )?
@@ -2636,6 +2645,83 @@ mod real {
                 model.mtp_prefill_fill(st, chunk.len() as u32, pos)?;
             }
             pos += chunk.len() as u32;
+        }
+
+        // Draft-free n-gram speculation (PULSAR_NGRAM=depth, greedy only):
+        // propose the tokens that followed the longest recent-suffix match
+        // earlier in the context, verify the whole chain in ONE batch-union
+        // forward (rows are cheap - the union fetch is shared), accept the
+        // matching prefix. No draft model, no draft cost; pays exactly when
+        // output repeats context (code, quotes, lists).
+        let ngram_depth = std::env::var("PULSAR_NGRAM")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|_| sampler.is_greedy() && model.mtp.is_none());
+        if let Some(depth) = ngram_depth {
+            let v = model.shape.n_vocab as usize;
+            let depth = depth.clamp(1, 15);
+            let mut hist: Vec<u32> = prompt.to_vec();
+            let mut emitted = 0usize;
+            let mut next = argmax(logits.as_deref().ok_or("no logits")?);
+            while emitted < max_tokens {
+                if stop(next) || pos + 1 >= st.ctx() {
+                    model.forward_batch(st, &[next], pos, false)?;
+                    pos += 1;
+                    break;
+                }
+                on_token(next);
+                emitted += 1;
+                hist.push(next);
+                // longest suffix (4..=1) of hist that recurs earlier
+                let mut draft: Vec<u32> = Vec::new();
+                'outer: for m in (3..=4usize.min(hist.len().saturating_sub(1))).rev() {
+                    let suf = &hist[hist.len() - m..];
+                    let limit = hist.len() - m;
+                    for i in (0..limit).rev() {
+                        if &hist[i..i + m] == suf {
+                            let mut j = i + m;
+                            while draft.len() < depth && j < limit {
+                                draft.push(hist[j]);
+                                j += 1;
+                            }
+                            if !draft.is_empty() {
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+                if draft.is_empty() || pos + 2 + draft.len() as u32 >= st.ctx() {
+                    let lg = model
+                        .forward_batch(st, &[next], pos, true)?
+                        .ok_or("no logits")?;
+                    pos += 1;
+                    next = argmax(&lg);
+                    continue;
+                }
+                let mut chain = vec![next];
+                chain.extend_from_slice(&draft);
+                st.mtp_drafted += draft.len() as u64;
+                let all = model
+                    .forward_rows(st, &chain, pos, chain.len() as u32)?
+                    .ok_or("no verify logits")?;
+                let k = draft.len();
+                let mut j = 0usize;
+                while j < k && argmax(&all[j * v..(j + 1) * v]) == chain[j + 1] {
+                    st.mtp_accepted += 1;
+                    j += 1;
+                }
+                pos += (j + 1) as u32;
+                next = argmax(&all[j * v..(j + 1) * v]);
+                for &d in &chain[1..=j] {
+                    if stop(d) || emitted >= max_tokens {
+                        return Ok(pos);
+                    }
+                    on_token(d);
+                    emitted += 1;
+                    hist.push(d);
+                }
+            }
+            return Ok(pos);
         }
 
         if spec {

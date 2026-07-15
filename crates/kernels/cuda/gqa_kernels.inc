@@ -374,8 +374,8 @@ extern "C" int ds4_gpu_gqa_selftest(void) {
         /* kernel pipeline */
         int ok = ds4_gpu_gqa_head_rms_norm_weight(g_q, g_qnw, n_tok * n_head, hd, eps) &&
                  ds4_gpu_gqa_head_rms_norm_weight(g_k, g_knw, n_tok * n_kv_head, hd, eps) &&
-                 ds4_gpu_gqa_rope(g_q, n_tok, n_head, hd, pos0, theta) &&
-                 ds4_gpu_gqa_rope(g_k, n_tok, n_kv_head, hd, pos0, theta) &&
+                 ds4_gpu_gqa_rope(g_q, n_tok, n_head, hd, hd, pos0, theta) &&
+                 ds4_gpu_gqa_rope(g_k, n_tok, n_kv_head, hd, hd, pos0, theta) &&
                  ds4_gpu_gqa_kv_cache_append(g_kc, g_k, n_tok, n_kv_head, hd, cap, pos0) &&
                  ds4_gpu_gqa_kv_cache_append(g_vc, g_v, n_tok, n_kv_head, hd, cap, pos0) &&
                  ds4_gpu_gqa_attention(g_out, g_q, g_kc, g_vc, n_tok, n_head, n_kv_head, hd, cap, pos0) &&
