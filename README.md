@@ -13,17 +13,20 @@ a neutron star that spins fast and emits beams.
 
 ## What it does today
 
-Six model architectures on consumer GPUs — running: **Hy3 295B** (hy-v3,
-GQA), **GLM-5.2 743B** (glm-dsa, MLA + DSA sparse attention), and
-**Kimi K2.7 1T** (deepseek2, MLA + YaRN); code-complete, first runs
-pending: **MiniMax M3** (partial rotary), **Qwen3-235B/30B**
-(qwen3moe, softmax router), **Gemma 4 26B-A4B** (interleaved
-sliding-window attention, dual GELU FFN). Reference box: RTX 5060 Ti
-16GB + RTX 4060 Ti 16GB, Ryzen 9900X, 30GB RAM, one Gen5 NVMe.
+Seven model architectures on consumer GPUs — running: **Hy3 295B**
+(hy-v3, GQA), **GLM-5.2 743B** (glm-dsa, MLA + DSA sparse attention),
+**Kimi K2.7 1T** (deepseek2, MLA + YaRN), **MiniMax M3** (partial
+rotary, swiglu_oai), **Gemma 4 26B-A4B** (interleaved sliding-window
+attention, dual GELU FFN), and **TML Inkling 1T** (no rope — learned
+relative-position bias, shortconv streams, sink router; supported the
+day after release); code-complete, first run pending: **Qwen3-235B/30B**
+(qwen3moe, softmax router). Reference box: RTX 5060 Ti 16GB + RTX
+4060 Ti 16GB, Ryzen 9900X, 30GB RAM, one Gen5 NVMe.
 
 | decode | pulsar | reference engine (same box) |
 |---|---|---|
 | Kimi K2.7-Code 1T (339GB, 8-shard split gguf) | **1.3 tok/s** | – |
+| TML Inkling 1T (317GB, 8-shard split gguf) | **1.15 tok/s** | – |
 | Hy3 295B (85GB gguf) | **7.2 tok/s** | 0.64–0.70 (ds4) |
 | Gemma 4 26B-A4B (17GB gguf) | **36 tok/s** | – |
 | GLM-5.2 743B (197GB gguf) | **2.0 tok/s** | 0.40 (ds4) |
