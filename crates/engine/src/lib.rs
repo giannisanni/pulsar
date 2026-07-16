@@ -1533,7 +1533,9 @@ mod real {
                             kernels::zero(&mut z, shape.n_expert as usize * 4)?;
                             z
                         },
-                        shexp: if gguf.tensor(&t("ffn_gate_shexp.weight")).is_some() {
+                        // inkling's ffn_*_shexp are 3D BANKS (the sink
+                        // ExpertTensors below), not the 2D dense triple
+                        shexp: if !ink_arch && gguf.tensor(&t("ffn_gate_shexp.weight")).is_some() {
                             Some((
                                 upload(&file, &gguf, &t("ffn_gate_shexp.weight"))?,
                                 upload(&file, &gguf, &t("ffn_up_shexp.weight"))?,
@@ -1561,9 +1563,9 @@ mod real {
                         },
                         sink: if ink_arch {
                             Some([
-                                exps_sink("ffn_gate_shexps.weight")?,
-                                exps_sink("ffn_up_shexps.weight")?,
-                                exps_sink("ffn_down_shexps.weight")?,
+                                exps_sink("ffn_gate_shexp.weight")?,
+                                exps_sink("ffn_up_shexp.weight")?,
+                                exps_sink("ffn_down_shexp.weight")?,
                             ])
                         } else {
                             None

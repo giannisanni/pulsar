@@ -1881,13 +1881,16 @@ __device__ __forceinline__ static void mma_s8_16x8x16(
 #endif
 
 /* unpacker functors: 16 elements (chunk c of a 256-superblock) of one
- * row into int8[16] + one float scale. SB_BYTES = the superblock's byte
- * footprint in the row. Formats with per-superblock minima (q2_K, q4_K,
- * q5_K, q5_1) need a bsum term the harness doesn't carry yet. */
+ * row into int8[16] + one float scale + one float min offset. The chunk
+ * dot is scale * sumi - minoff * bsum (bsum = the activation chunk's
+ * int sum, q8_K keeps one per 16 elements); HAS_MIN=false formats leave
+ * minoff untouched and the harness compiles the bsum term out. */
 struct unpack_iq2_xxs {
+    static const bool HAS_MIN = false;
     static const uint32_t SB_BYTES = sizeof(block_iq2_xxs);
     __device__ __forceinline__ static void chunk16(
-            const char *block, uint32_t c, int32_t out[4], float *scale) {
+            const char *block, uint32_t c, int32_t out[4], float *scale, float *minoff) {
+        (void)minoff;
         const block_iq2_xxs *x = (const block_iq2_xxs *)block;
         const uint16_t *q2 = x->qs + (c >> 1) * 4u;
         const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
@@ -1905,9 +1908,11 @@ struct unpack_iq2_xxs {
 };
 
 struct unpack_iq2_xs {
+    static const bool HAS_MIN = false;
     static const uint32_t SB_BYTES = sizeof(block_iq2_xs);
     __device__ __forceinline__ static void chunk16(
-            const char *block, uint32_t c, int32_t out[4], float *scale) {
+            const char *block, uint32_t c, int32_t out[4], float *scale, float *minoff) {
+        (void)minoff;
         const block_iq2_xs *x = (const block_iq2_xs *)block;
         const uint32_t g = c >> 1;
         const uint32_t h = c & 1u;
@@ -1927,9 +1932,11 @@ struct unpack_iq2_xs {
 };
 
 struct unpack_iq3_xxs {
+    static const bool HAS_MIN = false;
     static const uint32_t SB_BYTES = sizeof(block_iq3_xxs);
     __device__ __forceinline__ static void chunk16(
-            const char *block, uint32_t c, int32_t out[4], float *scale) {
+            const char *block, uint32_t c, int32_t out[4], float *scale, float *minoff) {
+        (void)minoff;
         const block_iq3_xxs *x = (const block_iq3_xxs *)block;
         const uint32_t g = c >> 1;
         const uint32_t h = c & 1u;
@@ -1953,9 +1960,11 @@ struct unpack_iq3_xxs {
 };
 
 struct unpack_q4_0 {
+    static const bool HAS_MIN = false;
     static const uint32_t SB_BYTES = 8u * sizeof(block_q4_0);
     __device__ __forceinline__ static void chunk16(
-            const char *block, uint32_t c, int32_t out[4], float *scale) {
+            const char *block, uint32_t c, int32_t out[4], float *scale, float *minoff) {
+        (void)minoff;
         const block_q4_0 *x = (const block_q4_0 *)block + (c >> 1);
         const uint32_t shift = (c & 1u) * 4u; /* low / high nibbles */
         #pragma unroll
@@ -1966,6 +1975,192 @@ struct unpack_q4_0 {
             out[j] = __vsub4((int32_t)((v >> shift) & 0x0f0f0f0fu), 0x08080808);
         }
         *scale = f16_to_f32(x->d);
+    }
+};
+
+struct unpack_q8_0 {
+    static const bool HAS_MIN = false;
+    static const uint32_t SB_BYTES = 8u * sizeof(q8_0_block);
+    __device__ __forceinline__ static void chunk16(
+            const char *block, uint32_t c, int32_t out[4], float *scale, float *minoff) {
+        (void)minoff;
+        const q8_0_block *x = (const q8_0_block *)block + (c >> 1);
+        const int8_t *q = x->q + (c & 1u) * 16u; /* 2-byte aligned */
+        #pragma unroll
+        for (uint32_t j = 0; j < 4; j++) memcpy(&out[j], q + j * 4u, 4u);
+        *scale = f16_to_f32(x->scale_f16);
+    }
+};
+
+struct unpack_iq4_xs {
+    static const bool HAS_MIN = false;
+    static const uint32_t SB_BYTES = sizeof(block_iq4_xs);
+    __device__ __forceinline__ static void chunk16(
+            const char *block, uint32_t c, int32_t out[4], float *scale, float *minoff) {
+        (void)minoff;
+        const block_iq4_xs *x = (const block_iq4_xs *)block;
+        const uint32_t s = c >> 1;
+        const uint32_t shift = (c & 1u) * 4u;
+        #pragma unroll
+        for (uint32_t j = 0; j < 4; j++) {
+            int8_t r[4];
+            #pragma unroll
+            for (uint32_t k = 0; k < 4; k++) {
+                r[k] = kd_iq4nl[(x->qs[s * 16u + j * 4u + k] >> shift) & 0xfu];
+            }
+            memcpy(&out[j], r, 4u);
+        }
+        const int ls = (int)(((x->scales_l[s >> 1] >> (4u * (s & 1u))) & 0xfu) |
+                             (((x->scales_h >> (2u * s)) & 3u) << 4u)) - 32;
+        *scale = f16_to_f32(x->d) * (float)ls;
+    }
+};
+
+/* minima formats: chunk dot = scale*sumi - minoff*bsum. q5_1 ADDS its
+ * offset m (minoff = -m folds the sign). */
+struct unpack_q5_1 {
+    static const bool HAS_MIN = true;
+    static const uint32_t SB_BYTES = 8u * sizeof(block_q5_1);
+    __device__ __forceinline__ static void chunk16(
+            const char *block, uint32_t c, int32_t out[4], float *scale, float *minoff) {
+        const block_q5_1 *x = (const block_q5_1 *)block + (c >> 1);
+        uint32_t qh;
+        memcpy(&qh, &x->qh, 4u);
+        const uint32_t hs = (c & 1u) * 16u; /* qh bit base for this half */
+        const uint32_t shift = (c & 1u) * 4u;
+        #pragma unroll
+        for (uint32_t j = 0; j < 4; j++) {
+            uint32_t v;
+            memcpy(&v, x->qs + j * 4u, 4u);
+            const uint32_t hb = (((qh >> (hs + j * 4u + 0u)) & 1u) << 4)
+                              | (((qh >> (hs + j * 4u + 1u)) & 1u) << 12)
+                              | (((qh >> (hs + j * 4u + 2u)) & 1u) << 20)
+                              | (((qh >> (hs + j * 4u + 3u)) & 1u) << 28);
+            out[j] = (int32_t)(((v >> shift) & 0x0f0f0f0fu) | hb);
+        }
+        *scale = f16_to_f32(x->d);
+        *minoff = -f16_to_f32(x->m);
+    }
+};
+
+struct unpack_q2_K {
+    static const bool HAS_MIN = true;
+    static const uint32_t SB_BYTES = sizeof(block_q2_K);
+    __device__ __forceinline__ static void chunk16(
+            const char *block, uint32_t c, int32_t out[4], float *scale, float *minoff) {
+        const block_q2_K *x = (const block_q2_K *)block;
+        const uint32_t boff = (c >> 3u) * 32u + (c & 1u) * 16u;
+        const uint32_t shift = 2u * ((c >> 1u) & 3u);
+        #pragma unroll
+        for (uint32_t j = 0; j < 4; j++) {
+            uint32_t v;
+            memcpy(&v, x->qs + boff + j * 4u, 4u);
+            out[j] = (int32_t)((v >> shift) & 0x03030303u);
+        }
+        const uint32_t sb = x->scales[c]; /* 16 sub-blocks == 16 chunks */
+        *scale = f16_to_f32(x->d) * (float)(sb & 0xfu);
+        *minoff = f16_to_f32(x->dmin) * (float)(sb >> 4);
+    }
+};
+
+struct unpack_q3_K {
+    static const bool HAS_MIN = false; /* centered by hmask, no minima */
+    static const uint32_t SB_BYTES = sizeof(block_q3_K);
+    __device__ __forceinline__ static void chunk16(
+            const char *block, uint32_t c, int32_t out[4], float *scale, float *minoff) {
+        (void)minoff;
+        const block_q3_K *x = (const block_q3_K *)block;
+        const uint32_t boff = (c >> 3u) * 32u + (c & 1u) * 16u;
+        const uint32_t shift = 2u * ((c >> 1u) & 3u);
+        const uint32_t hbit = c >> 1u;      /* hmask bit for this chunk */
+        const uint32_t hoff = (c & 1u) * 16u;
+        #pragma unroll
+        for (uint32_t j = 0; j < 4; j++) {
+            uint32_t v, h;
+            memcpy(&v, x->qs + boff + j * 4u, 4u);
+            memcpy(&h, x->hmask + hoff + j * 4u, 4u);
+            /* q = lo2 - (hbit set ? 0 : 4) */
+            const int32_t miss = __vcmpeq4((int32_t)((h >> hbit) & 0x01010101u), 0);
+            out[j] = __vsub4((int32_t)((v >> shift) & 0x03030303u),
+                             (int32_t)(0x04040404u & (uint32_t)miss));
+        }
+        int8_t sc[16];
+        k3_unpack_scales(x->scales, sc);
+        *scale = f16_to_f32(x->d) * (float)sc[c];
+    }
+};
+
+struct unpack_q6_K {
+    static const bool HAS_MIN = false; /* centered -32, signed scales */
+    static const uint32_t SB_BYTES = sizeof(block_q6_K);
+    __device__ __forceinline__ static void chunk16(
+            const char *block, uint32_t c, int32_t out[4], float *scale, float *minoff) {
+        (void)minoff;
+        const block_q6_K *x = (const block_q6_K *)block;
+        const uint32_t k = c >> 3u;       /* 128-element half */
+        const uint32_t cc = c & 7u;       /* chunk within the half */
+        const uint32_t qq = cc >> 1u;     /* quarter: q1/q2/q3/q4 region */
+        const uint32_t loff = k * 64u + (qq & 1u) * 32u + (cc & 1u) * 16u;
+        const uint32_t hoff = k * 32u + (cc & 1u) * 16u;
+        const uint32_t lsh = (qq >> 1u) * 4u;
+        const uint32_t hsh = qq * 2u;
+        #pragma unroll
+        for (uint32_t j = 0; j < 4; j++) {
+            uint32_t v, h; /* 210-byte blocks: 2-aligned, memcpy only */
+            memcpy(&v, x->ql + loff + j * 4u, 4u);
+            memcpy(&h, x->qh + hoff + j * 4u, 4u);
+            const uint32_t q = ((v >> lsh) & 0x0f0f0f0fu)
+                             | (((h >> hsh) & 0x03030303u) << 4);
+            out[j] = __vsub4((int32_t)q, 0x20202020);
+        }
+        *scale = f16_to_f32(x->d) * (float)x->scales[c];
+    }
+};
+
+struct unpack_q4_K {
+    static const bool HAS_MIN = true;
+    static const uint32_t SB_BYTES = sizeof(block_q4_K);
+    __device__ __forceinline__ static void chunk16(
+            const char *block, uint32_t c, int32_t out[4], float *scale, float *minoff) {
+        const block_q4_K *x = (const block_q4_K *)block;
+        const uint32_t s = c >> 1u;                       /* sub-block 0..7 */
+        const uint32_t boff = (s >> 1u) * 32u + (c & 1u) * 16u;
+        const uint32_t shift = (s & 1u) * 4u;
+        #pragma unroll
+        for (uint32_t j = 0; j < 4; j++) {
+            uint32_t v;
+            memcpy(&v, x->qs + boff + j * 4u, 4u);
+            out[j] = (int32_t)((v >> shift) & 0x0f0f0f0fu);
+        }
+        uint8_t sc, m;
+        k4_scale_min(s, x->scales, &sc, &m);
+        *scale = f16_to_f32(x->d) * (float)sc;
+        *minoff = f16_to_f32(x->dmin) * (float)m;
+    }
+};
+
+struct unpack_q5_K {
+    static const bool HAS_MIN = true;
+    static const uint32_t SB_BYTES = sizeof(block_q5_K);
+    __device__ __forceinline__ static void chunk16(
+            const char *block, uint32_t c, int32_t out[4], float *scale, float *minoff) {
+        const block_q5_K *x = (const block_q5_K *)block;
+        const uint32_t s = c >> 1u;
+        const uint32_t boff = (s >> 1u) * 32u + (c & 1u) * 16u;
+        const uint32_t shift = (s & 1u) * 4u;
+        const uint32_t hoff = (c & 1u) * 16u; /* qh byte base (no j advance) */
+        #pragma unroll
+        for (uint32_t j = 0; j < 4; j++) {
+            uint32_t v, h;
+            memcpy(&v, x->qs + boff + j * 4u, 4u);
+            memcpy(&h, x->qh + hoff + j * 4u, 4u);
+            const uint32_t hb = ((h >> s) & 0x01010101u) << 4;
+            out[j] = (int32_t)(((v >> shift) & 0x0f0f0f0fu) | hb);
+        }
+        uint8_t sc, m;
+        k4_scale_min(s, x->scales, &sc, &m);
+        *scale = f16_to_f32(x->d) * (float)sc;
+        *minoff = f16_to_f32(x->dmin) * (float)m;
     }
 };
 
@@ -2004,6 +2199,10 @@ __global__ static void moe_grouped_mma_kernel(
     /* A rows for this block's tile, gate and up as two planes */
     __shared__ int8_t a_s[2][16][256];
     __shared__ float s_w[2][16][16];
+    /* per-chunk min offsets (minima formats): dot = sc*sumi - mo*bsum.
+     * dimensioned [2] unconditionally: the !HAS_MIN branches are dead
+     * code but still type-checked, and [1]-dim indexing would be UB */
+    __shared__ float s_m[2][16][16];
     const uint32_t planes = KIND == 0 ? 2u : 1u;
 
     const uint32_t n_tiles = (len + 7u) / 8u;
@@ -2029,13 +2228,15 @@ __global__ static void moe_grouped_mma_kernel(
                             ? (pl == 0 ? p.gate : p.up) : p.down);
                     int32_t w4[4] = {0, 0, 0, 0};
                     float sc = 0.0f;
+                    float mo = 0.0f;
                     if (r0 + r < n_rows) {
                         UNPACK::chunk16(base + (uint64_t)(r0 + r) * row_bytes
                                                 + (uint64_t)sb * UNPACK::SB_BYTES,
-                                        c, w4, &sc);
+                                        c, w4, &sc, &mo);
                     }
                     *(int4 *)&a_s[pl][r][c * 16u] = *(const int4 *)w4;
                     s_w[pl][r][c] = sc;
+                    if (UNPACK::HAS_MIN) s_m[pl][r][c] = mo;
                 }
             }
             __syncthreads();
@@ -2059,18 +2260,38 @@ __global__ static void moe_grouped_mma_kernel(
                 const char *yb = pr_b != 0xffffffffu
                         ? (const char *)actq + ((uint64_t)arow_b * n_blocks + sb) * sizeof(block_q8_K)
                         : NULL;
-                const float d0 = pr_c0 != 0xffffffffu
-                        ? ((const block_q8_K *)((const char *)actq + ((uint64_t)arow_c0 * n_blocks + sb) * sizeof(block_q8_K)))->d
-                        : 0.0f;
-                const float d1 = pr_c1 != 0xffffffffu
-                        ? ((const block_q8_K *)((const char *)actq + ((uint64_t)arow_c1 * n_blocks + sb) * sizeof(block_q8_K)))->d
-                        : 0.0f;
+                const char *yc0 = pr_c0 != 0xffffffffu
+                        ? (const char *)actq + ((uint64_t)arow_c0 * n_blocks + sb) * sizeof(block_q8_K)
+                        : NULL;
+                const char *yc1 = pr_c1 != 0xffffffffu
+                        ? (const char *)actq + ((uint64_t)arow_c1 * n_blocks + sb) * sizeof(block_q8_K)
+                        : NULL;
+                const float d0 = yc0 ? ((const block_q8_K *)yc0)->d : 0.0f;
+                const float d1 = yc1 ? ((const block_q8_K *)yc1)->d : 0.0f;
 
                 #pragma unroll
                 for (uint32_t ch = 0; ch < 16u; ch++) {
                     const int32_t b = yb
                             ? *(const int32_t *)(yb + 4u + ch * 16u + tg * 4u)
                             : 0;
+                    /* minima formats: chunk dot = sc*sumi - mo*bsum; the
+                     * bsum rides the same activation scale d as sumi.
+                     * q8_K bsums: one i16 per 16-element chunk at +260 */
+                    float bs0 = 0.0f, bs1 = 0.0f;
+                    if (UNPACK::HAS_MIN) {
+                        bs0 = yc0 ? (float)((const int16_t *)(yc0 + 4u + 256u))[ch] : 0.0f;
+                        bs1 = yc1 ? (float)((const int16_t *)(yc1 + 4u + 256u))[ch] : 0.0f;
+                        accg[t][0] -= s_m[0][g][ch] * bs0 * d0;
+                        accg[t][1] -= s_m[0][g][ch] * bs1 * d1;
+                        accg[t][2] -= s_m[0][g + 8u][ch] * bs0 * d0;
+                        accg[t][3] -= s_m[0][g + 8u][ch] * bs1 * d1;
+                        if (KIND == 0) {
+                            accu[t][0] -= s_m[1][g][ch] * bs0 * d0;
+                            accu[t][1] -= s_m[1][g][ch] * bs1 * d1;
+                            accu[t][2] -= s_m[1][g + 8u][ch] * bs0 * d0;
+                            accu[t][3] -= s_m[1][g + 8u][ch] * bs1 * d1;
+                        }
+                    }
                     int32_t a[2], dsum[4];
                     a[0] = *(const int32_t *)&a_s[0][g][ch * 16u + tg * 4u];
                     a[1] = *(const int32_t *)&a_s[0][g + 8u][ch * 16u + tg * 4u];
@@ -2179,6 +2400,14 @@ extern "C" int pulsar_moe_pair_swiglu_grouped(
         PULSAR_MMA_PAIR(PULSAR_QUANT_IQ2_XS, unpack_iq2_xs);
         PULSAR_MMA_PAIR(PULSAR_QUANT_IQ3_XXS, unpack_iq3_xxs);
         PULSAR_MMA_PAIR(PULSAR_QUANT_Q4_0, unpack_q4_0);
+        PULSAR_MMA_PAIR(PULSAR_QUANT_Q8_0, unpack_q8_0);
+        PULSAR_MMA_PAIR(PULSAR_QUANT_IQ4_XS, unpack_iq4_xs);
+        PULSAR_MMA_PAIR(PULSAR_QUANT_Q5_1, unpack_q5_1);
+        PULSAR_MMA_PAIR(PULSAR_QUANT_Q2_K, unpack_q2_K);
+        PULSAR_MMA_PAIR(PULSAR_QUANT_Q3_K, unpack_q3_K);
+        PULSAR_MMA_PAIR(PULSAR_QUANT_Q4_K, unpack_q4_K);
+        PULSAR_MMA_PAIR(PULSAR_QUANT_Q5_K, unpack_q5_K);
+        PULSAR_MMA_PAIR(PULSAR_QUANT_Q6_K, unpack_q6_K);
 #undef PULSAR_MMA_PAIR
         default: break;
         }
@@ -2222,6 +2451,14 @@ extern "C" int pulsar_moe_down_grouped(
         PULSAR_MMA_DOWN(PULSAR_QUANT_IQ2_XS, unpack_iq2_xs);
         PULSAR_MMA_DOWN(PULSAR_QUANT_IQ3_XXS, unpack_iq3_xxs);
         PULSAR_MMA_DOWN(PULSAR_QUANT_Q4_0, unpack_q4_0);
+        PULSAR_MMA_DOWN(PULSAR_QUANT_Q8_0, unpack_q8_0);
+        PULSAR_MMA_DOWN(PULSAR_QUANT_IQ4_XS, unpack_iq4_xs);
+        PULSAR_MMA_DOWN(PULSAR_QUANT_Q5_1, unpack_q5_1);
+        PULSAR_MMA_DOWN(PULSAR_QUANT_Q2_K, unpack_q2_K);
+        PULSAR_MMA_DOWN(PULSAR_QUANT_Q3_K, unpack_q3_K);
+        PULSAR_MMA_DOWN(PULSAR_QUANT_Q4_K, unpack_q4_K);
+        PULSAR_MMA_DOWN(PULSAR_QUANT_Q5_K, unpack_q5_K);
+        PULSAR_MMA_DOWN(PULSAR_QUANT_Q6_K, unpack_q6_K);
 #undef PULSAR_MMA_DOWN
         default: break;
         }
