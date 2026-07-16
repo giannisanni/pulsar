@@ -90,3 +90,45 @@ already (gqa fp8 KV); hadamard128 + e2m1 are new small device fns.
 
 Projected decode: ~8B active, ~1.7GB/token reads -> 10-15 tok/s on the
 reference box.
+
+## Session-2 recon additions
+
+### Attention core (layer_attention_rows_one ~7045)
+K and V are the SAME 512-wide latent row (score dot AND value accumulate
+read kv_rows). kv_head=1. Per-head SINK logit: max/denominator include
+sinks[h], no value contribution. scale 1/sqrt(512).
+
+### Output projection (layer_grouped_out_one ~7100)
+64 heads x 512 = 32768 -> 8 GROUPS of 8 heads (group_dim 4096);
+attn_output_a = 8 banks of [4096 -> 1024] (tensor [4096, 8192]); concat
+8x1024 = 8192 -> attn_output_b [8192 -> 4096]. Q8_0 both.
+
+### Compressor (compressor_decode_one ~8663) - KV cache compression
+Per position: kv_cur/sc_cur = attn_compressor_{kv,gate} projections of x
+(q8_0 pair matvec); sc_cur += ape[:, pos % R] (additive PE). Rows land in
+rolling state [2R x width] (R = compress_ratio, coff=2 when R=4). Every
+R-th position: score-weighted pool (compressor_pool_decode_state) ->
+rms*norm -> rope at compressed position (pos+1-R) -> fp8 e4m3 quant
+(main, head_dim 512) or hadamard+fp4 QAT (indexer, head_dim 128) ->
+emitted as ONE compressed cache row. So the cache = compressed history
+rows + recent raw rows (+ sliding window n_swa - read attention assembly
+still TODO). prefill has a batch path + compressor_finish_prefill_state.
+
+### Hyper-connections callers (~6440-6560) - COMPLETE
+- init: hc_from_plain_embedding = all 4 streams get the token embedding
+- pre (per block): flat = rms_norm_no_weight(concat 4 streams, 16384) as
+  ONE norm; mix[24] = hc_fn^T flat (f16); split via sinkhorn fn;
+  block_in = sum_src pre[src] * streams_RAW[src]; keep post[4], comb[16]
+- post: stream'[dst] = post[dst]*block_out + sum_src comb[dst + src*4] *
+  stream[src]  (comb addressed [dst, src] with dst fastest)
+- attn and ffn each have their own fn/scale/base; output_hc_* merges the
+  4 streams before output_norm (exact merge form: check output_hc use)
+
+### Still to read
+- layer_topk_selected_experts + sqrt(softplus) probs + gating_func 4 +
+  hash router weights (~7327-7460)
+- attention row assembly at decode/prefill: sliding window n_swa + raw +
+  compressed rows + q/kv construction (q_a/q_a_norm/q_b, kv/kv_a_norm,
+  rope split 64 of 512, fp8 cache quant call sites)
+- chat-v2 template markers; clamp metadata key for expert act
+- output_hc merge exact form
