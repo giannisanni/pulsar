@@ -43,6 +43,14 @@ compute-bound, not streaming-bound.
 † Measured before the n=64 standardization and not yet re-run (model deleted
 to free disk); the sustained rate is likely a little lower than shown.
 
+Decode rate slides with output length on the streaming models: a longer
+generation routes to a wider set of experts, so the disk-miss fraction
+creeps up until the working set saturates. Hy3 measures 5.7 tok/s at n=64,
+4.5 at n=128, 4.2 at n=256, converging toward a ~4 tok/s floor set by how
+much of the expert working set fits in host RAM (more RAM lifts the whole
+curve). n=64 is the reported standard; long outputs run nearer the floor.
+Gemma is exempt: its weights are fully resident, so no disk is in the loop.
+
 Prefill runs the quantized weights through int8 tensor cores: Hy3
 **28 tok/s** (1.8× over dp4a, ds4 0.44), GLM-5.2 **15 tok/s** (2.7×).
 Warm start: hot experts bulk-load in **~3s**. (ds4 = NeutronStar, the
