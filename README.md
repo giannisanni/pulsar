@@ -13,19 +13,25 @@ a neutron star that spins fast and emits beams.
 
 ## What it does today
 
-Seven model architectures running on consumer GPUs: **Hy3 295B**
+Eight model architectures running on consumer GPUs: **Hy3 295B**
 (hy-v3, GQA), **GLM-5.2 743B** (glm-dsa, MLA + DSA sparse attention),
 **Kimi K2.7 1T** (deepseek2, MLA + YaRN), **MiniMax M3** (partial
 rotary, swiglu_oai), **Gemma 4 26B-A4B** (interleaved sliding-window
 attention, dual GELU FFN), **TML Inkling 1T** (no rope, learned
 relative-position bias, shortconv streams, sink router; supported the
-day after release), and **Qwen3-235B-A22B** (qwen3moe, softmax router;
-correct output on its first-ever run). Reference box: RTX 5060 Ti 16GB +
-RTX 4060 Ti 16GB, Ryzen 9900X, 30GB RAM, one Gen5 NVMe.
+day after release), **Qwen3-235B-A22B** (qwen3moe, softmax router;
+correct output on its first-ever run), and **DeepSeek-V4-Flash 284B**
+(deepseek4: 4-stream hyper-connection residual with Sinkhorn gates,
+sink attention over a sliding window plus streaming compressed KV,
+fp8/fp4 cache quantization-aware sims, token-id hash routing on the
+early layers; also correct output on its first-ever run). Reference
+box: RTX 5060 Ti 16GB + RTX 4060 Ti 16GB, Ryzen 9900X, 30GB RAM, one
+Gen5 NVMe.
 
 | Model | Total | Active / token | gguf | Decode, warm | vs ds4, same box |
 |---|---|---|---|---|---|
 | Gemma 4 26B-A4B | 26B | 4B | 16GB (Q4_K_XL) | **41 tok/s** | – |
+| DeepSeek-V4-Flash | 284B | ~8B (top-6 of 256 + shared) | 87GB (ds4 recipe) | **5.9 tok/s** | – |
 | Hy3 295B | 295B | 21B (top-8 of 192) | 79GB (IQ2_XXS) | **5.3 tok/s** | 0.64–0.70 |
 | Qwen3-235B-A22B | 235B | 22B (top-8 of 128) | 83GB (Q2_K_XL) | **4.6 tok/s** | – |
 | MiniMax M3 | 428B | 23B | 134GB (Q2_K_XL) | **3.4 tok/s** | – |
@@ -44,6 +50,12 @@ compute-bound, not streaming-bound.
 † Measured before the n=64 standardization and not yet re-run (model deleted
 to free disk); the sustained rate is likely a little lower than shown, as
 GLM-5.2's re-measurement confirmed (2.0 -> 1.7).
+
+DeepSeek-V4-Flash prefill currently runs at decode speed: the V4 graph's
+sliding-window ring and streaming KV compressor are per-token state
+machines, and the first port processes prompts sequentially. Long-context
+retrieval works (needle recall at 2.4k ctx through compressed rows with
+live indexer top-k masking); batched prefill is on the roadmap.
 
 Decode rate slides with output length on the streaming models: a longer
 generation routes to a wider set of experts, so the disk-miss fraction

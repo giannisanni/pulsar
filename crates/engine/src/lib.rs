@@ -540,7 +540,6 @@ mod real {
         ape: Vec<f32>,
         norm: Vec<f32>, // host RMS weight [head_dim]
         width: u32,
-        head_dim: u32,
     }
 
     struct Dsv4IdxW {
@@ -1856,7 +1855,7 @@ mod real {
                             buf.write(0, &bytes)?;
                             Ok(buf)
                         };
-                        let comp_lane = |prefix: &str, head_dim: u32, budget: &mut i64| -> Result<Dsv4CompW> {
+                        let comp_lane = |prefix: &str, budget: &mut i64| -> Result<Dsv4CompW> {
                             let kv_name = t(&format!("{prefix}_kv.weight"));
                             let ti = gguf.tensor(&kv_name).ok_or_else(|| meta_err(&kv_name))?;
                             let width = ti.dims[1] as u32;
@@ -1866,7 +1865,6 @@ mod real {
                                 ape: read_f16_as_f32(&file, &gguf, &t(&format!("{prefix}_ape.weight")))?,
                                 norm: read_tensor_f32(&file, &gguf, &t(&format!("{prefix}_norm.weight")))?,
                                 width,
-                                head_dim,
                             })
                         };
                         let tid2eid = if gguf.tensor(&t("ffn_gate_tid2eid.weight")).is_some() {
@@ -1903,7 +1901,7 @@ mod real {
                             },
                             tid2eid,
                             comp: if ratio != 0 {
-                                Some(comp_lane("attn_compressor", shape.head_dim, &mut *attn_vram_budget)?)
+                                Some(comp_lane("attn_compressor", &mut *attn_vram_budget)?)
                             } else {
                                 None
                             },
@@ -1911,7 +1909,7 @@ mod real {
                                 Some(Dsv4IdxW {
                                     q_b: upload_f16_q8(&t("indexer.attn_q_b.weight"), &mut *attn_vram_budget)?,
                                     proj: upload_f16_as_f32(&file, &gguf, &t("indexer.proj.weight"))?,
-                                    comp: comp_lane("indexer_compressor", shape.n_idx_dim, &mut *attn_vram_budget)?,
+                                    comp: comp_lane("indexer_compressor", &mut *attn_vram_budget)?,
                                 })
                             } else {
                                 None
