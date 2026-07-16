@@ -25,6 +25,7 @@ fn parse_type(s: &str) -> Result<TensorType, String> {
         "q4_k" => TensorType::Q4K,
         "q5_k" => TensorType::Q5K,
         "q6_k" => TensorType::Q6K,
+        "iq2_xxs" => TensorType::IQ2XXS,
         "f16" => TensorType::F16,
         "f32" => TensorType::F32,
         other => return Err(format!("unknown target type {other} (stage 1: q8_0 q2_k..q6_k f16 f32)")),
@@ -146,6 +147,7 @@ fn run() -> Result<(), String> {
     let mut output = None;
     let mut maps: Vec<(String, TensorType)> = Vec::new();
     let mut default_ty = TensorType::Q8_0;
+    let mut imatrix_path: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut need = |what: &str| args.next().ok_or(format!("{what} needs a value"));
@@ -159,11 +161,16 @@ fn run() -> Result<(), String> {
                 }
             }
             "--default" => default_ty = parse_type(&need("--default")?)?,
+            "--imatrix" => imatrix_path = Some(need("--imatrix")?),
             other => return Err(format!("unknown arg {other}")),
         }
     }
     let input = std::path::PathBuf::from(input.ok_or("-i required")?);
     let output = std::path::PathBuf::from(output.ok_or("-o required")?);
+    let imatrix = match &imatrix_path {
+        Some(p) => Some(quant::iq::read_imatrix(std::path::Path::new(p))?),
+        None => None,
+    };
 
     // ---- read headers (single file or split), build virtual view
     let shard_paths = gguf::split_shards(&input).unwrap_or_else(|| vec![input.clone()]);
@@ -203,7 +210,8 @@ fn run() -> Result<(), String> {
             .unwrap_or(default_ty);
         let row = dims[0];
         let ok = match want {
-            TensorType::Q2K | TensorType::Q3K | TensorType::Q4K | TensorType::Q5K | TensorType::Q6K => row % 256 == 0,
+            TensorType::Q2K | TensorType::Q3K | TensorType::Q4K | TensorType::Q5K
+            | TensorType::Q6K | TensorType::IQ2XXS => row % 256 == 0,
             TensorType::Q8_0 => row % 32 == 0,
             _ => true,
         };
@@ -226,7 +234,19 @@ fn run() -> Result<(), String> {
             TensorType::F32 | TensorType::F16 | TensorType::BF16 => {}
             other => return Err(format!("{}: source type {other:?} is not a float type", t.name)),
         }
-        let ty = pick(&t.name, &t.dims);
+        let mut ty = pick(&t.name, &t.dims);
+        if ty == TensorType::IQ2XXS {
+            let row = t.dims[0];
+            let n_exp = t.dims.get(2).copied().unwrap_or(1);
+            let ok = imatrix
+                .as_ref()
+                .and_then(|m| m.get(&t.name))
+                .is_some_and(|e| e.len() as u64 == row || e.len() as u64 == row * n_exp);
+            if !ok {
+                eprintln!("pulsar-quant: {} has no usable imatrix entry, falling back to q2_k", t.name);
+                ty = TensorType::Q2K;
+            }
+        }
         let row = *t.dims.first().unwrap_or(&1);
         let rows: u64 = t.dims.iter().skip(1).product::<u64>().max(1);
         let bytes = ty.row_bytes(row).ok_or("row_bytes")? * rows;
@@ -305,12 +325,23 @@ fn run() -> Result<(), String> {
                 let hi = ((c + 1) * chunk_rows).min(rows);
                 let src = &src[lo * src_row_bytes..hi * src_row_bytes];
                 let (src_ty, out_ty) = (t.src_ty, t.ty);
+                let entry = imatrix.as_ref().and_then(|m| m.get(&t.name));
+                let ne1 = t.dims.get(1).copied().unwrap_or(1) as usize;
                 handles.push(s.spawn(move || -> Result<Vec<u8>, String> {
                     let mut buf = Vec::with_capacity((hi - lo) * out_row_bytes);
                     let mut f32row = Vec::with_capacity(row);
-                    for r in src.chunks_exact(src_row_bytes) {
+                    for (k, r) in src.chunks_exact(src_row_bytes).enumerate() {
                         quant::row_to_f32(src_ty, r, &mut f32row)?;
-                        quant::quantize_row(out_ty, &f32row, &mut buf)?;
+                        let qw = entry.map(|e| {
+                            if e.len() == row {
+                                &e[..]
+                            } else {
+                                // per-expert imatrix: ne0 * n_expert values
+                                let expert = (lo + k) / ne1.max(1);
+                                &e[expert * row..(expert + 1) * row]
+                            }
+                        });
+                        quant::quantize_row(out_ty, &f32row, qw, &mut buf)?;
                     }
                     Ok(buf)
                 }));

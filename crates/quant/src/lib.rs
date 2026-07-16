@@ -7,6 +7,8 @@
 //! Stage 1 formats: q8_0 (attn/dense in the ds4-style recipe) and the
 //! K-quants q2_K..q6_K. Stage 2 adds iq2_xxs/iq2_xs/iq3_xxs + imatrix.
 
+pub mod iq;
+
 pub const QK8_0: usize = 32;
 pub const QK_K: usize = 256;
 
@@ -677,8 +679,15 @@ pub fn quantize_row_q6_k(x: &[f32], out: &mut Vec<u8>) {
     }
 }
 
-/// Quantize one logical row into `out` as `ty`.
-pub fn quantize_row(ty: gguf::TensorType, x: &[f32], out: &mut Vec<u8>) -> Result<(), String> {
+/// Quantize one logical row into `out` as `ty`. `qw` = per-column imatrix
+/// weights; required for iq2_xxs, ignored elsewhere (stage 2 keeps the
+/// K-quant paths imatrix-free like llama-quantize without one).
+pub fn quantize_row(
+    ty: gguf::TensorType,
+    x: &[f32],
+    qw: Option<&[f32]>,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
     match ty {
         gguf::TensorType::Q8_0 => quantize_row_q8_0(x, out),
         gguf::TensorType::Q2K => quantize_row_q2_k(x, out),
@@ -686,6 +695,10 @@ pub fn quantize_row(ty: gguf::TensorType, x: &[f32], out: &mut Vec<u8>) -> Resul
         gguf::TensorType::Q4K => quantize_row_q4_k(x, out),
         gguf::TensorType::Q5K => quantize_row_q5_k(x, out),
         gguf::TensorType::Q6K => quantize_row_q6_k(x, out),
+        gguf::TensorType::IQ2XXS => {
+            let qw = qw.ok_or("iq2_xxs requires an imatrix (--imatrix)")?;
+            iq::quantize_row_iq2_xxs(x, qw, out);
+        }
         gguf::TensorType::F32 => out.extend(x.iter().flat_map(|v| v.to_le_bytes())),
         gguf::TensorType::F16 => out.extend(x.iter().flat_map(|v| f32_to_f16(*v).to_le_bytes())),
         other => return Err(format!("no encoder for {other:?}")),
@@ -869,7 +882,7 @@ mod tests {
     fn check(ty: gguf::TensorType, max_rel_rmse: f32) {
         let x = rand_rows(QK_K * 8, 42);
         let mut enc = Vec::new();
-        quantize_row(ty, &x, &mut enc).unwrap();
+        quantize_row(ty, &x, None, &mut enc).unwrap();
         let (bs, bb) = ty.block_layout().unwrap();
         assert_eq!(enc.len() as u64, (x.len() as u64 / bs) * bb, "{ty:?} size");
         let mut dec = Vec::new();
