@@ -94,6 +94,32 @@ impl TensorType {
         }
     }
 
+    /// Inverse of from_id, for writers.
+    pub fn to_id(self) -> u32 {
+        match self {
+            Self::F32 => 0,
+            Self::F16 => 1,
+            Self::Q4_0 => 2,
+            Self::Q5_1 => 7,
+            Self::Q8_0 => 8,
+            Self::Q2K => 10,
+            Self::Q3K => 11,
+            Self::Q4K => 12,
+            Self::Q5K => 13,
+            Self::Q6K => 14,
+            Self::Q8K => 15,
+            Self::IQ2XXS => 16,
+            Self::IQ2XS => 17,
+            Self::IQ3XXS => 18,
+            Self::IQ4NL => 20,
+            Self::IQ3S => 21,
+            Self::IQ2S => 22,
+            Self::IQ4XS => 23,
+            Self::BF16 => 30,
+            Self::Other(id) => id,
+        }
+    }
+
     /// (block size in elements, bytes per block); None for Other.
     pub fn block_layout(self) -> Option<(u64, u64)> {
         Some(match self {
