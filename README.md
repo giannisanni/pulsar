@@ -26,19 +26,25 @@ day after release); code-complete, first run pending: **Qwen3-235B/30B**
 | Model | Total | Active / token | gguf | Decode, warm | vs ds4, same box |
 |---|---|---|---|---|---|
 | Gemma 4 26B-A4B* | 26B | 4B | 16GB (Q4_K_XL) | **33 tok/s** | – |
-| Hy3 295B | 295B | 21B (top-8 of 192) | 79GB (IQ2_XXS) | **7.2 tok/s** | 0.64–0.70 |
-| MiniMax M3* | 428B | 23B | 134GB (Q2_K_XL) | **2.9 tok/s** | – |
-| GLM-5.2 | 744B | 40B | 197GB (Q2_K_XL) | **2.0 tok/s** | 0.40 |
+| Hy3 295B | 295B | 21B (top-8 of 192) | 79GB (IQ2_XXS) | **4.4 tok/s** | 0.64–0.70 |
+| MiniMax M3 | 428B | 23B | 134GB (Q2_K_XL) | **2.9 tok/s** | – |
+| GLM-5.2† | 744B | 40B | 197GB (Q2_K_XL) | **2.0 tok/s** | 0.40 |
 | TML Inkling | 975B | 41B (6 + 2 shared) | 296GB (Q2_K_XL) | **1.5 tok/s** | – |
-| Kimi K2.7 Code | ~1T | 32B | 339GB (Q2_K_XL) | **1.3 tok/s** | – |
+| Kimi K2.7 Code† | ~1T | 32B | 339GB (Q2_K_XL) | **1.3 tok/s** | – |
 
-\* Sustained warm decode at n=64. Both read higher on shorter generations
-(M3 does 5.4 tok/s at n=12) because the per-token SSD miss rate climbs
-toward steady state as decoding fans across more experts. Gemma is small
-enough to sit around 84% resident in VRAM, so it is bound by pulsar's
-per-token streaming overhead rather than disk, and a fully-resident engine
-would decode a model that size faster. Pulsar's streaming path is built for
-models larger than memory, not small resident ones.
+All figures are sustained warm decode at n=64, temp 0. Shorter generations
+read higher because the per-token SSD miss rate is still climbing to steady
+state (Hy3 does 6.2 tok/s at n=12, M3 5.4), so a short benchmark flatters
+these models; n=64 is the honest sustained rate.
+
+\* Gemma is small enough to sit around 84% resident in VRAM, so it is bound
+by pulsar's per-token streaming overhead rather than disk, and a
+fully-resident engine would decode a model this small faster. Pulsar's
+streaming path is built for models larger than memory, not small resident ones.
+
+† Measured before the n=64 standardization and not yet re-run at n=64 (model
+deleted to free disk); like the others, the sustained rate is likely a little
+lower than shown.
 
 Prefill runs the quantized weights through int8 tensor cores: Hy3
 **28 tok/s** (1.8× over dp4a, ds4 0.44), GLM-5.2 **15 tok/s** (2.7×).
