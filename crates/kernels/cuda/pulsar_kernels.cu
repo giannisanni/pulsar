@@ -4045,8 +4045,11 @@ extern "C" int pulsar_gqa_rope(
 
 extern "C" int pulsar_gqa_kv_append(
         void *cache, const void *kv, uint32_t n_tok, uint32_t n_kv_head,
-        uint32_t head_dim, uint32_t cap, uint32_t pos0) {
+        uint32_t head_dim, uint32_t cap, uint32_t pos0, uint32_t kvq) {
     ds4_gpu_tensor ct = shim(cache), kt = shim(kv);
+    if (kvq == 1)
+        return ds4_gpu_gqa_kv_cache_append_fp8(&ct, &kt, n_tok, n_kv_head,
+                                               head_dim, cap, pos0);
     return ds4_gpu_gqa_kv_cache_append(&ct, &kt, n_tok, n_kv_head, head_dim,
                                        cap, pos0);
 }
@@ -4056,10 +4059,14 @@ extern "C" int pulsar_gqa_attention(
         uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
         uint32_t head_dim, uint32_t cap, uint32_t pos0,
         float scale, uint32_t window,
-        const void *rel, uint32_t rel_extent) {
+        const void *rel, uint32_t rel_extent, uint32_t kvq) {
     ds4_gpu_tensor ot = shim(out), qt = shim(q), kt = shim(k_cache),
                    vt = shim(v_cache);
     ds4_gpu_tensor rt = shim(rel);
+    if (kvq == 1)
+        return ds4_gpu_gqa_attention_fp8(&ot, &qt, &kt, &vt, n_tok, n_head,
+                                         n_kv_head, head_dim, cap, pos0, scale,
+                                         window, rel ? &rt : NULL, rel_extent);
     return ds4_gpu_gqa_attention(&ot, &qt, &kt, &vt, n_tok, n_head,
                                  n_kv_head, head_dim, cap, pos0, scale, window,
                                  rel ? &rt : NULL, rel_extent);

@@ -2033,6 +2033,9 @@ mod real {
         expert_ptrs: DeviceBuf,
         kcache: Vec<DeviceBuf>,
         vcache: Vec<DeviceBuf>,
+        /// Gqa KV storage: false = f32 (exact), true = fp8 e4m3 + per-row
+        /// scale (PULSAR_KV=fp8, lossy, opt-in)
+        kv_fp8: bool,
         logits: DeviceBuf,
         pub store: StreamingStore,
         prefetcher: Prefetcher,
@@ -2269,9 +2272,16 @@ mod real {
 
             // Gqa: kcache/vcache are per-head K/V. Mla: kcache is the
             // compact latent cache (kv_lora wide), vcache the rope tail.
+            // PULSAR_KV=fp8 stores Gqa rows as e4m3 + per-row f32 scale
+            // (stride head_dim+4, ~3.9x smaller). Lossy, so opt-in: the
+            // default f32 path keeps the bit-exact guarantees. MLA keeps
+            // its compact latent cache as-is.
+            let kv_fp8 = matches!(s.family, Family::Gqa)
+                && std::env::var("PULSAR_KV").ok().as_deref() == Some("fp8");
+            let kv_row = |hd: usize| if kv_fp8 { hd + 4 } else { hd * 4 };
             let (k_bytes, v_bytes) = match s.family {
                 Family::Gqa => {
-                    let b = s.n_head_kv as usize * ctx as usize * s.head_dim as usize * 4;
+                    let b = s.n_head_kv as usize * ctx as usize * kv_row(s.head_dim as usize);
                     (b, b)
                 }
                 Family::Mla => (
@@ -2279,6 +2289,15 @@ mod real {
                     ctx as usize * s.qk_rope as usize * 4,
                 ),
             };
+            if kv_fp8 {
+                let full = s.n_head_kv as usize * ctx as usize * s.head_dim as usize * 4;
+                eprintln!(
+                    "pulsar: fp8 KV cache on ({:.2} GB -> {:.2} GB over {} layers)",
+                    (full * 2 * s.n_exec_layer as usize) as f64 / 1e9,
+                    ((k_bytes + v_bytes) * s.n_exec_layer as usize) as f64 / 1e9,
+                    s.n_exec_layer,
+                );
+            }
             // batch prefill: activations sized for max_batch tokens; the
             // logits/lm-head path stays single-row (last token only)
             // big default: each prefill chunk costs roughly one pass over
@@ -2313,7 +2332,7 @@ mod real {
                 // own kv width, not the Shape max
                 let (kb, vb) = match m.geom.get(i) {
                     Some(g) => {
-                        let b = g.n_head_kv as usize * ctx as usize * g.head_dim as usize * 4;
+                        let b = g.n_head_kv as usize * ctx as usize * kv_row(g.head_dim as usize);
                         (b, b)
                     }
                     None => (k_bytes, v_bytes),
@@ -2436,6 +2455,7 @@ mod real {
                 )?,
                 kcache,
                 vcache,
+                kv_fp8,
                 logits: f32s(spec_rows * s.n_vocab)?,
                 store: StreamingStore::open(&m.shards, cache_bytes)?,
                 prefetcher: Prefetcher::spawn(&m.shards)?,
@@ -2830,8 +2850,9 @@ mod real {
                             kernels::gqa_rope(&mut st.q, n_tok, s.n_head, hd, rot, pos0, theta, factors)?;
                             kernels::gqa_rope(&mut st.k, n_tok, hkv, hd, rot, pos0, theta, factors)?;
                         }
-                        kernels::gqa_kv_append(&mut st.kcache[il], &st.k, n_tok, hkv, hd, st.ctx, pos0)?;
-                        kernels::gqa_kv_append(&mut st.vcache[il], &st.v, n_tok, hkv, hd, st.ctx, pos0)?;
+                        let kvq = st.kv_fp8 as u32;
+                        kernels::gqa_kv_append(&mut st.kcache[il], &st.k, n_tok, hkv, hd, st.ctx, pos0, kvq)?;
+                        kernels::gqa_kv_append(&mut st.vcache[il], &st.v, n_tok, hkv, hd, st.ctx, pos0, kvq)?;
                         // gemma scores at scale 1.0 (q is per-head normed);
                         // inkling at muP 1/head_dim
                         let scale = if l.ink.is_some() {
@@ -2851,7 +2872,7 @@ mod real {
                             0
                         };
                         let rel = l.ink.as_ref().map(|_| &st.rel_buf);
-                        kernels::gqa_attention_rel(&mut st.heads, &st.q, &st.kcache[il], &st.vcache[il], n_tok, s.n_head, hkv, hd, st.ctx, pos0, scale, window, rel, rel_ext)?;
+                        kernels::gqa_attention_rel(&mut st.heads, &st.q, &st.kcache[il], &st.vcache[il], n_tok, s.n_head, hkv, hd, st.ctx, pos0, scale, window, rel, rel_ext, kvq)?;
 
                         // output projection on the attn card, hop back,
                         // restore the primary (mirrors the Mla path)
