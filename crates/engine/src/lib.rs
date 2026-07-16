@@ -2025,6 +2025,10 @@ mod real {
         xq: DeviceBuf,
         midq: DeviceBuf,
         pub dev_cache: DeviceSlabCache,
+        /// census count each touch entry was seeded with by load_warm, so
+        /// save_warm can merge on this-run deltas (seeded counts otherwise
+        /// ratchet: seed + delta > seed every run, a running sum in disguise)
+        warm_seeds: std::collections::HashMap<u64, u64>,
         staging: DeviceBuf,
         expert_ptrs: DeviceBuf,
         kcache: Vec<DeviceBuf>,
@@ -2145,18 +2149,26 @@ mod real {
             // clobber a rich census and starve the next run's tier
             // placement - measured: a poisoned census halved Hy3's resident
             // tier hits, doubled h2d, and cut decode 8.2 -> 5.8 tok/s. Take
-            // the per-slab max heat ever seen: a thin run can't lower a hot
-            // slab, and seeded admission counts stay bounded (a running sum
-            // would ossify the cache). ponytail: rm the .warm to reset.
+            // the per-slab max of PER-RUN heat: subtract the load_warm seed
+            // first, because seeded counts increment from the old census
+            // value, and max(old, seed + delta) is a running sum in
+            // disguise. Cached slabs would ratchet cumulatively while
+            // tier-resident slabs (never seeded) stayed per-run, so tier
+            // ranking would drift toward whatever sat in the cache longest.
+            // A thin run still can't lower a hot slab, and counts stay at
+            // per-run scale (a running sum would ossify the cache).
+            // ponytail: rm the .warm to reset a drifted hot set.
             let mut merged: std::collections::HashMap<u64, (u64, u64)> =
                 read_census(&m.path)
                     .into_iter()
                     .map(|(off, len, count)| (off, (len, count)))
                     .collect();
             for (&off, &(count, len)) in self.dev_cache.touch.iter() {
+                let seed = self.warm_seeds.get(&off).copied().unwrap_or(0);
+                let this_run = count.saturating_sub(seed);
                 let e = merged.entry(off).or_insert((len, 0));
                 e.0 = len;
-                e.1 = e.1.max(count);
+                e.1 = e.1.max(this_run);
             }
             let mut entries: Vec<(u64, u64, u64)> = merged
                 .into_iter()
@@ -2193,6 +2205,7 @@ mod real {
                 entries.into_iter().filter(|&(off, _, _)| !in_tier(off)).collect();
             for &(off, len, count) in &entries {
                 self.dev_cache.touch.insert(off, (count, len));
+                self.warm_seeds.insert(off, count);
             }
             let dev_slots = self.dev_cache.meta.len();
             let dev_tier: Vec<stream::Read> = entries
@@ -2416,6 +2429,7 @@ mod real {
                 // MEASURED free VRAM once every fixed buffer has landed
                 // (unified boxes keep the 1-byte cache: zero-copy resolve)
                 dev_cache: DeviceSlabCache::new(1, max_slab)?,
+                warm_seeds: std::collections::HashMap::new(),
                 staging: DeviceBuf::alloc(1)?,
                 expert_ptrs: DeviceBuf::alloc(
                     mb as usize * n_used * std::mem::size_of::<ExpertPtrs>(),
@@ -3345,7 +3359,12 @@ mod real {
                             let [g3, u3, d3] = slabs_of(e as u32);
                             let ep = ExpertPtrs {
                                 gate: resolved[&off_of(g3.0, g3.1)],
-                                up: byte_off(resolved[&off_of(u3.0, u3.1)], *fused_up_off),
+                                // sink banks are never gate_up-fused (same
+                                // rule as tier_of above)
+                                up: byte_off(
+                                    resolved[&off_of(u3.0, u3.1)],
+                                    if e as u32 >= s.n_expert { 0 } else { *fused_up_off },
+                                ),
                                 down: resolved[&off_of(d3.0, d3.1)],
                             };
                             if !sink_same && e as u32 >= s.n_expert {
