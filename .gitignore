@@ -1,3 +1,9 @@
 target/
 Cargo.lock
 *.bin.tmp
+.gitnexus
+
+# gitnexus local code-intelligence (tooling, not for the public repo)
+.gitnexus/
+CLAUDE.md
+.claude/
