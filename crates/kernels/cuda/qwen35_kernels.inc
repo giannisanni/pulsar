@@ -104,7 +104,9 @@ __global__ static void qwen35_gdn_step_kernel(
     uint32_t h = blockIdx.x;
     uint32_t j = threadIdx.x;
     if (h >= h_v || j >= dim) return;
-    const uint32_t kh = h / (h_v / h_k);
+    /* ggml_repeat TILES along the head dim: v-head h reads k-head
+     * h %% h_k (not the GQA-style block mapping h / (h_v/h_k)) */
+    const uint32_t kh = h % h_k;
     const float *qh = q + (uint64_t)kh * dim;
     const float *kk = k + (uint64_t)kh * dim;
     float *S = state + (uint64_t)h * dim * dim;
@@ -275,8 +277,8 @@ extern "C" int pulsar_qwen35_selftest(void) {
             ok &= pulsar_qwen35_gdn_step(dout, dS, dq, dk, dv, dg, dbeta, HV, HK, DIM);
             cudaMemcpy(got, dout, (size_t)HV * DIM * 4, cudaMemcpyDeviceToHost);
             for (uint32_t h = 0; h < HV && ok; h++) {
-                const float *qh = q + (h / (HV / HK)) * DIM;
-                const float *kh = k + (h / (HV / HK)) * DIM;
+                const float *qh = q + (h % HK) * DIM;
+                const float *kh = k + (h % HK) * DIM;
                 float *S = S_ref + (uint64_t)h * DIM * DIM;
                 const float decay = expf(g[h]);
                 const float qs = 1.0f / sqrtf((float)DIM);
