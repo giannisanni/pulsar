@@ -37,6 +37,11 @@ pub struct Tokenizer {
     pub bos_id: Option<u32>,
     pub eos_id: Option<u32>,
     pub eot_id: Option<u32>,
+    /// Every end-of-generation id in the gguf: eos/eot/eom metadata plus
+    /// vocab tokens whose text is a known turn-end marker. Built
+    /// dynamically per model - single hardcoded ids stop the wrong place
+    /// on models whose chat EOG differs from ggml.eos_token_id.
+    pub stop_ids: Vec<u32>,
     /// Whether a raw prompt gets a leading bos (llama.cpp semantics:
     /// tokenizer.ggml.add_bos_token if present, else SPM yes / BPE no).
     pub add_bos: bool,
@@ -98,6 +103,8 @@ pub struct ChatMarkers {
     /// Hy3: think_start/think_end. Kimi: <|im_middle|> / <|im_system|>.
     aux0: u32,
     aux1: u32,
+    /// Full dynamic end-of-generation set from the tokenizer.
+    stops: Vec<u32>,
 }
 
 impl ChatMarkers {
@@ -113,6 +120,7 @@ impl ChatMarkers {
                 assistant: find("<|im_assistant|>")?,
                 aux0: find("<|im_middle|>")?,
                 aux1: find("<|im_system|>")?,
+                stops: t.stop_ids.clone(),
             });
         }
         if t.find_token("<start_of_turn>").is_some() {
@@ -125,6 +133,7 @@ impl ChatMarkers {
                 assistant: find("<start_of_turn>")?,
                 aux0: find("<end_of_turn>")?,
                 aux1: find("<end_of_turn>")?,
+                stops: t.stop_ids.clone(),
             });
         }
         if t.find_token("<|message_user|>").is_some() {
@@ -139,6 +148,7 @@ impl ChatMarkers {
                 assistant: find("<|message_model|>")?,
                 aux0: find("<|end_message|>")?,
                 aux1: find("<|content_text|>")?,
+                stops: t.stop_ids.clone(),
             });
         }
         if t.find_token("]~b]").is_some() {
@@ -158,6 +168,7 @@ impl ChatMarkers {
                 assistant: find("]~b]")?,
                 aux0: find("[e~[")?,
                 aux1: find("<mm:think>")?,
+                stops: t.stop_ids.clone(),
             });
         }
         if t.find_token("<|im_start|>").is_some() {
@@ -171,6 +182,7 @@ impl ChatMarkers {
                 assistant: find("<|im_start|>")?,
                 aux0: find("<|im_end|>")?,
                 aux1: find("<|im_end|>")?,
+                stops: t.stop_ids.clone(),
             });
         }
         Ok(ChatMarkers {
@@ -182,6 +194,7 @@ impl ChatMarkers {
             assistant: find("<｜hy_Assistant:opensource｜>")?,
             aux0: find("<think:opensource>")?,
             aux1: find("</think:opensource>")?,
+            stops: t.stop_ids.clone(),
         })
     }
 
@@ -330,7 +343,7 @@ impl ChatMarkers {
     }
 
     pub fn is_stop(&self, id: u32) -> bool {
-        id == self.eos || Some(id) == self.eot
+        id == self.eos || Some(id) == self.eot || self.stops.binary_search(&id).is_ok()
     }
 }
 
@@ -380,6 +393,32 @@ impl Tokenizer {
         }
 
         let id_key = |k| g.metadata.get(k).and_then(Value::as_u64).map(|v| v as u32);
+        // end-of-generation set: metadata ids + known marker texts (the
+        // same list llama.cpp treats as EOG, incl. GLM's role-token stops)
+        let mut stop_ids: Vec<u32> = [
+            "tokenizer.ggml.eos_token_id",
+            "tokenizer.ggml.eot_token_id",
+            "tokenizer.ggml.eom_token_id",
+        ]
+        .into_iter()
+        .filter_map(&id_key)
+        .collect();
+        const EOG_TEXTS: &[&str] = &[
+            "</s>", "<|endoftext|>", "<|end_of_text|>", "<|eot_id|>",
+            "<|eom_id|>", "<|im_end|>", "<|end|>", "<end_of_turn>",
+            "<|endofturn|>", "<|content_model_end_sampling|>", "[e~[",
+            "<|user|>", "<|observation|>", "<|return|>", "[EOS]",
+        ];
+        for (i, tok) in tokens.iter().enumerate() {
+            if EOG_TEXTS.iter().any(|t| *t == tok.as_str()) {
+                stop_ids.push(i as u32);
+            }
+        }
+        stop_ids.sort_unstable();
+        stop_ids.dedup();
+        if let Some(b) = id_key("tokenizer.ggml.bos_token_id") {
+            stop_ids.retain(|&x| x != b);
+        }
         Ok(Tokenizer {
             tokens,
             token_to_id,
@@ -389,6 +428,7 @@ impl Tokenizer {
             bos_id: id_key("tokenizer.ggml.bos_token_id"),
             eos_id: id_key("tokenizer.ggml.eos_token_id"),
             eot_id: id_key("tokenizer.ggml.eot_token_id"),
+            stop_ids,
             add_bos: match g.metadata.get("tokenizer.ggml.add_bos_token") {
                 Some(Value::Bool(b)) => *b,
                 _ => g.metadata.get("tokenizer.ggml.model").and_then(Value::as_str)
@@ -427,6 +467,11 @@ impl Tokenizer {
     /// Exact vocab lookup, e.g. for chat marker tokens.
     pub fn find_token(&self, s: &str) -> Option<u32> {
         self.token_to_id.get(s).copied()
+    }
+
+    /// True when `id` is any end-of-generation token for this model.
+    pub fn is_eog(&self, id: u32) -> bool {
+        self.stop_ids.binary_search(&id).is_ok()
     }
 
     /// Encode plain text (no special-token recognition; chat markers are

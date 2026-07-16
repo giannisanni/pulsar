@@ -309,7 +309,6 @@ fn run() -> engine::Result {
         let mut generated: Vec<u32> = Vec::new();
         let mut t_first: Option<std::time::Instant> = None;
         let mut sampler = engine::Sampler::new(0.0, 1.0, 0.0, 1);
-        let eos = tok.eos_id;
         let out = std::io::stdout();
         engine::generate(
             &model,
@@ -318,7 +317,7 @@ fn run() -> engine::Result {
             0,
             &mut sampler,
             n_predict,
-            |t| Some(t) == eos,
+            |t| tok.is_eog(t),
             |t| {
                 t_first.get_or_insert_with(std::time::Instant::now);
                 generated.push(t);
@@ -382,7 +381,7 @@ fn run() -> engine::Result {
     for _ in 0..n_predict {
         let l = logits.as_ref().ok_or("no logits")?;
         let next = engine::argmax(l);
-        if Some(next) == tok.eos_id {
+        if tok.is_eog(next) {
             break;
         }
         generated.push(next);
