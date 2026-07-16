@@ -114,12 +114,19 @@ __device__ __forceinline__ static float pulsar_gate_act(float g, uint32_t op) {
 /* Gated-FFN combine: act(gate) * up by act_op.
  *   0 = silu (swiglu), 1 = gelu tanh, 2 = swiglu_oai (gpt-oss / MiniMax
  *   M3): gate one-side clamped to 7, up clamped to +-7, alpha-sharpened
- *   sigmoid (1.702), and the +1 on up - llama.cpp ggml_swiglu_oai. */
+ *   sigmoid (1.702), and the +1 on up - llama.cpp ggml_swiglu_oai,
+ *   3 = deepseek4 clamped silu: gate one-side clamped to 10, up clamped
+ *   to +-10 (DS4_SWIGLU_CLAMP_EXP, both Flash and Pro), plain silu. */
 __device__ __forceinline__ static float pulsar_glu(float g, float u, uint32_t op) {
     if (op == 2u) {
         g = fminf(g, 7.0f);
         u = fminf(fmaxf(u, -7.0f), 7.0f);
         return g / (1.0f + expf(-1.702f * g)) * (u + 1.0f);
+    }
+    if (op == 3u) {
+        g = fminf(g, 10.0f);
+        u = fminf(fmaxf(u, -10.0f), 10.0f);
+        return g / (1.0f + expf(-g)) * u;
     }
     return pulsar_gate_act(g, op) * u;
 }
@@ -4329,3 +4336,4 @@ extern "C" int pulsar_mla_selftest(void) {
            mla_selftest_one(0.5f, 1.0f, 32.0f, 1.0f, "yarn");
 }
 #include "dsa_indexer.inc"
+#include "dsv4_kernels.inc"

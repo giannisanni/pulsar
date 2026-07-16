@@ -105,7 +105,8 @@ __global__ static void mla_rope_tail_kernel(
         float ext_factor,
         float attn_factor,
         float beta_fast,
-        float beta_slow) {
+        float beta_slow,
+        float sin_sign /* -1 = inverse rotation (deepseek4 heads un-rope) */) {
     const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t half_rot = rot_dim / 2u;
     const uint32_t pairs = n_tokens * n_head * half_rot;
@@ -126,6 +127,7 @@ __global__ static void mla_rope_tail_kernel(
     float c, s;
     mla_rope_yarn(theta_extrap, freq_scale, corr0, corr1, (int)i,
                   ext_factor, attn_factor, &c, &s);
+    s *= sin_sign;
 
     float *row = x + ((uint64_t)token * n_head + head) * head_dim + rot_offset;
     const float x0 = row[i];
@@ -157,8 +159,39 @@ extern "C" int pulsar_mla_rope_tail(
             (float *)x_dev, n_tokens, n_head, head_dim, rot_dim,
             head_dim - rot_dim, pos0, n_ctx_orig,
             freq_base, freq_scale, ext_factor, attn_factor,
-            beta_fast, beta_slow);
+            beta_fast, beta_slow, 1.0f);
     return cuda_ok(cudaGetLastError(), "mla rope tail launch");
+}
+
+/* deepseek4 rope tail: same rotation as mla_rope_tail plus an inverse
+ * mode - V4 un-rotates the attention output heads before the grouped
+ * output projection (the value rows carry their key-side rope). */
+extern "C" int pulsar_dsv4_rope_tail(
+        void *x_dev,
+        uint32_t n_tokens,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t rot_dim,
+        uint32_t pos0,
+        uint32_t n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow,
+        uint32_t inverse) {
+    if (!x_dev || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
+        rot_dim == 0 || rot_dim > head_dim || (rot_dim & 1u) != 0) {
+        return 0;
+    }
+    const uint32_t pairs = n_tokens * n_head * (rot_dim / 2u);
+    mla_rope_tail_kernel<<<(pairs + 255u) / 256u, 256>>>(
+            (float *)x_dev, n_tokens, n_head, head_dim, rot_dim,
+            head_dim - rot_dim, pos0, n_ctx_orig,
+            freq_base, freq_scale, ext_factor, attn_factor,
+            beta_fast, beta_slow, inverse ? -1.0f : 1.0f);
+    return cuda_ok(cudaGetLastError(), "dsv4 rope tail launch");
 }
 
 /* ---- kv lora rms norm: first kv_lora_dim of each kv_raw row ------------ */

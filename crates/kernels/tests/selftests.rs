@@ -20,3 +20,4 @@ selftest!(moe_selftest);
 selftest!(glue_selftest);
 selftest!(mla_selftest);
 selftest!(idx_selftest);
+selftest!(dsv4_selftest);

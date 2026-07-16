@@ -109,6 +109,12 @@ mod real {
         fn pulsar_sconv_selftest() -> i32;
 
         fn pulsar_mla_rope_tail(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, n_ctx_orig: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32) -> i32;
+        fn pulsar_dsv4_rope_tail(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, n_ctx_orig: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32, inverse: u32) -> i32;
+        fn pulsar_dsv4_hc_mix(out: *mut c_void, streams: *const c_void, block: *const c_void, st_c: *const f32, blk_c: *const f32, n_embd: u32, n_hc: u32, n_out: u32) -> i32;
+        fn pulsar_dsv4_attention(out: *mut c_void, q: *const c_void, raw: *const c_void, n_raw: u32, comp: *const c_void, n_comp: u32, allowed: *const c_void, sinks: *const c_void, n_head: u32, head_dim: u32, scale: f32) -> i32;
+        fn pulsar_dsv4_fp8_sim(x: *mut c_void, n_rows: u32, head_dim: u32, n_rot: u32) -> i32;
+        fn pulsar_dsv4_f16_round(x: *mut c_void, n: u32) -> i32;
+        fn pulsar_dsv4_selftest() -> i32;
         fn pulsar_mla_kv_lora_rms_norm(out: *mut c_void, kv_raw: *const c_void, w: *const c_void, n_tok: u32, kv_raw_dim: u32, kv_lora_dim: u32, eps: f32) -> i32;
         fn pulsar_mla_store_compact_kv(kv_lora_cache: *mut c_void, k_rope_cache: *mut c_void, kv_norm: *const c_void, kv_raw: *const c_void, pos0: u32, n_tok: u32, cache_cap: u32, kv_raw_dim: u32, kv_lora_dim: u32, qk_rope: u32) -> i32;
         fn pulsar_mla_fill_selected_range(selected: *mut c_void, n_tok: u32, pos0: u32, n_selected: u32, pad_row: u32) -> i32;
@@ -632,6 +638,24 @@ mod real {
         check(unsafe { pulsar_q8_0_matmul(out.ptr_mut(), w.ptr(), x.ptr(), in_dim, out_dim, n_tok) }, "matmul_q8_0")
     }
 
+    /// matmul_q8_0 with byte offsets into each buffer (deepseek4's
+    /// grouped output projection launches one bank per offset triple).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_q8_0_off(out: &mut DeviceBuf, out_off: usize, w: &DeviceBuf, w_off: usize, x: &DeviceBuf, x_off: usize, in_dim: u32, out_dim: u32, n_tok: u32) -> Result {
+        debug_assert!(out_off < out.bytes() && w_off < w.bytes() && x_off < x.bytes());
+        check(
+            unsafe {
+                pulsar_q8_0_matmul(
+                    (out.ptr_mut() as *mut u8).add(out_off) as *mut c_void,
+                    (w.ptr() as *const u8).add(w_off) as *const c_void,
+                    (x.ptr() as *const u8).add(x_off) as *const c_void,
+                    in_dim, out_dim, n_tok,
+                )
+            },
+            "matmul_q8_0_off",
+        )
+    }
+
     /// Dense matmul over a K-quant weight matrix; `xq` holds q8_K-quantized
     /// activations (quantize_q8_k) - the lm-head path for K-quant ggufs.
     #[allow(clippy::too_many_arguments)]
@@ -852,6 +876,59 @@ mod real {
             },
             "mla_rope_tail",
         )
+    }
+
+    /// deepseek4 rope tail: mla_rope_tail plus inverse mode (heads get
+    /// un-rotated before the grouped output projection).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv4_rope_tail(x: &mut DeviceBuf, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, r: &RopeCfg, inverse: bool) -> Result {
+        check(
+            unsafe {
+                pulsar_dsv4_rope_tail(x.ptr_mut(), n_tok, n_head, head_dim, rot_dim, pos0, r.n_ctx_orig, r.freq_base, r.freq_scale, r.ext_factor, r.attn_factor, r.beta_fast, r.beta_slow, inverse as u32)
+            },
+            "dsv4_rope_tail",
+        )
+    }
+
+    /// deepseek4 hyper-connection combine: out[j] = blk_c[j]*block +
+    /// sum_src st_c[j*n_hc+src]*streams[src]. Serves the pre reduce
+    /// (n_out 1), post expand (n_out 4) and the output-head merge.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv4_hc_mix(out: &mut DeviceBuf, streams: &DeviceBuf, block: Option<&DeviceBuf>, st_c: &[f32], blk_c: Option<&[f32]>, n_embd: u32, n_hc: u32, n_out: u32) -> Result {
+        debug_assert_eq!(st_c.len(), (n_out * n_hc) as usize);
+        check(
+            unsafe {
+                pulsar_dsv4_hc_mix(out.ptr_mut(), streams.ptr(), block.map_or(std::ptr::null(), |b| b.ptr()), st_c.as_ptr(), blk_c.map_or(std::ptr::null(), |b| b.as_ptr()), n_embd, n_hc, n_out)
+            },
+            "dsv4_hc_mix",
+        )
+    }
+
+    /// deepseek4 decode attention: sinks + raw SWA ring + compressed
+    /// rows (K == V), optional per-comp-row visibility mask.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv4_attention(out: &mut DeviceBuf, q: &DeviceBuf, raw: &DeviceBuf, n_raw: u32, comp: Option<&DeviceBuf>, n_comp: u32, allowed: Option<&DeviceBuf>, sinks: &DeviceBuf, n_head: u32, head_dim: u32, scale: f32) -> Result {
+        check(
+            unsafe {
+                pulsar_dsv4_attention(out.ptr_mut(), q.ptr(), raw.ptr(), n_raw, comp.map_or(std::ptr::null(), |b| b.ptr()), n_comp, allowed.map_or(std::ptr::null(), |b| b.ptr()), sinks.ptr(), n_head, head_dim, scale)
+            },
+            "dsv4_attention",
+        )
+    }
+
+    /// ds4's fp8 e4m3 round-trip on the non-rope dims of each row
+    /// (64-wide blocks, power-of-2 scale, clamp +-448). In place.
+    pub fn dsv4_fp8_sim(x: &mut DeviceBuf, n_rows: u32, head_dim: u32, n_rot: u32) -> Result {
+        check(unsafe { pulsar_dsv4_fp8_sim(x.ptr_mut(), n_rows, head_dim, n_rot) }, "dsv4_fp8_sim")
+    }
+
+    /// Round f32 values through f16 storage in place (V4 cache rows).
+    pub fn dsv4_f16_round(x: &mut DeviceBuf, n: u32) -> Result {
+        check(unsafe { pulsar_dsv4_f16_round(x.ptr_mut(), n) }, "dsv4_f16_round")
+    }
+
+    pub fn dsv4_selftest() -> bool {
+        unsafe { pulsar_dsv4_selftest() != 0 }
     }
 
     pub fn mla_kv_lora_rms_norm(out: &mut DeviceBuf, kv_raw: &DeviceBuf, w: &DeviceBuf, n_tok: u32, kv_raw_dim: u32, kv_lora_dim: u32, eps: f32) -> Result {

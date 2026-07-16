@@ -15,6 +15,8 @@
 
 #[cfg(target_os = "linux")]
 mod real {
+    mod dsv4;
+
     use std::fs::File;
     use std::os::unix::fs::FileExt;
     use std::path::Path;
@@ -35,6 +37,12 @@ mod real {
         /// Multi-head latent attention, compact-KV path (GLM-5.2 /
         /// glm-dsa; no DSA indexer, so contexts up to indexer_top_k only).
         Mla,
+        /// DeepSeek-V4-Flash (deepseek4): 4-stream hyper-connection
+        /// residual, sink attention over a raw SWA ring + streaming
+        /// compressed KV, tid2eid hash routing on the first layers.
+        /// Decode-only graph; prefill loops tokens (the compressor and
+        /// SWA ring are sequential state machines).
+        Dsv4,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -86,6 +94,17 @@ mod real {
         pub rel_ext: u32,
         pub rel_ext_swa: u32,
         pub sconv_k: u32,
+        // deepseek4 (zero elsewhere)
+        pub n_swa: u32,
+        pub n_hash_layer: u32,
+        pub n_hc: u32,
+        pub hc_sinkhorn: u32,
+        pub hc_eps: f32,
+        pub compress_rope_base: f32,
+        pub n_out_group: u32,
+        /// SwiGLU clamp for routed AND shared experts (10.0 on V4;
+        /// the per-layer metadata array is constant per model)
+        pub clamp_exp: f32,
     }
 
     impl Shape {
@@ -96,7 +115,7 @@ mod real {
         /// Attention output width (input of attn_output).
         fn heads_dim(&self) -> u32 {
             match self.family {
-                Family::Gqa => self.n_head * self.head_dim,
+                Family::Gqa | Family::Dsv4 => self.n_head * self.head_dim,
                 Family::Mla => self.n_head * self.value_mla,
             }
         }
@@ -169,11 +188,20 @@ mod real {
                 // TML Inkling 1T: GQA without rope (learned rel-pos bias),
                 // shortconv streams, sink router (llama.cpp PR 25731)
                 Some("inkling") => Family::Gqa,
+                // DeepSeek-V4-Flash: hyper-connections + sink attention +
+                // compressed KV + hash routing (task #22)
+                Some("deepseek4") => Family::Dsv4,
                 other => return Err(format!("unsupported architecture {other:?}").into()),
             };
             let inkling = g.architecture() == Some("inkling");
             let n_layer = u("block_count")?;
-            let nextn = u("nextn_predict_layers").unwrap_or(0);
+            // deepseek4 ships its MTP block as a SEPARATE gguf: the main
+            // file's nextn_predict_layers=1 does not shrink block_count
+            let nextn = if family == Family::Dsv4 {
+                0
+            } else {
+                u("nextn_predict_layers").unwrap_or(0)
+            };
             let n_vocab = match g.metadata.get("tokenizer.ggml.tokens") {
                 Some(Value::Array(a)) => a.len() as u32,
                 _ => return Err(meta_err("tokenizer.ggml.tokens")),
@@ -213,7 +241,12 @@ mod real {
                 n_expert: u("expert_count")?,
                 n_expert_used: u("expert_used_count")?,
                 n_ff_exp: u("expert_feed_forward_length")?,
-                n_ff_dense: u("feed_forward_length")?,
+                // deepseek4 has no dense FFN layers and omits the key
+                n_ff_dense: match family {
+                    Family::Dsv4 => u("feed_forward_length")
+                        .unwrap_or(u("expert_feed_forward_length")?),
+                    _ => u("feed_forward_length")?,
+                },
                 n_vocab,
                 // absent on qwen3moe (no scaling) - default 1.0
                 expert_weight_scale: f("expert_weights_scale").unwrap_or(1.0),
@@ -250,6 +283,14 @@ mod real {
                 rel_ext: 0,
                 rel_ext_swa: 0,
                 sconv_k: 0,
+                n_swa: 0,
+                n_hash_layer: 0,
+                n_hc: 0,
+                hc_sinkhorn: 0,
+                hc_eps: 0.0,
+                compress_rope_base: 0.0,
+                n_out_group: 0,
+                clamp_exp: 0.0,
             };
             if family == Family::Gqa {
                 // partial rotary: MiniMax rotates rope.dimension_count of
@@ -284,6 +325,31 @@ mod real {
                 s.n_idx_topk = u("attention.indexer.top_k").unwrap_or(0);
                 s.rope_scale_factor = f("rope.scaling.factor").unwrap_or(1.0);
                 s.rope_yarn_log_mult = f("rope.scaling.yarn_log_multiplier").unwrap_or(0.0);
+            }
+            if family == Family::Dsv4 {
+                s.n_lora_q = u("attention.q_lora_rank").unwrap_or(1024);
+                s.rot_dim = u("rope.dimension_count").unwrap_or(64);
+                s.rope_orig_ctx =
+                    u("rope.scaling.original_context_length").unwrap_or(65_536);
+                s.rope_scale_factor = f("rope.scaling.factor").unwrap_or(16.0);
+                s.n_idx_head = u("attention.indexer.head_count").unwrap_or(64);
+                s.n_idx_dim = u("attention.indexer.key_length").unwrap_or(128);
+                s.n_idx_topk = u("attention.indexer.top_k").unwrap_or(512);
+                s.n_swa = u("attention.sliding_window").unwrap_or(128);
+                s.n_hash_layer = u("hash_layer_count").unwrap_or(3);
+                s.n_hc = u("hyper_connection.count").unwrap_or(4);
+                s.hc_sinkhorn = u("hyper_connection.sinkhorn_iterations").unwrap_or(20);
+                s.hc_eps = f("hyper_connection.epsilon").unwrap_or(1.0e-6);
+                s.compress_rope_base =
+                    f("attention.compress_rope_freq_base").unwrap_or(160_000.0);
+                s.n_out_group = u("attention.output_group_count").unwrap_or(8);
+                // per-layer float array, constant across layers on V4
+                s.clamp_exp = match g.arch_meta("swiglu_clamp_exp") {
+                    Some(Value::Array(a)) => {
+                        a.first().and_then(Value::as_f32).unwrap_or(10.0)
+                    }
+                    _ => 10.0,
+                };
             }
             Ok(s)
         }
@@ -434,6 +500,53 @@ mod real {
             v_b: DeviceBuf,
             indexer: Option<IdxW>,
         },
+        Dsv4(Box<Dsv4W>),
+    }
+
+    /// deepseek4 per-layer stack: V4 attention, hyper-connection
+    /// controls, streaming compressor, indexer, and the host-router
+    /// extras. The MoE half reuses Ffn::Moe (LayerW.attn_output = the
+    /// grouped projection's second stage attn_output_b).
+    struct Dsv4W {
+        q_a: DeviceBuf,      // q8_0 [n_embd -> n_lora_q]
+        q_a_norm: DeviceBuf, // f32 [n_lora_q]
+        q_b: DeviceBuf,      // q8_0 [n_lora_q -> n_head*head_dim]
+        kv: DeviceBuf,       // q8_0 [n_embd -> head_dim] (K == V latent)
+        kv_a_norm: DeviceBuf,
+        /// attn_output_a: n_out_group banks of [group_dim -> rank] (q8_0)
+        out_a: DeviceBuf,
+        sinks: DeviceBuf, // f32 [n_head] per-head sink logits
+        hc_attn_fn: DeviceBuf, // f32 [n_hc*n_embd -> 6*n_hc] (f16 converted)
+        hc_ffn_fn: DeviceBuf,
+        hc_attn_scale: Vec<f32>, // [3]
+        hc_attn_base: Vec<f32>,  // [6*n_hc]
+        hc_ffn_scale: Vec<f32>,
+        hc_ffn_base: Vec<f32>,
+        /// host router bias (selection only, like the noaux V3 router)
+        probs_b: Vec<f32>,
+        /// hash-routing table [n_vocab][n_expert_used] (first
+        /// n_hash_layer layers replace top-k SELECTION with this)
+        tid2eid: Option<Vec<i32>>,
+        comp: Option<Dsv4CompW>, // compress_ratio != 0
+        idx: Option<Dsv4IdxW>,   // compress_ratio == 4
+        ratio: u32,
+    }
+
+    /// One compressor lane (attention 512-wide or indexer 128-wide).
+    struct Dsv4CompW {
+        kv_w: DeviceBuf,   // q8_0 [n_embd -> width] (f16 requantized)
+        gate_w: DeviceBuf, // q8_0 [n_embd -> width]
+        /// additive PE, host [ratio-ish][width]: ape[pos_mod*width + j]
+        ape: Vec<f32>,
+        norm: Vec<f32>, // host RMS weight [head_dim]
+        width: u32,
+        head_dim: u32,
+    }
+
+    struct Dsv4IdxW {
+        q_b: DeviceBuf,  // q8_0 [n_lora_q -> n_idx_head*n_idx_dim]
+        proj: DeviceBuf, // f32 [n_embd -> n_idx_head]
+        comp: Dsv4CompW, // indexer lane (width 2*128, head_dim 128)
     }
 
     /// DSA lightning-indexer weights (small; resident beside the attn stack).
@@ -518,6 +631,21 @@ mod real {
         /// argmax/sampling cap (inkling pads the vocab: rows past
         /// unpadded_vocab_size are garbage); == n_vocab when unpadded
         pub n_vocab_out: u32,
+        /// deepseek4 per-layer compression ratios (0 = raw SWA only,
+        /// 4 = compressed + indexer, 128 = compressed); empty elsewhere
+        compress_ratios: Vec<u32>,
+        /// unit weight [n_hc*n_embd] for the weightless HC flat norm
+        ones_hc: Option<DeviceBuf>,
+        /// deepseek4 output-head HC merge
+        dsv4_out: Option<Dsv4OutW>,
+    }
+
+    /// deepseek4 output_hc_*: collapse the final HC streams before
+    /// output_norm and the lm head.
+    struct Dsv4OutW {
+        fn_w: DeviceBuf, // f32 [n_hc*n_embd -> n_hc]
+        scale: f32,
+        base: Vec<f32>, // [n_hc]
     }
 
     /// v1 StreamingStore (DESIGN-expert-store.md): io_uring batch fetch of
@@ -1235,6 +1363,47 @@ mod real {
         Ok(DeviceBuf::from_bytes(&read_tensor_bytes(file, g, name)?)?)
     }
 
+    /// f16 tensor -> host f32 (deepseek4 ships router/HC/compressor
+    /// weights as f16; small ones convert to f32 for matmul_f32).
+    fn read_f16_as_f32(file: &VFile, g: &Gguf, name: &str) -> Result<Vec<f32>> {
+        let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
+        if t.ty != TensorType::F16 {
+            return Err(format!("{name}: expected f16, got {:?}", t.ty).into());
+        }
+        let mut buf = vec![0u8; t.n_elements() as usize * 2];
+        file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+        Ok(buf
+            .chunks_exact(2)
+            .map(|c| requant::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect())
+    }
+
+    fn upload_f16_as_f32(file: &VFile, g: &Gguf, name: &str) -> Result<DeviceBuf> {
+        Ok(DeviceBuf::from_f32(&read_f16_as_f32(file, g, name)?)?)
+    }
+
+    /// f16 tensor -> q8_0 bytes (deepseek4's bigger f16 matmul weights
+    /// ride the q8_0 fast path; ~0.4% quantization noise).
+    fn read_f16_as_q8(file: &VFile, g: &Gguf, name: &str) -> Result<Vec<u8>> {
+        let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
+        if t.ty != TensorType::F16 {
+            return Err(format!("{name}: expected f16, got {:?}", t.ty).into());
+        }
+        let n = t.n_elements() as usize;
+        let mut buf = vec![0u8; n * 2];
+        file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+        let mut out = Vec::with_capacity(n / 32 * 34);
+        let mut f = [0f32; 256];
+        for blk in buf.chunks(512) {
+            let m = blk.len() / 2;
+            for (i, c) in blk.chunks_exact(2).enumerate() {
+                f[i] = requant::f16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+            }
+            requant::quantize_q8_0(&f[..m], &mut out);
+        }
+        Ok(out)
+    }
+
     /// Big attention weights: VRAM while `vram_budget` lasts, then pinned
     /// host memory (zero-copy PCIe reads). Gqa attn always fits, so its
     /// budget is unlimited; Mla (GLM-class, ~12GB attn q8) spends a
@@ -1270,8 +1439,13 @@ mod real {
             // the embedding table is read ~one row per token - pinned
             // host is free for it and returns ~1GB of VRAM to hot weights
             let token_embd = {
-                let bytes = read_tensor_bytes(&file, &gguf, "token_embd.weight")?;
-                let mut buf = if shape.family == Family::Mla {
+                // deepseek4 ships the table f16; embed_q8_0 wants q8_0
+                let bytes = if shape.family == Family::Dsv4 {
+                    read_f16_as_q8(&file, &gguf, "token_embd.weight")?
+                } else {
+                    read_tensor_bytes(&file, &gguf, "token_embd.weight")?
+                };
+                let mut buf = if matches!(shape.family, Family::Mla | Family::Dsv4) {
                     DeviceBuf::alloc_pinned(bytes.len())?
                 } else {
                     DeviceBuf::alloc(bytes.len())?
@@ -1386,6 +1560,9 @@ mod real {
                         ok
                     }),
                 },
+                // ponytail: dsv4 v1 runs everything on the primary; attn
+                // offload comes with the perf pass
+                Family::Dsv4 => None,
             };
             if let Some(d) = attn_dev {
                 eprintln!("pulsar: attn weights + KV resident on CUDA device {d}");
@@ -1504,10 +1681,28 @@ mod real {
                 (Family::Gqa, _) => i64::MAX,
                 (Family::Mla, Some(_)) => env_budget.unwrap_or(i64::MAX),
                 (Family::Mla, None) => env_budget.unwrap_or(6 << 30),
+                // V4's attn+compressor+indexer q8 stack is ~6GB total;
+                // resident on a 16GB card still leaves an expert cache
+                (Family::Dsv4, _) => env_budget.unwrap_or(8 << 30),
             };
             // small Mla attn tensors always go pinned (not worth budget) -
             // except on a dedicated attn GPU, where everything is resident
             let mut no_budget: i64 = if attn_dev.is_some() { i64::MAX } else { 0 };
+
+            let dsv4_arch = shape.family == Family::Dsv4;
+            let compress_ratios: Vec<u32> = if dsv4_arch {
+                match gguf.arch_meta("attention.compress_ratios") {
+                    Some(Value::Array(a)) => {
+                        a.iter().filter_map(Value::as_u64).map(|v| v as u32).collect()
+                    }
+                    _ => return Err(meta_err("attention.compress_ratios")),
+                }
+            } else {
+                Vec::new()
+            };
+            if dsv4_arch && compress_ratios.len() < shape.n_exec_layer as usize {
+                return Err("compress_ratios shorter than the layer count".into());
+            }
 
             let load_layer = |il: u32,
                               attn_vram_budget: &mut i64,
@@ -1553,7 +1748,13 @@ mod real {
                         (exps("ffn_gate_exps.weight")?, exps("ffn_up_exps.weight")?, 0)
                     };
                     Ffn::Moe {
-                        gate_inp: upload(&file, &gguf, &t("ffn_gate_inp.weight"))?,
+                        // deepseek4 ships the router f16; matmul_f32
+                        // wants f32 (router precision drives selection)
+                        gate_inp: if dsv4_arch {
+                            upload_f16_as_f32(&file, &gguf, &t("ffn_gate_inp.weight"))?
+                        } else {
+                            upload(&file, &gguf, &t("ffn_gate_inp.weight"))?
+                        },
                         // no bias tensor (qwen3moe) -> zeros: score = prob
                         probs_b: if gguf.tensor(&probs_b_name).is_some() {
                             upload(&file, &gguf, &probs_b_name)?
@@ -1638,8 +1839,87 @@ mod real {
                             None
                         },
                     },
+                    Family::Dsv4 => {
+                        let ratio = compress_ratios[il as usize];
+                        // f16 attn-side matmul weights ride q8_0; budget
+                        // placement like any other big attn tensor
+                        let upload_f16_q8 = |name: &str, budget: &mut i64| -> Result<DeviceBuf> {
+                            let bytes = read_f16_as_q8(&file, &gguf, name)?;
+                            let use_vram = *budget >= bytes.len() as i64
+                                && std::env::var("PULSAR_ATTN_HOST").ok().as_deref() != Some("1");
+                            let mut buf = if use_vram {
+                                *budget -= bytes.len() as i64;
+                                DeviceBuf::alloc(bytes.len())?
+                            } else {
+                                DeviceBuf::alloc_pinned(bytes.len())?
+                            };
+                            buf.write(0, &bytes)?;
+                            Ok(buf)
+                        };
+                        let comp_lane = |prefix: &str, head_dim: u32, budget: &mut i64| -> Result<Dsv4CompW> {
+                            let kv_name = t(&format!("{prefix}_kv.weight"));
+                            let ti = gguf.tensor(&kv_name).ok_or_else(|| meta_err(&kv_name))?;
+                            let width = ti.dims[1] as u32;
+                            Ok(Dsv4CompW {
+                                kv_w: upload_f16_q8(&kv_name, budget)?,
+                                gate_w: upload_f16_q8(&t(&format!("{prefix}_gate.weight")), budget)?,
+                                ape: read_f16_as_f32(&file, &gguf, &t(&format!("{prefix}_ape.weight")))?,
+                                norm: read_tensor_f32(&file, &gguf, &t(&format!("{prefix}_norm.weight")))?,
+                                width,
+                                head_dim,
+                            })
+                        };
+                        let tid2eid = if gguf.tensor(&t("ffn_gate_tid2eid.weight")).is_some() {
+                            let bytes = read_tensor_bytes(&file, &gguf, &t("ffn_gate_tid2eid.weight"))?;
+                            Some(
+                                bytes
+                                    .chunks_exact(4)
+                                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                    .collect(),
+                            )
+                        } else {
+                            None
+                        };
+                        Attn::Dsv4(Box::new(Dsv4W {
+                            q_a: upload_attn(&file, &gguf, &t("attn_q_a.weight"), &mut *attn_vram_budget)?,
+                            q_a_norm: upload(&file, &gguf, &t("attn_q_a_norm.weight"))?,
+                            q_b: upload_attn(&file, &gguf, &t("attn_q_b.weight"), &mut *attn_vram_budget)?,
+                            kv: upload_attn(&file, &gguf, &t("attn_kv.weight"), &mut *attn_vram_budget)?,
+                            kv_a_norm: upload(&file, &gguf, &t("attn_kv_a_norm.weight"))?,
+                            out_a: upload_attn(&file, &gguf, &t("attn_output_a.weight"), &mut *attn_vram_budget)?,
+                            sinks: upload(&file, &gguf, &t("attn_sinks.weight"))?,
+                            hc_attn_fn: upload_f16_as_f32(&file, &gguf, &t("hc_attn_fn.weight"))?,
+                            hc_ffn_fn: upload_f16_as_f32(&file, &gguf, &t("hc_ffn_fn.weight"))?,
+                            hc_attn_scale: read_tensor_f32(&file, &gguf, &t("hc_attn_scale.weight"))?,
+                            hc_attn_base: read_tensor_f32(&file, &gguf, &t("hc_attn_base.weight"))?,
+                            hc_ffn_scale: read_tensor_f32(&file, &gguf, &t("hc_ffn_scale.weight"))?,
+                            hc_ffn_base: read_tensor_f32(&file, &gguf, &t("hc_ffn_base.weight"))?,
+                            probs_b: read_tensor_f32(&file, &gguf, &t("exp_probs_b.bias"))?,
+                            tid2eid,
+                            comp: if ratio != 0 {
+                                Some(comp_lane("attn_compressor", shape.head_dim, &mut *attn_vram_budget)?)
+                            } else {
+                                None
+                            },
+                            idx: if ratio == 4 {
+                                Some(Dsv4IdxW {
+                                    q_b: upload_f16_q8(&t("indexer.attn_q_b.weight"), &mut *attn_vram_budget)?,
+                                    proj: upload_f16_as_f32(&file, &gguf, &t("indexer.proj.weight"))?,
+                                    comp: comp_lane("indexer_compressor", shape.n_idx_dim, &mut *attn_vram_budget)?,
+                                })
+                            } else {
+                                None
+                            },
+                            ratio,
+                        }))
+                    }
                 };
-                let attn_output = upload_attn(&file, &gguf, &t("attn_output.weight"), &mut *attn_vram_budget)?;
+                let attn_output = if dsv4_arch {
+                    // V4's second-stage output projection
+                    upload_attn(&file, &gguf, &t("attn_output_b.weight"), &mut *attn_vram_budget)?
+                } else {
+                    upload_attn(&file, &gguf, &t("attn_output.weight"), &mut *attn_vram_budget)?
+                };
                 if attn_dev.is_some() {
                     kernels::set_device(primary)?;
                 }
@@ -1842,6 +2122,19 @@ mod real {
             } else {
                 shape.n_vocab
             };
+            let (ones_hc, dsv4_out) = if dsv4_arch {
+                let ones = vec![1.0f32; (shape.n_hc * shape.n_embd) as usize];
+                (
+                    Some(DeviceBuf::from_f32(&ones)?),
+                    Some(Dsv4OutW {
+                        fn_w: upload_f16_as_f32(&file, &gguf, "output_hc_fn.weight")?,
+                        scale: read_tensor_f32(&file, &gguf, "output_hc_scale.weight")?[0],
+                        base: read_tensor_f32(&file, &gguf, "output_hc_base.weight")?,
+                    }),
+                )
+            } else {
+                (None, None)
+            };
             Ok(Model {
                 path: path.to_path_buf(),
                 shards,
@@ -1862,6 +2155,9 @@ mod real {
                 tok_norm,
                 logit_scale,
                 n_vocab_out,
+                compress_ratios,
+                ones_hc,
+                dsv4_out,
             })
         }
     }
@@ -1872,6 +2168,11 @@ mod real {
     fn build_tiers(m: &Model, mb: u32, primary: i32) -> Result<Vec<ExpertTier>> {
         let s = m.shape;
         if std::env::var("PULSAR_TIERS").ok().as_deref() == Some("off") {
+            return Ok(Vec::new());
+        }
+        if s.family == Family::Dsv4 {
+            // ponytail: the dsv4 resolve doesn't consult tiers yet -
+            // loading them would park dead weight on the other card
             return Ok(Vec::new());
         }
         // dedicated cards first; the attn card joins LAST with whatever
@@ -2107,6 +2408,8 @@ mod real {
         /// because each layer's resolve runs after a full device sync, so
         /// an evicted slab can never have in-flight readers.
         unified: bool,
+        /// deepseek4 runtime (HC streams, compressor state); None elsewhere
+        dsv4: Option<dsv4::Dsv4Rt>,
     }
 
     impl State {
@@ -2290,6 +2593,9 @@ mod real {
                     ctx as usize * s.n_kv_lora as usize * 4,
                     ctx as usize * s.qk_rope as usize * 4,
                 ),
+                // raw SWA ring in kcache; the compressed-row cache rides
+                // vcache, sized per layer in the loop below
+                Family::Dsv4 => (s.n_swa as usize * s.head_dim as usize * 4, 4),
             };
             if kv_fp8 {
                 let full = s.n_head_kv as usize * ctx as usize * s.head_dim as usize * 4;
@@ -2332,12 +2638,22 @@ mod real {
             for i in 0..n_kv_slots {
                 // per-layer geometry (gemma4): a SWA layer's cache is its
                 // own kv width, not the Shape max
-                let (kb, vb) = match m.geom.get(i) {
-                    Some(g) => {
-                        let b = g.n_head_kv as usize * ctx as usize * kv_row(g.head_dim as usize);
-                        (b, b)
+                let (kb, vb) = if s.family == Family::Dsv4 {
+                    let ratio = m.compress_ratios.get(i).copied().unwrap_or(0) as usize;
+                    let comp = if ratio > 0 {
+                        (ctx as usize / ratio + 2) * s.head_dim as usize * 4
+                    } else {
+                        4
+                    };
+                    (k_bytes, comp)
+                } else {
+                    match m.geom.get(i) {
+                        Some(g) => {
+                            let b = g.n_head_kv as usize * ctx as usize * kv_row(g.head_dim as usize);
+                            (b, b)
+                        }
+                        None => (k_bytes, v_bytes),
                     }
-                    None => (k_bytes, v_bytes),
                 };
                 let mut k = DeviceBuf::alloc(kb)?;
                 let mut v = DeviceBuf::alloc(vb)?;
@@ -2550,6 +2866,11 @@ mod real {
                     }
                     u
                 },
+                dsv4: if s.family == Family::Dsv4 {
+                    Some(dsv4::Dsv4Rt::new(m, ctx)?)
+                } else {
+                    None
+                },
             };
 
             // ---- capacity solver: size the VRAM budget from MEASUREMENT.
@@ -2673,6 +2994,11 @@ mod real {
             rows: u32,
         ) -> Result<Option<Vec<f32>>> {
             let s = self.shape;
+            if s.family == Family::Dsv4 {
+                // V4 is a sequential state machine (SWA ring, streaming
+                // compressor): prefill loops single-token forwards
+                return self.forward_dsv4(st, tokens, pos0, rows);
+            }
             // a batch must not straddle the indexer top_k boundary: rows
             // before it use causal range selection, rows after it need
             // scored top-k - split once here so every caller inherits it
@@ -2807,6 +3133,8 @@ mod real {
                 kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, n_tok, eps)?;
                 let mut attn_output_w: &DeviceBuf = &l.attn_output;
                 match &l.attn {
+                    // dsv4 has its own graph (forward_dsv4/eval_dsv4_layer)
+                    Attn::Dsv4(_) => return Err("dsv4 layer in the shared eval path".into()),
                     Attn::Gqa { attn_q, attn_k, attn_v, q_norm, k_norm } => {
                         let (hkv, hd, theta, window) = match gm {
                             Some(g) => (g.n_head_kv, g.head_dim, g.theta, g.window),

@@ -64,6 +64,8 @@ pub enum TensorType {
     IQ4XS,
     IQ4NL,
     BF16,
+    /// Plain int32 tensors (deepseek4 tid2eid hash-routing tables).
+    I32,
     /// Anything we do not model yet; the raw id is preserved.
     Other(u32),
 }
@@ -89,6 +91,7 @@ impl TensorType {
             21 => Self::IQ3S,
             22 => Self::IQ2S,
             23 => Self::IQ4XS,
+            26 => Self::I32,
             30 => Self::BF16,
             other => Self::Other(other),
         }
@@ -115,6 +118,7 @@ impl TensorType {
             Self::IQ3S => 21,
             Self::IQ2S => 22,
             Self::IQ4XS => 23,
+            Self::I32 => 26,
             Self::BF16 => 30,
             Self::Other(id) => id,
         }
@@ -123,7 +127,7 @@ impl TensorType {
     /// (block size in elements, bytes per block); None for Other.
     pub fn block_layout(self) -> Option<(u64, u64)> {
         Some(match self {
-            Self::F32 => (1, 4),
+            Self::F32 | Self::I32 => (1, 4),
             Self::F16 | Self::BF16 => (1, 2),
             Self::Q4_0 => (32, 18),
             Self::Q5_1 => (32, 24),
