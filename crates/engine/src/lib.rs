@@ -2140,11 +2140,27 @@ mod real {
 
         /// Persist the slab popularity census so the next run starts warm.
         pub fn save_warm(&self, m: &Model) -> Result {
-            let mut entries: Vec<(u64, u64, u64)> = self
-                .dev_cache
-                .touch
-                .iter()
-                .map(|(&off, &(count, len))| (count, off, len))
+            // Merge popularity across runs instead of overwriting. A save
+            // REPLACES the file, so one short run (thin touch set) would
+            // clobber a rich census and starve the next run's tier
+            // placement - measured: a poisoned census halved Hy3's resident
+            // tier hits, doubled h2d, and cut decode 8.2 -> 5.8 tok/s. Take
+            // the per-slab max heat ever seen: a thin run can't lower a hot
+            // slab, and seeded admission counts stay bounded (a running sum
+            // would ossify the cache). ponytail: rm the .warm to reset.
+            let mut merged: std::collections::HashMap<u64, (u64, u64)> =
+                read_census(&m.path)
+                    .into_iter()
+                    .map(|(off, len, count)| (off, (len, count)))
+                    .collect();
+            for (&off, &(count, len)) in self.dev_cache.touch.iter() {
+                let e = merged.entry(off).or_insert((len, 0));
+                e.0 = len;
+                e.1 = e.1.max(count);
+            }
+            let mut entries: Vec<(u64, u64, u64)> = merged
+                .into_iter()
+                .map(|(off, (len, count))| (count, off, len))
                 .collect();
             entries.sort_unstable_by(|a, b| b.0.cmp(&a.0));
             let mut bytes = Vec::with_capacity(entries.len() * 24);
