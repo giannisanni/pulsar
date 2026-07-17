@@ -686,6 +686,9 @@ pub fn generate_dflash(
             .ok_or("no verify logits")?;
         let target_tok: Vec<u32> =
             (0..bs).map(|i| argmax(&all[i * v..(i + 1) * v])).collect();
+        if std::env::var_os("PULSAR_DFLASH_DEBUG").is_some() {
+            eprintln!("dflash round @{committed}:\n  draft  {draft_tok:?}\n  target {target_tok:?}");
+        }
         // 3. accept the matching prefix (row i predicts the token after
         //    draft_tok[i]; draft_tok[0] = last_tok is always accepted)
         let mut accept_n = 1usize;
