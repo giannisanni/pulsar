@@ -27,10 +27,11 @@ fp8/fp4 cache quantization-aware sims, token-id hash routing on the
 early layers; also correct output on its first-ever run), and
 **Qwen3.6-35B-A3B** (qwen35moe hybrid: Gated DeltaNet linear attention
 with O(1) recurrent state on 3 of every 4 layers, sigmoid-gated full
-attention on the rest - 262k context with KV on only 10 of 40 layers;
-prefer K-quants for it: the Q4_K_XL decodes at 51.8 tok/s where the
-smaller Q3_K_XL manages 36, because iq3's codebook lookups are decode
-compute the simple K-quant shifts don't pay). Reference
+attention on the rest - 262k context with KV on only 10 of 40 layers,
+needle recall verified at 45k tokens with 19.6 tok/s decode at that
+depth; prefer K-quants for it: the Q4_K_XL decodes at 51.8 tok/s where
+the smaller Q3_K_XL manages 36, because iq3's codebook lookups are
+decode compute the simple K-quant shifts don't pay). Reference
 box: RTX 5060 Ti 16GB + RTX 4060 Ti 16GB, Ryzen 9900X, 30GB RAM, one
 Gen5 NVMe.
 
@@ -65,6 +66,17 @@ device and prefills in batched 16-token chunks (~14 tok/s prefill,
 chunk-layer, with the per-token ring/compressor/attention interleave
 preserved bit-exactly). Long-context retrieval verified by needle
 recall at 2.4k ctx through compressed rows.
+
+Long context on the GQA models decodes through a split-K attention
+kernel: past 4k visible rows the position scan fans out across blocks
+(2k rows per split, unnormalized online-softmax partials, one combine
+pass) instead of serializing inside a single block per head. Measured
+on Qwen3.6 at 45k tokens: needle recall correct, decode 3.7 to 19.6
+tok/s (5.3x); at 10.8k tokens recall is also verified. Short contexts
+take the original kernel unchanged, so bit-exact gates and the 51.8
+tok/s bench are untouched. Known remaining lever: each q-head group
+re-reads its shared kv-head rows, so a kv-head-centric layout has
+several-fold headroom left at depth.
 
 Decode rate slides with output length on the streaming models: a longer
 generation routes to a wider set of experts, so the disk-miss fraction

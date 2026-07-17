@@ -255,6 +255,205 @@ __global__ static void gqa_attention_kernel(
     }
 }
 
+/* ---- split-K decode attention -------------------------------------------
+ * The kernel above gives one block per (token, head): at decode a 16-head
+ * model occupies 16 SMs regardless of context depth and the position scan
+ * serializes (~5.6us/row measured on Qwen3.6 = ~7GB/s of a 448GB/s card).
+ * For decode-shaped calls the scan splits across blockIdx.z: each split
+ * runs the same online softmax over its slice of rows and writes an
+ * UNNORMALIZED partial {acc[hd], m, den}; a combine kernel rescales onto
+ * the global max and normalizes. Engaged only when n_tok <= 4, the
+ * visible rows >= 4096 and there is no rel bias, so short-context calls
+ * (and their bit-exact gates) take the original kernel unchanged. */
+#define GQA_SPLIT_MIN_ROWS 4096u
+#define GQA_SPLIT_MAX_TOK  4u
+#define GQA_SPLIT_ROWS     2048u
+#define GQA_SPLIT_MAX      64u
+
+template <bool KV8>
+__global__ static void gqa_attention_split_kernel(
+        float *partial,      /* [n_tok][n_head][n_split][hd+2]: acc, m, den */
+        const float *q,
+        const void *k_cache,
+        const void *v_cache,
+        uint32_t n_tok,
+        uint32_t n_head,
+        uint32_t n_kv_head,
+        uint32_t head_dim,
+        uint32_t cap,
+        uint32_t pos0,
+        float scale,
+        uint32_t window,
+        uint32_t n_split) {
+    uint32_t t = blockIdx.x;
+    uint32_t h = blockIdx.y;
+    uint32_t sp = blockIdx.z;
+    if (t >= n_tok || h >= n_head) return;
+    uint32_t kvh = h / (n_head / n_kv_head);
+    uint32_t n_rows = pos0 + t + 1u;
+    uint32_t row0 = (window != 0u && n_rows > window) ? n_rows - window : 0u;
+    uint32_t span = (n_rows - row0 + n_split - 1u) / n_split;
+    uint32_t lo = row0 + sp * span;
+    uint32_t hi = lo + span < n_rows ? lo + span : n_rows;
+    float *dst = partial + (((uint64_t)t * n_head + h) * n_split + sp) * ((uint64_t)head_dim + 2u);
+    const uint32_t tid = threadIdx.x;
+    if (lo >= hi) {
+        for (uint32_t d = tid; d < head_dim; d += 128u) dst[d] = 0.0f;
+        if (tid == 0) { dst[head_dim] = -INFINITY; dst[head_dim + 1u] = 0.0f; }
+        return;
+    }
+    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    const uint64_t kv_stride = KV8 ? (uint64_t)head_dim + 4u : (uint64_t)head_dim;
+    const uint8_t *kh8 = KV8 ? (const uint8_t *)k_cache + (uint64_t)kvh * cap * kv_stride : NULL;
+    const uint8_t *vh8 = KV8 ? (const uint8_t *)v_cache + (uint64_t)kvh * cap * kv_stride : NULL;
+    const float *kh = KV8 ? NULL : (const float *)k_cache + (uint64_t)kvh * cap * head_dim;
+    const float *vh = KV8 ? NULL : (const float *)v_cache + (uint64_t)kvh * cap * head_dim;
+    __shared__ float sq[512];
+    __shared__ float s_w[128];
+    __shared__ float red[128];
+    for (uint32_t d = tid; d < head_dim; d += 128u) sq[d] = qh[d];
+    __syncthreads();
+
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float den = 0.0f;
+    float m = -INFINITY;
+    for (uint32_t base = lo; base < hi; base += 128u) {
+        uint32_t chunk = hi - base < 128u ? hi - base : 128u;
+        float s = -INFINITY;
+        if (tid < chunk) {
+            float dot = 0.0f;
+            if (KV8) {
+                const uint8_t *krow = kh8 + (uint64_t)(base + tid) * kv_stride;
+                for (uint32_t d = 0; d < head_dim; d++) dot += sq[d] * e4m3_dec_common(krow[d]);
+                float ks;
+                memcpy(&ks, krow + head_dim, 4);
+                dot *= ks;
+            } else {
+                const float *krow = kh + (uint64_t)(base + tid) * head_dim;
+                for (uint32_t d = 0; d < head_dim; d++) dot += sq[d] * krow[d];
+            }
+            s = dot * scale;
+        }
+        red[tid] = s;
+        __syncthreads();
+        for (uint32_t st = 64u; st != 0; st >>= 1u) {
+            if (tid < st) red[tid] = fmaxf(red[tid], red[tid + st]);
+            __syncthreads();
+        }
+        float m_new = fmaxf(m, red[0]);
+        float corr = expf(m - m_new);
+        #pragma unroll
+        for (uint32_t k = 0; k < 4; k++) acc[k] *= corr;
+        den *= corr;
+        if (tid < chunk) s_w[tid] = expf(s - m_new);
+        __syncthreads();
+        for (uint32_t r = 0; r < chunk; r++) {
+            float w = s_w[r];
+            den += w;
+            if (KV8) {
+                const uint8_t *vrow = vh8 + (uint64_t)(base + r) * kv_stride;
+                float vs;
+                memcpy(&vs, vrow + head_dim, 4);
+                const float wv = w * vs;
+                for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++) {
+                    acc[k] += wv * e4m3_dec_common(vrow[d]);
+                }
+            } else {
+                const float *vrow = vh + (uint64_t)(base + r) * head_dim;
+                for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++) {
+                    acc[k] += w * vrow[d];
+                }
+            }
+        }
+        m = m_new;
+        __syncthreads();
+    }
+    for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++) dst[d] = acc[k];
+    if (tid == 0) { dst[head_dim] = m; dst[head_dim + 1u] = den; }
+}
+
+__global__ static void gqa_attention_combine_kernel(
+        float *out,
+        const float *partial,
+        uint32_t n_tok,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t n_split) {
+    uint32_t t = blockIdx.x;
+    uint32_t h = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    if (t >= n_tok || h >= n_head) return;
+    const uint64_t stride = (uint64_t)head_dim + 2u;
+    const float *base = partial + ((uint64_t)t * n_head + h) * n_split * stride;
+    float m = -INFINITY;
+    for (uint32_t s = 0; s < n_split; s++) m = fmaxf(m, base[s * stride + head_dim]);
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float den = 0.0f;
+    for (uint32_t s = 0; s < n_split; s++) {
+        const float ms = base[s * stride + head_dim];
+        if (ms == -INFINITY) continue; /* empty split */
+        const float w = expf(ms - m);
+        den += base[s * stride + head_dim + 1u] * w;
+        for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++)
+            acc[k] += base[s * stride + d] * w;
+    }
+    for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++)
+        out[((uint64_t)t * n_head + h) * head_dim + d] = acc[k] / den;
+}
+
+/* grow-only per-device scratch for the split partials (same pattern as
+ * preq_scratch: single-stream engine, VRAM only dereferenceable on its
+ * own device) */
+static void *g_gqa_split_scratch[16];
+static uint64_t g_gqa_split_cap[16];
+
+static void *gqa_split_scratch(uint64_t bytes) {
+    int dev = 0;
+    (void)cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 16) return NULL;
+    if (bytes <= g_gqa_split_cap[dev]) return g_gqa_split_scratch[dev];
+    if (g_gqa_split_scratch[dev]) (void)cudaFree(g_gqa_split_scratch[dev]);
+    g_gqa_split_scratch[dev] = NULL;
+    g_gqa_split_cap[dev] = 0;
+    if (!cuda_ok(cudaMalloc(&g_gqa_split_scratch[dev], bytes), "gqa split scratch")) return NULL;
+    g_gqa_split_cap[dev] = bytes;
+    return g_gqa_split_scratch[dev];
+}
+
+template <bool KV8>
+static int gqa_attention_dispatch(
+        float *out, const float *q, const void *kc, const void *vc,
+        uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
+        uint32_t head_dim, uint32_t cap, uint32_t pos0,
+        float scale, uint32_t window,
+        const float *rel, uint32_t rel_extent) {
+    uint32_t rows_eff = pos0 + n_tok;
+    if (window != 0u && rows_eff > window) rows_eff = window;
+    if (!rel && n_tok <= GQA_SPLIT_MAX_TOK && rows_eff >= GQA_SPLIT_MIN_ROWS) {
+        uint32_t n_split = (rows_eff + GQA_SPLIT_ROWS - 1u) / GQA_SPLIT_ROWS;
+        if (n_split > GQA_SPLIT_MAX) n_split = GQA_SPLIT_MAX;
+        if (n_split >= 2u) {
+            uint64_t bytes = (uint64_t)n_tok * n_head * n_split * ((uint64_t)head_dim + 2u) * 4u;
+            float *partial = (float *)gqa_split_scratch(bytes);
+            if (partial) { /* alloc failure falls through to the plain kernel */
+                dim3 g1(n_tok, n_head, n_split);
+                gqa_attention_split_kernel<KV8><<<g1, 128>>>(
+                        partial, q, kc, vc, n_tok, n_head, n_kv_head,
+                        head_dim, cap, pos0, scale, window, n_split);
+                if (!cuda_ok(cudaGetLastError(), "gqa split launch")) return 0;
+                dim3 g2(n_tok, n_head, 1);
+                gqa_attention_combine_kernel<<<g2, 128>>>(out, partial, n_tok, n_head, head_dim, n_split);
+                return cuda_ok(cudaGetLastError(), "gqa combine launch");
+            }
+        }
+    }
+    dim3 grid(n_tok, n_head, 1);
+    gqa_attention_kernel<KV8><<<grid, 128>>>(
+            out, q, kc, vc, n_tok, n_head, n_kv_head, head_dim, cap, pos0,
+            scale, window, rel, rel_extent);
+    return cuda_ok(cudaGetLastError(), "gqa attention launch");
+}
+
 /* ---- host wrappers ---- */
 
 extern "C" int ds4_gpu_gqa_head_rms_norm_weight(
@@ -304,13 +503,11 @@ extern "C" int ds4_gpu_gqa_attention(
         (rel && rel_extent == 0)) {
         return 0;
     }
-    dim3 grid(n_tok, n_head, 1);
-    gqa_attention_kernel<false><<<grid, 128>>>(
+    return gqa_attention_dispatch<false>(
             (float *)out->ptr, (const float *)q->ptr,
             k_cache->ptr, v_cache->ptr,
             n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window,
             rel ? (const float *)rel->ptr : NULL, rel_extent);
-    return cuda_ok(cudaGetLastError(), "gqa attention launch");
 }
 
 /* ---- fp8 KV variants ---------------------------------------------------- */
@@ -366,13 +563,11 @@ extern "C" int ds4_gpu_gqa_attention_fp8(
         pos0 + n_tok > cap || (rel && rel_extent == 0)) {
         return 0;
     }
-    dim3 grid(n_tok, n_head, 1);
-    gqa_attention_kernel<true><<<grid, 128>>>(
+    return gqa_attention_dispatch<true>(
             (float *)out->ptr, (const float *)q->ptr,
             k_cache->ptr, v_cache->ptr,
             n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window,
             rel ? (const float *)rel->ptr : NULL, rel_extent);
-    return cuda_ok(cudaGetLastError(), "gqa attention fp8 launch");
 }
 
 /* ---- CPU reference + self-test ---- */
@@ -684,6 +879,110 @@ extern "C" int ds4_gpu_gqa_selftest(void) {
         free(q); free(k); free(v); free(kc8); free(vc8); free(ref_out); free(gpu_out);
         ds4_gpu_tensor_free(g_q); ds4_gpu_tensor_free(g_k); ds4_gpu_tensor_free(g_v);
         ds4_gpu_tensor_free(g_out); ds4_gpu_tensor_free(g_kc8); ds4_gpu_tensor_free(g_vc8);
+    }
+
+    /* Phase 7 (split-K decode): a 7000-row cache forces the split path
+     * (rows >= 4096, n_tok <= 4). Three sub-cases: f32 full-causal, f32
+     * with a 5000-row sliding window (split ranges start at row0 > 0),
+     * and fp8 KV. Reference = the same CPU function as every other
+     * phase, so this also cross-checks split vs plain semantics. */
+    {
+        const uint32_t n_head2 = 16, n_kv2 = 2, hd2 = 256, cap2 = 8192;
+        const uint32_t pos2 = 7000, n_tok2 = 2;
+        const float scale2 = 1.0f / sqrtf((float)hd2);
+        const uint64_t cache_elems2 = (uint64_t)n_kv2 * cap2 * hd2;
+        const uint64_t stride8 = (uint64_t)hd2 + 4u;
+        const uint64_t cache8_2 = (uint64_t)n_kv2 * cap2 * stride8;
+        const uint64_t q_elems2 = (uint64_t)n_tok2 * n_head2 * hd2;
+        const uint64_t fill_elems = (uint64_t)(pos2 + n_tok2) * n_kv2 * hd2;
+
+        float *kc2 = (float *)calloc(cache_elems2, sizeof(float));
+        float *vc2 = (float *)calloc(cache_elems2, sizeof(float));
+        float *kin = (float *)malloc(fill_elems * sizeof(float));
+        float *vin = (float *)malloc(fill_elems * sizeof(float));
+        float *q2 = (float *)malloc(q_elems2 * sizeof(float));
+        for (uint64_t i = 0; i < fill_elems; i++) { kin[i] = gqa_test_randf(); vin[i] = gqa_test_randf(); }
+        for (uint64_t i = 0; i < q_elems2; i++) q2[i] = gqa_test_randf();
+        for (uint32_t r = 0; r < pos2 + n_tok2; r++)
+        for (uint32_t h2 = 0; h2 < n_kv2; h2++)
+        for (uint32_t d = 0; d < hd2; d++) {
+            kc2[((uint64_t)h2 * cap2 + r) * hd2 + d] = kin[((uint64_t)r * n_kv2 + h2) * hd2 + d];
+            vc2[((uint64_t)h2 * cap2 + r) * hd2 + d] = vin[((uint64_t)r * n_kv2 + h2) * hd2 + d];
+        }
+
+        ds4_gpu_tensor *g_q2 = ds4_gpu_tensor_alloc(q_elems2 * sizeof(float));
+        ds4_gpu_tensor *g_kc2 = ds4_gpu_tensor_alloc(cache_elems2 * sizeof(float));
+        ds4_gpu_tensor *g_vc2 = ds4_gpu_tensor_alloc(cache_elems2 * sizeof(float));
+        ds4_gpu_tensor *g_out2 = ds4_gpu_tensor_alloc(q_elems2 * sizeof(float));
+        ds4_gpu_tensor_write(g_q2, 0, q2, q_elems2 * sizeof(float));
+        ds4_gpu_tensor_write(g_kc2, 0, kc2, cache_elems2 * sizeof(float));
+        ds4_gpu_tensor_write(g_vc2, 0, vc2, cache_elems2 * sizeof(float));
+
+        float *ref_out2 = (float *)malloc(q_elems2 * sizeof(float));
+        float *gpu_out2 = (float *)malloc(q_elems2 * sizeof(float));
+        const uint32_t wins[2] = { 0u, 5000u };
+        for (int wi = 0; wi < 2; wi++) {
+            gqa_ref_attention(ref_out2, q2, kc2, vc2, n_tok2, n_head2, n_kv2, hd2, cap2, pos2,
+                              scale2, wins[wi], NULL, 0u);
+            int ok = ds4_gpu_gqa_attention(g_out2, g_q2, g_kc2, g_vc2, n_tok2, n_head2, n_kv2,
+                                           hd2, cap2, pos2, scale2, wins[wi], NULL, 0u) &&
+                     cuda_ok(cudaDeviceSynchronize(), "gqa split selftest sync");
+            if (ok) ok = ds4_gpu_tensor_read(g_out2, 0, gpu_out2, q_elems2 * sizeof(float)) != 0;
+            float diff = ok ? gqa_max_abs_diff(ref_out2, gpu_out2, q_elems2) : INFINITY;
+            int pass = ok && diff < 5e-4f;
+            fprintf(stderr, "gqa-selftest phase 7 split-k (rows=%u win=%u): %s (max diff %.2e)\n",
+                    pos2 + n_tok2, wins[wi], pass ? "PASS" : "FAIL", diff);
+            if (!pass) all_ok = 0;
+        }
+
+        /* fp8 KV split: append the same rows through the encoder, decode
+         * the GPU cache bytes on the host for the reference (phase-6
+         * recipe) */
+        ds4_gpu_tensor *g_kin = ds4_gpu_tensor_alloc(fill_elems * sizeof(float));
+        ds4_gpu_tensor *g_vin = ds4_gpu_tensor_alloc(fill_elems * sizeof(float));
+        ds4_gpu_tensor *g_kc8 = ds4_gpu_tensor_alloc(cache8_2);
+        ds4_gpu_tensor *g_vc8 = ds4_gpu_tensor_alloc(cache8_2);
+        ds4_gpu_tensor_write(g_kin, 0, kin, fill_elems * sizeof(float));
+        ds4_gpu_tensor_write(g_vin, 0, vin, fill_elems * sizeof(float));
+        int ok8 = ds4_gpu_gqa_kv_cache_append_fp8(g_kc8, g_kin, pos2 + n_tok2, n_kv2, hd2, cap2, 0u) &&
+                  ds4_gpu_gqa_kv_cache_append_fp8(g_vc8, g_vin, pos2 + n_tok2, n_kv2, hd2, cap2, 0u) &&
+                  ds4_gpu_gqa_attention_fp8(g_out2, g_q2, g_kc8, g_vc8, n_tok2, n_head2, n_kv2,
+                                            hd2, cap2, pos2, scale2, 0u, NULL, 0u) &&
+                  cuda_ok(cudaDeviceSynchronize(), "gqa split fp8 selftest sync");
+        uint8_t *kc8h = (uint8_t *)malloc(cache8_2);
+        uint8_t *vc8h = (uint8_t *)malloc(cache8_2);
+        if (ok8) ok8 = ds4_gpu_tensor_read(g_kc8, 0, kc8h, cache8_2) != 0 &&
+                       ds4_gpu_tensor_read(g_vc8, 0, vc8h, cache8_2) != 0;
+        if (ok8) {
+            memset(kc2, 0, cache_elems2 * sizeof(float));
+            memset(vc2, 0, cache_elems2 * sizeof(float));
+            for (uint32_t h2 = 0; h2 < n_kv2; h2++)
+            for (uint32_t r = 0; r < pos2 + n_tok2; r++) {
+                const uint8_t *kr = kc8h + ((uint64_t)h2 * cap2 + r) * stride8;
+                const uint8_t *vr = vc8h + ((uint64_t)h2 * cap2 + r) * stride8;
+                float ksc, vsc;
+                memcpy(&ksc, kr + hd2, 4);
+                memcpy(&vsc, vr + hd2, 4);
+                for (uint32_t d = 0; d < hd2; d++) {
+                    kc2[((uint64_t)h2 * cap2 + r) * hd2 + d] = e4m3_dec_common(kr[d]) * ksc;
+                    vc2[((uint64_t)h2 * cap2 + r) * hd2 + d] = e4m3_dec_common(vr[d]) * vsc;
+                }
+            }
+        }
+        gqa_ref_attention(ref_out2, q2, kc2, vc2, n_tok2, n_head2, n_kv2, hd2, cap2, pos2,
+                          scale2, 0u, NULL, 0u);
+        if (ok8) ok8 = ds4_gpu_tensor_read(g_out2, 0, gpu_out2, q_elems2 * sizeof(float)) != 0;
+        float diff8 = ok8 ? gqa_max_abs_diff(ref_out2, gpu_out2, q_elems2) : INFINITY;
+        int pass8 = ok8 && diff8 < 1e-3f;
+        fprintf(stderr, "gqa-selftest phase 7 split-k fp8 (rows=%u): %s (max diff %.2e)\n",
+                pos2 + n_tok2, pass8 ? "PASS" : "FAIL", diff8);
+        if (!pass8) all_ok = 0;
+
+        free(kc2); free(vc2); free(kin); free(vin); free(q2);
+        free(ref_out2); free(gpu_out2); free(kc8h); free(vc8h);
+        ds4_gpu_tensor_free(g_q2); ds4_gpu_tensor_free(g_kc2); ds4_gpu_tensor_free(g_vc2);
+        ds4_gpu_tensor_free(g_out2); ds4_gpu_tensor_free(g_kin); ds4_gpu_tensor_free(g_vin);
+        ds4_gpu_tensor_free(g_kc8); ds4_gpu_tensor_free(g_vc8);
     }
 
     free(qn_w); free(kn_w); free(ref_kc); free(ref_vc);
