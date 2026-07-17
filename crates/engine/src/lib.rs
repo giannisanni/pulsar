@@ -728,6 +728,9 @@ mod real {
         tick: u64,
         pub hits: u64,
         pub misses: u64,
+        /// offsets the CPU expert lane is reading right now - the evictors
+        /// must not free them mid-dot (cleared after the pool joins)
+        pinned: Vec<u64>,
     }
 
     struct CacheEntry {
@@ -745,6 +748,9 @@ mod real {
         pub sync: std::time::Duration,
         pub resolve: std::time::Duration,
         pub h2d: std::time::Duration,
+        /// CPU expert lane wall time after the stage-A overlap (mid
+        /// quantize + down-proj fan-out + join)
+        pub cpu: std::time::Duration,
         pub tail: std::time::Duration,
         pub calls: u64,
     }
@@ -753,11 +759,12 @@ mod real {
         pub fn report(&self) -> String {
             let s = |d: std::time::Duration| d.as_secs_f64();
             format!(
-                "gpu-wait {:.2}s, resolve {:.2}s (h2d {:.2}s, disk/host {:.2}s), logits-tail {:.2}s over {} layer steps",
+                "gpu-wait {:.2}s, resolve {:.2}s (h2d {:.2}s, disk/host {:.2}s), cpu-lane {:.2}s, logits-tail {:.2}s over {} layer steps",
                 s(self.sync),
                 s(self.resolve),
                 s(self.h2d),
                 s(self.resolve) - s(self.h2d),
+                s(self.cpu),
                 s(self.tail),
                 self.calls
             )
@@ -1155,7 +1162,21 @@ mod real {
                 tick: 0,
                 hits: 0,
                 misses: 0,
+                pinned: Vec::new(),
             })
+        }
+
+        /// Cache-hit payload for the CPU expert lane: bumps LFU heat like
+        /// an ensure_with hit and returns the slab bytes as a raw span
+        /// (valid until the entry is evicted - pin it across any evictor).
+        fn peek_ptr(&mut self, offset: u64) -> Option<(*const u8, usize)> {
+            let tick = self.tick;
+            let e = self.cache.get_mut(&offset)?;
+            e.freq += 1;
+            e.tick = tick;
+            self.hits += 1;
+            let p = e.slab.payload();
+            Some((p.as_ptr(), p.len()))
         }
 
         /// Resolve every read: cached payloads go to `place(offset, bytes)`
@@ -1191,7 +1212,9 @@ mod real {
                 let victim = self
                     .cache
                     .iter()
-                    .filter(|(k, _)| !wants.iter().any(|w| w.offset == **k))
+                    .filter(|(k, _)| {
+                        !wants.iter().any(|w| w.offset == **k) && !self.pinned.contains(k)
+                    })
                     .min_by_key(|(_, e)| (e.freq, e.tick))
                     .map(|(k, _)| *k);
                 let Some(k) = victim else { break };
@@ -1266,6 +1289,7 @@ mod real {
                 let victim = self
                     .cache
                     .iter()
+                    .filter(|(k, _)| !self.pinned.contains(k))
                     .min_by_key(|(_, e)| (e.freq, e.tick))
                     .map(|(k, _)| *k);
                 let Some(k) = victim else { break };
@@ -1275,6 +1299,121 @@ mod real {
             }
             self.used += incoming;
             self.cache.insert(offset, CacheEntry { slab, freq: 1, tick: self.tick });
+        }
+    }
+
+    /// CPU expert lane: host-cache-hit experts compute where their bytes
+    /// live (RAM at ~42GB/s on the 9900X via the AVX2 iq2_xxs dot) instead
+    /// of crossing PCIe (~29GB/s), freeing H2D for disk-miss staging. The
+    /// pool is persistent - per-layer thread spawns would cost more than
+    /// the dots. Opt-in: PULSAR_CPU=1 (or =N for N worker threads).
+    mod cpu_tier {
+        pub type Job = Box<dyn FnOnce() + Send>;
+
+        /// raw-pointer smuggler for jobs; soundness = caller keeps the
+        /// pointee alive and unmutated until wait() returns
+        #[derive(Clone, Copy)]
+        pub struct SendPtr(pub *const u8);
+        unsafe impl Send for SendPtr {}
+        #[derive(Clone, Copy)]
+        pub struct SendMut(pub *mut f32);
+        unsafe impl Send for SendMut {}
+        // accessors, not .0: edition-2021 closures capture the raw-ptr
+        // FIELD on .0 (not Send); a method call captures the wrapper
+        impl SendPtr {
+            pub fn get(self) -> *const u8 {
+                self.0
+            }
+        }
+        impl SendMut {
+            pub fn get(self) -> *mut f32 {
+                self.0
+            }
+        }
+
+        pub struct Pool {
+            tx: std::sync::mpsc::Sender<Job>,
+            done_rx: std::sync::mpsc::Receiver<()>,
+            pub threads: usize,
+        }
+
+        impl Pool {
+            pub fn from_env() -> Option<Pool> {
+                let v = std::env::var("PULSAR_CPU").ok()?;
+                let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+                let threads = match v.as_str() {
+                    "" | "0" | "off" => return None,
+                    // physical cores minus main + fetcher headroom
+                    "1" | "on" => (cores / 2).saturating_sub(2).max(1),
+                    n => n.parse().ok()?,
+                };
+                let (tx, rx) = std::sync::mpsc::channel::<Job>();
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+                for _ in 0..threads {
+                    let rx = rx.clone();
+                    let done_tx = done_tx.clone();
+                    std::thread::spawn(move || loop {
+                        let job = match rx.lock().unwrap().recv() {
+                            Ok(j) => j,
+                            Err(_) => return,
+                        };
+                        job();
+                        let _ = done_tx.send(());
+                    });
+                }
+                Some(Pool { tx, done_rx, threads })
+            }
+
+            pub fn submit(&self, jobs: Vec<Job>) -> usize {
+                let n = jobs.len();
+                for j in jobs {
+                    let _ = self.tx.send(j);
+                }
+                n
+            }
+
+            pub fn wait(&self, n: usize) {
+                for _ in 0..n {
+                    let _ = self.done_rx.recv();
+                }
+            }
+        }
+
+        /// joins outstanding jobs on drop - an early `?` return between
+        /// submit and the explicit join must not free buffers the workers
+        /// still write
+        pub struct WaitGuard<'a> {
+            pub pool: &'a Pool,
+            pub n: usize,
+        }
+        impl Drop for WaitGuard<'_> {
+            fn drop(&mut self) {
+                self.pool.wait(self.n);
+            }
+        }
+
+        /// mirrors pulsar_glu in pulsar_kernels.cu (0 = silu, 1 = gelu
+        /// tanh, 2 = swiglu_oai, 3 = deepseek4 clamped silu)
+        pub fn glu(g: f32, u: f32, op: u32) -> f32 {
+            match op {
+                1 => {
+                    0.5 * g
+                        * (1.0 + (0.797_884_560_802_865_4_f32 * (g + 0.044715 * g * g * g)).tanh())
+                        * u
+                }
+                2 => {
+                    let g = g.min(7.0);
+                    let u = u.clamp(-7.0, 7.0);
+                    g / (1.0 + (-1.702 * g).exp()) * (u + 1.0)
+                }
+                3 => {
+                    let g = g.min(10.0);
+                    let u = u.clamp(-10.0, 10.0);
+                    g / (1.0 + (-g).exp()) * u
+                }
+                _ => g / (1.0 + (-g).exp()) * u,
+            }
         }
     }
 
@@ -2641,6 +2780,10 @@ mod real {
         // buffer their partial outputs are gathered into
         pub tiers: Vec<ExpertTier>,
         tier_ret: DeviceBuf,
+        /// CPU expert lane (PULSAR_CPU=1): worker pool + partial-return buf
+        pub cpu_pool: Option<cpu_tier::Pool>,
+        cpu_ret: DeviceBuf,
+        pub cpu_hits: u64,
         // grouped batch-MoE scratch (grow-only; prefill chunks only)
         grp_ptrs: DeviceBuf,
         grp_starts: DeviceBuf,
@@ -3195,6 +3338,9 @@ mod real {
                 normed_a,
                 attn_out_a,
                 tier_ret: if tiers.is_empty() { f32s(1)? } else { f32s(mb * s.n_embd)? },
+                cpu_pool: cpu_tier::Pool::from_env(),
+                cpu_ret: f32s(1)?, // grows on first CPU-lane hit
+                cpu_hits: 0,
                 tiers,
                 grp_ptrs: DeviceBuf::alloc(s.n_expert.max(1) as usize * std::mem::size_of::<ExpertPtrs>())?,
                 grp_starts: DeviceBuf::alloc((s.n_expert as usize + 1) * 4)?,
@@ -4004,12 +4150,149 @@ mod real {
                                 }, is_sink))
                             })
                         };
+                        // CPU expert lane (PULSAR_CPU=1): iq2_xxs experts
+                        // whose three slabs all sit in the host cache (and
+                        // none in VRAM) never cross PCIe - the worker pool
+                        // dots them from store memory under the GPU resolve
+                        // and a ~20KB f32 partial joins moe_out after the
+                        // tier gather. Decode-shaped batches only: prefill
+                        // amortizes each upload across the whole chunk, so
+                        // the GPU wins there. Float order differs from the
+                        // single-kernel path (same drift class as tiers).
+                        let cpu_on = st.cpu_pool.is_some()
+                            && n_tok <= 8
+                            && !st.unified
+                            && s.n_embd % 256 == 0
+                            && s.n_ff_exp % 256 == 0
+                            && [gate_exps.quant, up_exps.quant, down_exps.quant]
+                                .iter()
+                                .all(|&q| q == kernels::QUANT_IQ2_XXS);
+                        let n_used = s.n_expert_used as usize;
+                        let (ne, nf) = (s.n_embd as usize, s.n_ff_exp as usize);
+                        let mut cpu_idx: std::collections::HashMap<i32, usize> =
+                            std::collections::HashMap::new();
+                        let mut cpu_ptr: Vec<[cpu_tier::SendPtr; 3]> = Vec::new();
+                        let mut cpu_pairs: Vec<Vec<(usize, f32)>> = Vec::new();
+                        let mut cpu_xqs: Vec<quant::cpu_dot::Q8KRow> = Vec::new();
+                        let mut cpu_mids: Vec<f32> = Vec::new();
+                        let mut cpu_guard: Option<cpu_tier::WaitGuard> = None;
+                        if cpu_on {
+                            let mut pins = Vec::new();
+                            for &e in &distinct {
+                                if e < 0 || e as u32 >= s.n_expert || tier_of(e).is_some() {
+                                    continue;
+                                }
+                                let [g3, u3, d3] = slabs_of(e as u32);
+                                let (go, uo, dno) =
+                                    (off_of(g3.0, g3.1), off_of(u3.0, u3.1), off_of(d3.0, d3.1));
+                                if self
+                                    .mtp
+                                    .as_ref()
+                                    .is_some_and(|mt| mt.res_map.contains_key(&go))
+                                    || st.dev_cache.map.contains_key(&go)
+                                    || st.dev_cache.map.contains_key(&uo)
+                                    || st.dev_cache.map.contains_key(&dno)
+                                {
+                                    continue;
+                                }
+                                let (Some(gp), Some(upp), Some(dp)) = (
+                                    st.store.peek_ptr(go),
+                                    st.store.peek_ptr(uo),
+                                    st.store.peek_ptr(dno),
+                                ) else {
+                                    continue;
+                                };
+                                cpu_idx.insert(e, cpu_ptr.len());
+                                cpu_ptr.push([
+                                    cpu_tier::SendPtr(gp.0),
+                                    cpu_tier::SendPtr(unsafe {
+                                        upp.0.add(*fused_up_off as usize)
+                                    }),
+                                    cpu_tier::SendPtr(dp.0),
+                                ]);
+                                cpu_pairs.push(Vec::new());
+                                pins.extend([go, uo, dno]);
+                            }
+                            st.store.pinned = pins;
+                        }
+                        if !cpu_idx.is_empty() {
+                            let rw = st.router_weights.read_f32(n_tok as usize * n_used)?;
+                            for (si, &e) in selected.iter().enumerate() {
+                                if let Some(&ci) = cpu_idx.get(&e) {
+                                    cpu_pairs[ci].push((si / n_used, rw[si]));
+                                }
+                            }
+                            let normed_h = st.normed.read_f32(n_tok as usize * ne)?;
+                            cpu_xqs = (0..n_tok as usize)
+                                .map(|t| {
+                                    quant::cpu_dot::quantize_row_q8_k(
+                                        &normed_h[t * ne..(t + 1) * ne],
+                                    )
+                                })
+                                .collect();
+                            let npairs: usize = cpu_pairs.iter().map(|p| p.len()).sum();
+                            cpu_mids = vec![0f32; npairs * nf];
+                            let act_op = s.moe_act_op;
+                            let grb = gate_exps.row_bytes as usize;
+                            let xq_ptr = cpu_tier::SendPtr(cpu_xqs.as_ptr() as *const u8);
+                            let mut jobs: Vec<cpu_tier::Job> = Vec::new();
+                            let mut mid_base = 0usize;
+                            for (ci, pairs) in cpu_pairs.iter().enumerate() {
+                                let [gp, up_, _] = cpu_ptr[ci];
+                                let mid = cpu_tier::SendMut(unsafe {
+                                    cpu_mids.as_mut_ptr().add(mid_base * nf)
+                                });
+                                mid_base += pairs.len();
+                                for lo in (0..nf).step_by(256) {
+                                    let hi = (lo + 256).min(nf);
+                                    let pairs = pairs.clone();
+                                    jobs.push(Box::new(move || unsafe {
+                                        for j in lo..hi {
+                                            let g_row = std::slice::from_raw_parts(
+                                                gp.get().add(j * grb), grb,
+                                            );
+                                            let u_row = std::slice::from_raw_parts(
+                                                up_.get().add(j * grb), grb,
+                                            );
+                                            for (pi, &(tok, w)) in pairs.iter().enumerate() {
+                                                let xq = &*(xq_ptr.get()
+                                                    as *const quant::cpu_dot::Q8KRow)
+                                                    .add(tok);
+                                                let g = quant::cpu_dot::vec_dot_iq2_xxs_q8_k(
+                                                    g_row, xq, ne,
+                                                );
+                                                let u = quant::cpu_dot::vec_dot_iq2_xxs_q8_k(
+                                                    u_row, xq, ne,
+                                                );
+                                                *mid.get().add(pi * nf + j) =
+                                                    cpu_tier::glu(g, u, act_op) * w;
+                                            }
+                                        }
+                                    }));
+                                }
+                            }
+                            let pool = st.cpu_pool.as_ref().unwrap();
+                            cpu_guard = Some(cpu_tier::WaitGuard {
+                                pool,
+                                n: pool.submit(jobs),
+                            });
+                        }
                         let mut offsets =
                             Vec::with_capacity(3 * distinct.len());
                         for &e in &distinct {
                             if tier_of(e).is_some() {
                                 // keep the census warm for resident slabs
                                 // or their heat freezes at placement time
+                                for (t, le) in slabs_of(e as u32) {
+                                    let off = off_of(t, le);
+                                    st.dev_cache.touch.entry(off).or_insert((0, t.expert_bytes)).0 += 1;
+                                }
+                                continue;
+                            }
+                            if cpu_idx.contains_key(&e) {
+                                // CPU-lane experts: no fetch, no upload;
+                                // keep their VRAM-census heat warm like the
+                                // tier branch does
                                 for (t, le) in slabs_of(e as u32) {
                                     let off = off_of(t, le);
                                     st.dev_cache.touch.entry(off).or_insert((0, t.expert_bytes)).0 += 1;
@@ -4163,6 +4446,10 @@ mod real {
                                     tptrs[ti][si] = tp;
                                     tier_slots[ti] += 1;
                                 }
+                                continue;
+                            }
+                            if cpu_idx.contains_key(&e) {
+                                ptrs.push(ExpertPtrs::NULL);
                                 continue;
                             }
                             let [g3, u3, d3] = slabs_of(e as u32);
@@ -4438,6 +4725,75 @@ mod real {
                                 kernels::set_device(primary)?;
                                 kernels::add_assign(&mut st.moe_out, &st.tier_ret, n_tok * s.n_embd)?;
                             }
+                        }
+
+                        // CPU-lane join: stage A (gate/up + glu) ran under
+                        // the resolve and the GPU launches above; down-proj
+                        // partials fan out here while those kernels are
+                        // still in flight, then a single f32 upload joins
+                        // moe_out on the primary stream.
+                        if !cpu_idx.is_empty() {
+                            drop(cpu_guard.take());
+                            let t_cpu = std::time::Instant::now();
+                            let npairs: usize = cpu_pairs.iter().map(|p| p.len()).sum();
+                            let midq: Vec<quant::cpu_dot::Q8KRow> = (0..npairs)
+                                .map(|p| {
+                                    quant::cpu_dot::quantize_row_q8_k(
+                                        &cpu_mids[p * nf..(p + 1) * nf],
+                                    )
+                                })
+                                .collect();
+                            let mut per_tok: Vec<Vec<(cpu_tier::SendPtr, usize)>> =
+                                vec![Vec::new(); n_tok as usize];
+                            let mut mid_base = 0usize;
+                            for (ci, pairs) in cpu_pairs.iter().enumerate() {
+                                for (pi, &(tok, _)) in pairs.iter().enumerate() {
+                                    per_tok[tok].push((cpu_ptr[ci][2], mid_base + pi));
+                                }
+                                mid_base += pairs.len();
+                            }
+                            let mut acc = vec![0f32; n_tok as usize * ne];
+                            let drb = down_exps.row_bytes as usize;
+                            let acc_ptr = cpu_tier::SendMut(acc.as_mut_ptr());
+                            let midq_ptr = cpu_tier::SendPtr(midq.as_ptr() as *const u8);
+                            let mut jobs: Vec<cpu_tier::Job> = Vec::new();
+                            for (t, list) in per_tok.iter().enumerate() {
+                                if list.is_empty() {
+                                    continue;
+                                }
+                                for lo in (0..ne).step_by(512) {
+                                    let hi = (lo + 512).min(ne);
+                                    let list = list.clone();
+                                    jobs.push(Box::new(move || unsafe {
+                                        for r in lo..hi {
+                                            let mut sum = 0f32;
+                                            for &(dp, mi) in &list {
+                                                let row = std::slice::from_raw_parts(
+                                                    dp.get().add(r * drb), drb,
+                                                );
+                                                let mq = &*(midq_ptr.get()
+                                                    as *const quant::cpu_dot::Q8KRow)
+                                                    .add(mi);
+                                                sum += quant::cpu_dot::vec_dot_iq2_xxs_q8_k(
+                                                    row, mq, nf,
+                                                );
+                                            }
+                                            *acc_ptr.get().add(t * ne + r) = sum;
+                                        }
+                                    }));
+                                }
+                            }
+                            let pool = st.cpu_pool.as_ref().unwrap();
+                            pool.wait(pool.submit(jobs));
+                            st.store.pinned.clear();
+                            st.cpu_hits += cpu_idx.len() as u64;
+                            st.prof.cpu += t_cpu.elapsed();
+                            let need = n_tok as usize * ne * 4;
+                            if st.cpu_ret.bytes() < need {
+                                st.cpu_ret = DeviceBuf::alloc(need)?;
+                            }
+                            st.cpu_ret.write(0, kernels::as_bytes(&acc))?;
+                            kernels::add_assign(&mut st.moe_out, &st.cpu_ret, n_tok * s.n_embd)?;
                         }
 
                         // cur = after_attn + routed + shared (ds4's add3).

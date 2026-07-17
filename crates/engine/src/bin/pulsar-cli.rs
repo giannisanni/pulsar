@@ -452,6 +452,9 @@ fn run() -> engine::Result {
         } else {
             String::new()
         };
+        if st.cpu_hits > 0 {
+            s += &format!(", cpu lane {} experts", st.cpu_hits);
+        }
         if st.mtp_drafted > 0 {
             s += &format!(
                 ", mtp {}/{} drafts accepted ({:.0}%)",

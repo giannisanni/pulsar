@@ -7,6 +7,7 @@
 //! Stage 1 formats: q8_0 (attn/dense in the ds4-style recipe) and the
 //! K-quants q2_K..q6_K. Stage 2 adds iq2_xxs/iq2_xs/iq3_xxs + imatrix.
 
+pub mod cpu_dot;
 pub mod iq;
 
 pub const QK8_0: usize = 32;

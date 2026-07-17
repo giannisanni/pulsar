@@ -8,6 +8,7 @@ description = "hy-v3 forward graph and decode loop over the pulsar CUDA kernels.
 [dependencies]
 gguf = { path = "../gguf" }
 kernels = { path = "../kernels" }
+quant = { path = "../quant" }
 stream = { path = "../stream" }
 tokenizer = { path = "../tokenizer" }
 
