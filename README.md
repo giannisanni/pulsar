@@ -316,17 +316,20 @@ batched target forward verifies the block, recurrent state snapshots
 roll back rejections). The machinery works - structured text accepts
 whole 16-blocks - but it ships opt-in experimental
 (`PULSAR_DFLASH=draft.gguf`) because on the reference box it is
-net-slower: each verify unions ~110 distinct experts per layer where
-sequential decode touches 8, and that union streams over PCIe while
-sequential decode rides a 94%-hit VRAM cache. Same law MTP taught:
-speculation pays when the verify union is weight-resident. The flip is
-scoped: expert tiers on the second GPU serve the union at VRAM speed.
+net-slower (8.7 vs ~35 tok/s): a 16-row verify runs 16x the expert-dot
+work of a sequential token, and the iq3/iq4 dequant compute dominates
+once the weights are resident. The hybrid families do get resident
+expert tiers now (the spare card serves ~98% of expert slots at VRAM
+speed - that took DFlash from 6.1 to 8.7 and cost sequential decode
+nothing), and the profile pins the rest: tensor-core MoE unpackers for
+iq3_xxs/iq4_xs (decode each expert block once per verify instead of
+once per row), acceptance tuning, fast state rollback.
 
 Not yet:
 
-- DFlash perf pass: tier-aware expert resolve for the hybrid families
-  (~14GB of experts fit the spare 16GB card whole), draft context-KV
-  ring, fast GDN rollback
+- DFlash perf pass, remaining: iq3_xxs/iq4_xs unpackers for the
+  grouped tensor-core MoE (the verify-cost fix), draft context-KV
+  ring + acceptance tuning, fast GDN rollback
 - deepseek4 perf pass: batched prefill (prompts currently process
   sequentially), resident tiers + cross-layer prefetch for the dsv4
   resolve, fewer host syncs on the hyper-connection gates

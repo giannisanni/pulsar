@@ -144,15 +144,29 @@ equivalents + draft (~1ms) and commits accept_n+bonus (lucebox measures
 ##   union streams over PCIe every round while sequential decode rides
 ##   94% VRAM cache hits.
 ##
-## To flip it net-positive (the DFlash perf pass):
-## 1. expert tiers for the hybrid families: ~14GB of experts fit the
-##    idle 4060 Ti entirely; teach the lean dsv4_moe resolve the tier
-##    map (the shared eval_layer arm already has the pattern). Verify
-##    unions then run at VRAM speed on the second card - the exact
-##    regime where lucebox's 3.4x lives.
-## 2. acceptance: RING_CAP 256 -> 2048 (matters past 256 ctx), cached
-##    draft ctx-KV ring (lucebox DraftKvCacheRefs) so the window isn't
-##    recomputed per round, try the Q4_K_XL target (less feature noise
-##    than Q3 against a bf16-trained draft).
-## 3. lucebox-style fast rollback (per-position GDN input stash +
-##    replay) to drop the restore+replay forward.
+## TIER PASS DONE (2026-07-16 night): tier-aware lean resolve shipped
+## (tier lookup + census keep-warm + cross-card launches + gather; the
+## eval_layer pattern minus sinks/fused/MTP), build_tiers re-enabled
+## for the hybrid families. 8725 triples / 12.2GB resident on the
+## 4060 Ti, ~98% of expert slots tier-served. Also killed the batched-
+## path sync tax (one-launch qkv split, ring scatter/gather kernels,
+## on-device GDN coefficients + shexp gate - was ~1500 blocking d2d
+## copies + 100 host readbacks per round). DFlash 6.1 -> 8.7 tok/s;
+## sequential unchanged at ~35 (ids identical).
+##
+## MEASURED PROFILE (PULSAR_DFLASH_DEBUG timing): draft 47ms,
+## verify(16) 260ms (tiers-off: 330ms - tier helps), replay
+## ~18ms/token. Verify = 6.5ms/layer vs 0.6 sequential: the cost is
+## IQ-QUANT DECODE COMPUTE in the dp4a MoE kernels - 128 expert-slot
+## dots re-decode iq3_xxs/iq4_xs per token. Round commits ~2.8 tokens
+## for ~12 sequential-tokens of work.
+##
+## Remaining moves, in value order:
+## 1. unpack16_iq3_xxs + unpack16_iq4_xs (~40 lines each) -> the
+##    task-#15 grouped-MMA MoE kernels decode each expert superblock
+##    to int8 smem ONCE per launch. Est. verify 260 -> 60-90ms.
+## 2. acceptance 2.8 -> 6+: Q4_K_XL target (feature noise vs the
+##    bf16-trained draft), RING_CAP 2048, draft ctx-KV cache ring.
+## 3. fast rollback (per-position GDN input stash) drops the replay.
+## Break-even math: round_ms / 25ms-per-sequential-token < commits.
+## All three land ~2x over sequential; any one alone does not flip it.
