@@ -72,6 +72,7 @@ mod real {
         fn pulsar_embed_q8_0(out: *mut c_void, w: *const c_void, tokens: *const c_void, n_embd: u32, n_vocab: u32, n_tok: u32) -> i32;
         fn pulsar_rms_norm(out: *mut c_void, x: *const c_void, w: *const c_void, n: u32, rows: u32, eps: f32) -> i32;
         fn pulsar_q8_0_matmul(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32) -> i32;
+        fn pulsar_q8_0_matmul_banked(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_bank: u32, n_tok: u32) -> i32;
         fn pulsar_matmul_f32(out: *mut c_void, w: *const c_void, x: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32) -> i32;
         fn pulsar_matmul_kq(out: *mut c_void, w: *const c_void, xq: *const c_void, in_dim: u32, out_dim: u32, n_tok: u32, row_bytes: u64, quant: u32) -> i32;
         fn pulsar_idx_rope0(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, n_ctx_orig: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32) -> i32;
@@ -655,6 +656,14 @@ mod real {
 
     pub fn matmul_q8_0(out: &mut DeviceBuf, w: &DeviceBuf, x: &DeviceBuf, in_dim: u32, out_dim: u32, n_tok: u32) -> Result {
         check(unsafe { pulsar_q8_0_matmul(out.ptr_mut(), w.ptr(), x.ptr(), in_dim, out_dim, n_tok) }, "matmul_q8_0")
+    }
+
+    /// Banked matmul: x is n_tok*n_bank contiguous pseudo-rows of in_dim,
+    /// w is n_bank stacked [out_dim x in_dim] q8_0 matrices, pseudo-row j
+    /// multiplies bank j % n_bank (deepseek4's grouped output projection
+    /// in ONE launch, bitwise identical to the per-bank loop).
+    pub fn matmul_q8_0_banked(out: &mut DeviceBuf, w: &DeviceBuf, x: &DeviceBuf, in_dim: u32, out_dim: u32, n_bank: u32, n_tok: u32) -> Result {
+        check(unsafe { pulsar_q8_0_matmul_banked(out.ptr_mut(), w.ptr(), x.ptr(), in_dim, out_dim, n_bank, n_tok) }, "matmul_q8_0_banked")
     }
 
     /// matmul_q8_0 with byte offsets into each buffer (deepseek4's

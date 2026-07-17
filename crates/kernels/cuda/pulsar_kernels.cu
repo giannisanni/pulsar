@@ -305,6 +305,38 @@ __global__ static void matmul_q8_0_preq_warp8_kernel(
     if (lane == 0) out[row] = acc;
 }
 
+/* banked q8_0 matmul: pseudo-row j = token*n_bank + bank multiplies weight
+ * bank j % n_bank (deepseek4's grouped out-proj: heads is [t][n_bank]
+ * contiguous slices, low is [t][n_bank] contiguous rank-rows, so the whole
+ * t*n_bank loop collapses into one launch). Per-thread accumulation order
+ * matches matmul_q8_0_preq_warp8_kernel exactly -> bitwise identical to the
+ * per-(token,bank) launch loop it replaces. */
+__global__ static void matmul_q8_0_preq_banked_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t out_dim,
+        uint64_t n_bank,
+        uint64_t blocks) {
+    uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint32_t lane = threadIdx.x & 31u;
+    uint64_t j = (uint64_t)blockIdx.y;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + ((j % n_bank) * out_dim + row) * blocks * 34;
+    const int8_t *xqr = xq + j * blocks * 32;
+    const float *xsr = xscale + j * blocks;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const __half *scale_h = (const __half *)(wr + b * 34);
+        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
+        int dot = dot_i8x32_dp4a(qs, xqr + b * 32);
+        acc += __half2float(*scale_h) * xsr[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) out[j * out_dim + row] = acc;
+}
+
 /* tensor-core prefill GEMM (sm_80+): one mma.m16n8k32 s8s8s32 covers
  * exactly one q8_0 quant block (k=32), so the integer accumulator can be
  * rescaled by scale_w[row][blk] * scale_x[tok][blk] in registers using
@@ -475,6 +507,38 @@ extern "C" int pulsar_q8_0_matmul(
     return cuda_ok(cudaGetLastError(), "q8_0 matmul launch");
 }
 
+/* banked matmul: x is n_tok*n_bank contiguous pseudo-rows of in_dim floats
+ * (row j = token*n_bank + bank), w is n_bank stacked [out_dim x in_dim]
+ * q8_0 matrices, out is n_tok*n_bank contiguous out_dim rows. */
+extern "C" int pulsar_q8_0_matmul_banked(
+        void *out_dev,
+        const void *w_dev,
+        const void *x_dev,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t n_bank,
+        uint32_t n_tok) {
+    if (in_dim == 0 || in_dim % 32u != 0 || out_dim == 0 || n_bank == 0 || n_tok == 0) return 0;
+    const uint64_t blocks = in_dim / 32u;
+    const uint64_t rows = (uint64_t)n_tok * n_bank;
+    const uint64_t xq_bytes = rows * blocks * 32u;
+    const uint64_t scale_off = (xq_bytes + 15u) & ~15ull;
+    void *tmp = preq_scratch(scale_off + rows * blocks * sizeof(float));
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_off);
+
+    dim3 qgrid((unsigned)blocks, (unsigned)rows, 1);
+    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x_dev, in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(), "q8_0 banked prequant launch")) return 0;
+
+    dim3 grid((out_dim + 7u) / 8u, (unsigned)rows, 1);
+    matmul_q8_0_preq_banked_kernel<<<grid, 256>>>(
+            (float *)out_dev, (const unsigned char *)w_dev, xq, xscale,
+            out_dim, n_bank, blocks);
+    return cuda_ok(cudaGetLastError(), "q8_0 banked matmul launch");
+}
+
 /* CPU-reference selftest: quantize random weights to q8_0 on the host,
  * run both pipelines, compare. */
 static uint16_t f32_to_f16_bits(float f) {
@@ -604,10 +668,70 @@ static int q8_0_matmul_selftest_one(uint32_t n_tok) {
     return ok;
 }
 
+/* banked kernel must be BITWISE identical to the per-(token,bank) warp8
+ * launch loop it replaces (dsv4 grouped out-proj), so compare with memcmp. */
+static int q8_0_banked_selftest_one(uint32_t n_tok) {
+    const uint32_t in_dim = 1088, out_dim = 96, n_bank = 8;
+    const uint32_t blocks = in_dim / 32u;
+    const uint64_t w_bytes = (uint64_t)n_bank * out_dim * blocks * 34u;
+    const uint64_t rows = (uint64_t)n_tok * n_bank;
+    const uint64_t x_bytes = rows * in_dim * sizeof(float);
+    const uint64_t o_bytes = rows * out_dim * sizeof(float);
+
+    unsigned char *w = (unsigned char *)malloc(w_bytes);
+    float *x = (float *)malloc(x_bytes);
+    float *out_a = (float *)malloc(o_bytes);
+    float *out_b = (float *)malloc(o_bytes);
+    for (uint64_t b = 0; b < w_bytes / 34u; b++) {
+        unsigned char *blk = w + b * 34u;
+        uint16_t s = f32_to_f16_bits(gqa_test_randf() * 0.1f);
+        blk[0] = (unsigned char)(s & 0xFF);
+        blk[1] = (unsigned char)(s >> 8);
+        for (int i = 0; i < 32; i++)
+            blk[2 + i] = (unsigned char)(int8_t)lrintf(gqa_test_randf() * 127.0f);
+    }
+    for (uint64_t i = 0; i < rows * in_dim; i++) x[i] = gqa_test_randf();
+
+    void *w_dev = NULL, *x_dev = NULL, *oa_dev = NULL, *ob_dev = NULL;
+    int ok = cuda_ok(cudaMalloc(&w_dev, w_bytes), "w alloc") &&
+             cuda_ok(cudaMalloc(&x_dev, x_bytes), "x alloc") &&
+             cuda_ok(cudaMalloc(&oa_dev, o_bytes), "oa alloc") &&
+             cuda_ok(cudaMalloc(&ob_dev, o_bytes), "ob alloc") &&
+             cuda_ok(cudaMemcpy(w_dev, w, w_bytes, cudaMemcpyHostToDevice), "w h2d") &&
+             cuda_ok(cudaMemcpy(x_dev, x, x_bytes, cudaMemcpyHostToDevice), "x h2d") &&
+             pulsar_q8_0_matmul_banked(oa_dev, w_dev, x_dev, in_dim, out_dim, n_bank, n_tok);
+    if (ok) {
+        for (uint32_t t = 0; t < n_tok && ok; t++)
+            for (uint32_t g = 0; g < n_bank && ok; g++) {
+                uint64_t j = (uint64_t)t * n_bank + g;
+                ok = pulsar_q8_0_matmul(
+                        (char *)ob_dev + j * out_dim * sizeof(float),
+                        (const char *)w_dev + (uint64_t)g * out_dim * blocks * 34u,
+                        (const char *)x_dev + j * in_dim * sizeof(float),
+                        in_dim, out_dim, 1);
+            }
+    }
+    ok = ok &&
+         cuda_ok(cudaDeviceSynchronize(), "sync") &&
+         cuda_ok(cudaMemcpy(out_a, oa_dev, o_bytes, cudaMemcpyDeviceToHost), "oa d2h") &&
+         cuda_ok(cudaMemcpy(out_b, ob_dev, o_bytes, cudaMemcpyDeviceToHost), "ob d2h") &&
+         memcmp(out_a, out_b, o_bytes) == 0;
+    fprintf(stderr, "q8_0-banked-selftest n_tok=%u: %s\n", n_tok, ok ? "PASS" : "FAIL");
+    if (w_dev) cudaFree(w_dev);
+    if (x_dev) cudaFree(x_dev);
+    if (oa_dev) cudaFree(oa_dev);
+    if (ob_dev) cudaFree(ob_dev);
+    free(w); free(x); free(out_a); free(out_b);
+    return ok;
+}
+
 extern "C" int pulsar_q8_0_matmul_selftest(void) {
     return q8_0_matmul_selftest_one(9) &&
            q8_0_matmul_selftest_one(19) &&
-           q8_0_matmul_selftest_one(40);
+           q8_0_matmul_selftest_one(40) &&
+           q8_0_banked_selftest_one(1) &&
+           q8_0_banked_selftest_one(5) &&
+           q8_0_banked_selftest_one(16);
 }
 
 /* ---- sigmoid router + top-k select ------------------------------------

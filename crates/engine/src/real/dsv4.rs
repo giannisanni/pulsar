@@ -973,23 +973,12 @@ impl Model {
         // ---- batched tail: un-rope, grouped out, hc_post
         kernels::dsv4_rope_tail(&mut st.heads, t, s.n_head, s.head_dim, s.rot_dim, pos0, &rope, true)?;
         let rank = 1024usize;
-        let group_dim = (q_dim / s.n_out_group) as usize;
-        let w_row_bytes = (group_dim / 32) * 34;
-        for i in 0..t as usize {
-            for g in 0..s.n_out_group as usize {
-                kernels::matmul_q8_0_off(
-                    &mut rt.low,
-                    (i * s.n_out_group as usize * rank + g * rank) * 4,
-                    &w.out_a,
-                    g * rank * w_row_bytes,
-                    &st.heads,
-                    (i * q_dim as usize + g * group_dim) * 4,
-                    group_dim as u32,
-                    rank as u32,
-                    1,
-                )?;
-            }
-        }
+        let group_dim = q_dim / s.n_out_group;
+        // heads is [t][n_out_group] contiguous group_dim slices and low is
+        // [t][n_out_group] contiguous rank rows, so all t*8 grouped
+        // projections collapse into one banked launch (bitwise identical
+        // to the per-(token,group) loop).
+        kernels::matmul_q8_0_banked(&mut rt.low, &w.out_a, &st.heads, group_dim, rank as u32, s.n_out_group, t)?;
         kernels::matmul_q8_0(&mut st.attn_out, &l.attn_output, &rt.low, (s.n_out_group as usize * rank) as u32, s.n_embd, t)?;
         self.dsv4_hc_post(rt, &st.attn_out, false, t)?;
 

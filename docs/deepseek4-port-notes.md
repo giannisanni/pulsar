@@ -206,6 +206,23 @@ still TODO). prefill has a batch path + compressor_finish_prefill_state.
 ## Remaining prefill wall: the per-(token,group) grouped-out launches
 ## (128/layer/chunk) and per-token attention - CUDA-graph territory.
 ##
+## PHASE 3 (2026-07-17): banked out-proj SHIPPED, and it settled the
+## wall question. pulsar_q8_0_matmul_banked collapses the t*8
+## per-(token,group) out-proj launches (plus their per-call prequants,
+## ~256 launches/layer/chunk) into ONE prequant + ONE kernel: heads is
+## [t][n_out_group] contiguous slices and low is [t][n_out_group]
+## contiguous rank rows, so pseudo-row j just reads weight bank
+## j % n_bank. Accumulation order matches the warp8 kernel -> BITWISE
+## identical (memcmp selftest at t=1/5/16 + needle ids byte-identical).
+## MEASURED: needle prefill 168.25s vs 169s = NEUTRAL. With vram cache
+## at 13% hits the chunk-layer budget is eaten by expert H2D streaming,
+## not launches - same lesson as phase-1 short-ctx decode. Verdict:
+## dsv4 prefill is STREAMING-BOUND; CUDA-graphing the per-token
+## attention/comp interleave would buy nothing here either. Launch-side
+## work on this arch only pays where streaming is absent (long-ctx
+## decode, resident models). Kernel kept: fewer launches, less code,
+## decode canonical 8.1 tok/s (unchanged).
+##
 ## PHASE 2 original design notes: chunked batched prefill. On-device state
 ## makes it feasible; layer flow = batched [hc_pre/norms/q-kv/rope/
 ## fp8] -> per-token sequential [ring append, comp steps, attention]
