@@ -35,6 +35,7 @@ fn softplus_stable(x: f32) -> f32 {
 /// f32 -> f16 bits, round-to-nearest-even (matches __float2half; the
 /// requant module's converter truncates, which is fine for scales but
 /// not for cache-value parity).
+#[allow(dead_code)] // host reference, exercised by the unit tests
 fn f32_to_f16_rte(x: f32) -> u16 {
     let bits = x.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
@@ -77,11 +78,13 @@ fn f32_to_f16_rte(x: f32) -> u16 {
     sign | ((e << 10) as u16) | m as u16
 }
 
+#[allow(dead_code)] // host reference, exercised by the unit tests
 fn f16_round(x: f32) -> f32 {
     super::requant::f16_to_f32(f32_to_f16_rte(x))
 }
 
 /// e4m3fn decode (mirrors e4m3_dec_common in the CUDA side).
+#[allow(dead_code)] // host reference, exercised by the unit tests
 fn e4m3_dec(b: u8) -> f32 {
     let e = (b >> 3) & 0xf;
     let m = (b & 7) as f32;
@@ -99,6 +102,7 @@ fn e4m3_dec(b: u8) -> f32 {
 
 /// Round-half-to-even for non-negative x (avoids the round_ties_even
 /// MSRV dependency; matches __float2int_rn on this domain).
+#[allow(dead_code)] // host reference, exercised by the unit tests
 fn round_half_even(x: f32) -> i32 {
     let f = x.floor();
     let diff = x - f;
@@ -117,6 +121,7 @@ fn round_half_even(x: f32) -> i32 {
 }
 
 /// e4m3fn encode, nearest-even (mirrors e4m3_enc in the CUDA side).
+#[allow(dead_code)] // host reference, exercised by the unit tests
 fn e4m3_enc(x: f32) -> u8 {
     let (s, x) = if x < 0.0 { (0x80u8, -x) } else { (0u8, x) };
     if !(x > 0.0) {
@@ -148,6 +153,7 @@ fn e4m3_enc(x: f32) -> u8 {
 
 /// ds4's fp8 sim: e4m3 round-trip on the first head_dim-n_rot dims,
 /// 64-wide blocks, power-of-2 scale, clamp +-448 (host lane).
+#[allow(dead_code)] // host reference, exercised by the unit tests
 fn fp8_sim_row(x: &mut [f32], n_rot: usize) {
     let n_nope = x.len() - n_rot;
     for blk in x[..n_nope].chunks_mut(64) {
@@ -315,6 +321,7 @@ pub(super) fn rope_cfg(s: &Shape, ratio: u32) -> kernels::RopeCfg {
 /// comb_k[n_hc*n_hc]). comb_k is already in the kernel's [dst*n_hc+src]
 /// layout: the reference's post step reads its row-softmax matrix
 /// TRANSPOSED (comb[dst + src*n_hc]), so the transpose happens here.
+#[allow(dead_code)] // host reference, exercised by the unit tests
 fn sinkhorn_split(mix: &[f32], scale: &[f32], base: &[f32], n_hc: usize, iters: u32, eps: f32) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let mut pre = vec![0f32; n_hc];
     let mut post = vec![0f32; n_hc];
@@ -429,6 +436,7 @@ fn route(logits: &[f32], bias: &[f32], tid2eid: Option<&Vec<i32>>, token: u32, k
 /* ---- streaming compressor (compressor_decode_one) ---------------------- */
 
 /// One compressor lane's rolling state.
+#[allow(dead_code)] // host reference, exercised by the unit tests
 pub(super) struct CompLane {
     st_kv: Vec<f32>,
     st_sc: Vec<f32>,
@@ -437,6 +445,7 @@ pub(super) struct CompLane {
     ratio: usize,
 }
 
+#[allow(dead_code)]
 impl CompLane {
     fn new(ratio: u32, head_dim: u32) -> CompLane {
         let coff = if ratio == 4 { 2 } else { 1 };
@@ -542,12 +551,45 @@ impl CompLane {
 }
 
 /// Per-layer host state.
+/// Device-resident compressor lane state (the host CompLane stays as
+/// the unit-test reference).
+struct DevLane {
+    st_kv: DeviceBuf, // [rows][width]
+    st_sc: DeviceBuf,
+    width: u32,
+    ratio: u32,
+}
+
+impl DevLane {
+    fn new(ratio: u32, head_dim: u32) -> Result<DevLane> {
+        let coff = if ratio == 4 { 2u32 } else { 1 };
+        let width = coff * head_dim;
+        let rows = coff * ratio;
+        let mut l = DevLane {
+            st_kv: DeviceBuf::alloc((rows * width) as usize * 4)?,
+            st_sc: DeviceBuf::alloc((rows * width) as usize * 4)?,
+            width,
+            ratio,
+        };
+        l.reset()?;
+        Ok(l)
+    }
+
+    fn reset(&mut self) -> Result {
+        let n = self.st_kv.bytes();
+        kernels::zero(&mut self.st_kv, n)?;
+        kernels::fill_row_tail(&mut self.st_sc, 1, (n / 4) as u32, 0, NEG_INF)?;
+        Ok(())
+    }
+}
+
 pub(super) struct LayerRt {
-    comp: Option<CompLane>,
+    comp: Option<DevLane>,
     pub n_comp: u32,
-    idx: Option<CompLane>,
-    /// host-side indexer compressed cache [n_idx_comp][n_idx_dim]
-    idx_cache: Vec<f32>,
+    idx: Option<DevLane>,
+    /// device indexer compressed cache [cap][n_idx_dim] (read back to
+    /// the host only when top-k selection fires, past 512 comp rows)
+    idx_cache: DeviceBuf,
     pub n_idx_comp: u32,
 }
 
@@ -563,6 +605,9 @@ pub(super) struct Dsv4Rt {
     comp_sc: DeviceBuf,
     idx_w: DeviceBuf,  // [n_idx_head] indexer proj
     allowed: DeviceBuf, // [comp cap] u8 visibility mask
+    /// device Sinkhorn coefficient buffers [6*n_hc] (attn / ffn halves)
+    coef_attn: DeviceBuf,
+    coef_ffn: DeviceBuf,
     layers: Vec<LayerRt>,
 }
 
@@ -581,10 +626,14 @@ impl Dsv4Rt {
         for il in 0..s.n_exec_layer as usize {
             let ratio = m.compress_ratios[il];
             layers.push(LayerRt {
-                comp: (ratio != 0).then(|| CompLane::new(ratio, s.head_dim)),
+                comp: if ratio != 0 { Some(DevLane::new(ratio, s.head_dim)?) } else { None },
                 n_comp: 0,
-                idx: (ratio == 4).then(|| CompLane::new(ratio, s.n_idx_dim)),
-                idx_cache: Vec::new(),
+                idx: if ratio == 4 { Some(DevLane::new(ratio, s.n_idx_dim)?) } else { None },
+                idx_cache: DeviceBuf::alloc(if ratio == 4 {
+                    max_ratio_cap * s.n_idx_dim as usize * 4
+                } else {
+                    4
+                })?,
                 n_idx_comp: 0,
             });
         }
@@ -598,22 +647,24 @@ impl Dsv4Rt {
             comp_sc: DeviceBuf::alloc(2 * s.head_dim as usize * 4)?,
             idx_w: DeviceBuf::alloc(s.n_idx_head.max(1) as usize * 4)?,
             allowed: DeviceBuf::alloc(max_ratio_cap)?,
+            coef_attn: DeviceBuf::alloc(6 * s.n_hc as usize * 4)?,
+            coef_ffn: DeviceBuf::alloc(6 * s.n_hc as usize * 4)?,
             layers,
         })
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self) -> Result {
         for l in &mut self.layers {
             if let Some(c) = &mut l.comp {
-                c.reset();
+                c.reset()?;
             }
             if let Some(c) = &mut l.idx {
-                c.reset();
+                c.reset()?;
             }
             l.n_comp = 0;
             l.n_idx_comp = 0;
-            l.idx_cache.clear();
         }
+        Ok(())
     }
 }
 
@@ -682,7 +733,7 @@ impl Model {
         for (i, &tok) in tokens.iter().enumerate() {
             let pos = pos0 + i as u32;
             if pos == 0 {
-                rt.reset();
+                rt.reset()?;
             }
             st.tok.write(0, kernels::as_bytes(&[tok as i32]))?;
             kernels::embed_q8_0(&mut st.cur, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, 1)?;
@@ -717,24 +768,27 @@ impl Model {
     }
 
     /// hc_pre: flat-norm the streams, project the control vector, run
-    /// Sinkhorn on the host, reduce the streams into st.cur.
-    /// Returns (post gates, kernel-layout combine matrix).
-    fn dsv4_hc_pre(&self, st: &mut State, rt: &mut Dsv4Rt, fn_w: &DeviceBuf, scale: &[f32], base: &[f32]) -> Result<(Vec<f32>, Vec<f32>)> {
+    /// the Sinkhorn split ON DEVICE into a coef buffer (was 2 host
+    /// readbacks per layer per token), reduce the streams into st.cur.
+    /// `ffn` picks which coef buffer holds this half's gates.
+    fn dsv4_hc_pre(&self, st: &mut State, rt: &mut Dsv4Rt, fn_w: &DeviceBuf, scale: &DeviceBuf, base: &DeviceBuf, ffn: bool) -> Result {
         let s = self.shape;
         let ones = self.ones_hc.as_ref().ok_or("ones_hc missing")?;
         kernels::rms_norm(&mut rt.hc_next, &rt.hc_cur, ones, s.n_hc * s.n_embd, 1, s.rms_eps)?;
         kernels::matmul_f32(&mut rt.mix, fn_w, &rt.hc_next, s.n_hc * s.n_embd, 6 * s.n_hc, 1)?;
-        let mix = rt.mix.read_f32(6 * s.n_hc as usize)?;
-        let (pre, post, comb_k) =
-            sinkhorn_split(&mix, scale, base, s.n_hc as usize, s.hc_sinkhorn, s.hc_eps);
-        kernels::dsv4_hc_mix(&mut st.cur, &rt.hc_cur, None, &pre, None, s.n_embd, s.n_hc, 1)?;
-        Ok((post, comb_k))
+        let coef = if ffn { &mut rt.coef_ffn } else { &mut rt.coef_attn };
+        kernels::dsv4_sinkhorn(coef, &rt.mix, scale, base, s.n_hc, s.hc_sinkhorn, s.hc_eps)?;
+        let coef = if ffn { &rt.coef_ffn } else { &rt.coef_attn };
+        kernels::dsv4_hc_mix_dev(&mut st.cur, &rt.hc_cur, None, coef, 0, -1, s.n_embd, s.n_hc, 1)?;
+        Ok(())
     }
 
-    /// hc_post: streams' = post*block_out + comb-mix of streams.
-    fn dsv4_hc_post(&self, rt: &mut Dsv4Rt, block_out: &DeviceBuf, post: &[f32], comb_k: &[f32]) -> Result {
+    /// hc_post: streams' = post*block_out + comb-mix of streams, gates
+    /// read from the half's device coef buffer.
+    fn dsv4_hc_post(&self, rt: &mut Dsv4Rt, block_out: &DeviceBuf, ffn: bool) -> Result {
         let s = self.shape;
-        kernels::dsv4_hc_mix(&mut rt.hc_next, &rt.hc_cur, Some(block_out), comb_k, Some(post), s.n_embd, s.n_hc, s.n_hc)?;
+        let coef = if ffn { &rt.coef_ffn } else { &rt.coef_attn };
+        kernels::dsv4_hc_mix_dev(&mut rt.hc_next, &rt.hc_cur, Some(block_out), coef, 2 * s.n_hc, s.n_hc as i32, s.n_embd, s.n_hc, s.n_hc)?;
         std::mem::swap(&mut rt.hc_cur, &mut rt.hc_next);
         Ok(())
     }
@@ -750,7 +804,7 @@ impl Model {
         let q_dim = s.n_head * s.head_dim;
 
         // ---- attention half
-        let (post, comb_k) = self.dsv4_hc_pre(st, rt, &w.hc_attn_fn, &w.hc_attn_scale, &w.hc_attn_base)?;
+        self.dsv4_hc_pre(st, rt, &w.hc_attn_fn, &w.hc_attn_scale, &w.hc_attn_base, false)?;
         kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, 1, eps)?;
         // q: lora bottleneck + per-head weightless rms norm
         kernels::matmul_q8_0(&mut st.q_rank, &w.q_a, &st.normed, s.n_embd, s.n_lora_q, 1)?;
@@ -775,40 +829,52 @@ impl Model {
         // ---- streaming compressor (+ indexer lane and selection)
         let lrt = &mut rt.layers[il];
         let mut use_mask = false;
+        // boundary flags are deterministic in pos - no readbacks needed
+        let emit = w.ratio != 0 && (pos + 1) % w.ratio == 0;
         if let Some(comp) = &w.comp {
             kernels::matmul_q8_0(&mut rt.comp_kv, &comp.kv_w, &st.normed, s.n_embd, comp.width, 1)?;
             kernels::matmul_q8_0(&mut rt.comp_sc, &comp.gate_w, &st.normed, s.n_embd, comp.width, 1)?;
-            let kv_cur = rt.comp_kv.read_f32(comp.width as usize)?;
-            let sc_cur = rt.comp_sc.read_f32(comp.width as usize)?;
             let lane = lrt.comp.as_mut().ok_or("compressor state missing")?;
-            if let Some(row) = lane.step(&kv_cur, &sc_cur, &comp.ape, &comp.norm, pos, eps, &rope, s.rot_dim as usize) {
-                st.vcache[il].write(
-                    lrt.n_comp as usize * s.head_dim as usize * 4,
-                    kernels::as_bytes(&row),
-                )?;
+            kernels::dsv4_comp_step(
+                &mut lane.st_kv, &mut lane.st_sc,
+                &mut st.vcache[il], lrt.n_comp as usize * s.head_dim as usize * 4,
+                &rt.comp_kv, &rt.comp_sc, &comp.ape, &comp.norm,
+                comp.width, s.head_dim, lane.ratio, pos, emit, false, eps, &rope,
+            )?;
+            if emit {
                 lrt.n_comp += 1;
             }
         }
         if let Some(idx) = &w.idx {
             kernels::matmul_q8_0(&mut rt.comp_kv, &idx.comp.kv_w, &st.normed, s.n_embd, idx.comp.width, 1)?;
             kernels::matmul_q8_0(&mut rt.comp_sc, &idx.comp.gate_w, &st.normed, s.n_embd, idx.comp.width, 1)?;
-            let kv_cur = rt.comp_kv.read_f32(idx.comp.width as usize)?;
-            let sc_cur = rt.comp_sc.read_f32(idx.comp.width as usize)?;
             let lane = lrt.idx.as_mut().ok_or("indexer state missing")?;
-            if let Some(row) = lane.step(&kv_cur, &sc_cur, &idx.comp.ape, &idx.comp.norm, pos, eps, &rope, s.rot_dim as usize) {
-                lrt.idx_cache.extend_from_slice(&row);
+            let (cache, n_idx) = (&mut lrt.idx_cache, lrt.n_idx_comp);
+            kernels::dsv4_comp_step(
+                &mut lane.st_kv, &mut lane.st_sc,
+                cache, n_idx as usize * s.n_idx_dim as usize * 4,
+                &rt.comp_kv, &rt.comp_sc, &idx.comp.ape, &idx.comp.norm,
+                idx.comp.width, s.n_idx_dim, lane.ratio, pos, emit, true, eps, &rope,
+            )?;
+            if emit {
                 lrt.n_idx_comp += 1;
             }
             if lrt.n_idx_comp > s.n_idx_topk {
-                // indexer query (device matvec, host rope + QAT + scoring)
+                // top-k selection (fires past 512 comp rows = ctx > 2k):
+                // the ONE remaining host round-trip on ratio-4 layers -
+                // it reads the device indexer cache back per selection
                 kernels::matmul_q8_0(&mut rt.low, &idx.q_b, &st.q_rank_norm, s.n_lora_q, s.n_idx_head * s.n_idx_dim, 1)?;
                 kernels::matmul_f32(&mut rt.idx_w, &idx.proj, &st.normed, s.n_embd, s.n_idx_head, 1)?;
+                kernels::sync()?;
                 let mut q = rt.low.read_f32((s.n_idx_head * s.n_idx_dim) as usize)?;
                 let weights = rt.idx_w.read_f32(s.n_idx_head as usize)?;
+                let idx_cache_host = lrt
+                    .idx_cache
+                    .read_f32(lrt.n_idx_comp as usize * s.n_idx_dim as usize)?;
                 if let Some(mask) = indexer_allowed(
                     &mut q,
                     &weights,
-                    &lrt.idx_cache,
+                    &idx_cache_host,
                     lrt.n_idx_comp as usize,
                     s.n_idx_head as usize,
                     s.n_idx_dim as usize,
@@ -857,10 +923,10 @@ impl Model {
             )?;
         }
         kernels::matmul_q8_0(&mut st.attn_out, &l.attn_output, &rt.low, (s.n_out_group as usize * rank) as u32, s.n_embd, 1)?;
-        self.dsv4_hc_post(rt, &st.attn_out, &post, &comb_k)?;
+        self.dsv4_hc_post(rt, &st.attn_out, false)?;
 
         // ---- ffn half (shared expert + routed MoE, host router)
-        let (post, comb_k) = self.dsv4_hc_pre(st, rt, &w.hc_ffn_fn, &w.hc_ffn_scale, &w.hc_ffn_base)?;
+        self.dsv4_hc_pre(st, rt, &w.hc_ffn_fn, &w.hc_ffn_scale, &w.hc_ffn_base, true)?;
         kernels::rms_norm(&mut st.normed, &st.cur, &l.ffn_norm, s.n_embd, 1, eps)?;
         let Ffn::Moe { gate_inp, shexp, gate_exps, up_exps, down_exps, .. } = &l.ffn else {
             return Err("dsv4 layer without MoE ffn".into());
@@ -889,7 +955,7 @@ impl Model {
         kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, 1)?;
         self.dsv4_moe(st, &selected, gate_exps, up_exps, down_exps, 3, 1)?;
         kernels::add(&mut st.ffn_out, &st.moe_out, &st.shared_out, s.n_embd)?;
-        self.dsv4_hc_post(rt, &st.ffn_out, &post, &comb_k)?;
+        self.dsv4_hc_post(rt, &st.ffn_out, true)?;
         Ok(())
     }
 

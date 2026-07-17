@@ -170,6 +170,128 @@ extern "C" int pulsar_dsv4_attention(
     return cuda_ok(cudaGetLastError(), "dsv4 attention launch");
 }
 
+/* Device-side Sinkhorn hyper-connection gate split (was ~2 host
+ * readbacks + host math per layer per token = the dominant dsv4
+ * decode sync tax). Input mix[6*n_hc] straight from the control
+ * matmul; output coef[6*n_hc] = pre[n_hc] | post[n_hc] |
+ * comb_k[n_hc*n_hc] in the hc_mix kernel's [dst*n_hc+src] layout.
+ * Serial math on ONE thread: n_hc = 4, 20 iterations - nothing to
+ * parallelize, correctness over elegance. */
+__global__ static void dsv4_sinkhorn_kernel(
+        float *coef,
+        const float *mix,
+        const float *scale, /* [3] */
+        const float *base,  /* [6*n_hc] */
+        uint32_t n_hc,
+        uint32_t iters,
+        float eps) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    for (uint32_t i = 0; i < n_hc; i++) {
+        coef[i] = 1.0f / (1.0f + expf(-(mix[i] * scale[0] + base[i]))) + eps;
+        const uint32_t o = n_hc + i;
+        coef[o] = 2.0f / (1.0f + expf(-(mix[o] * scale[1] + base[o])));
+    }
+    float c[16];
+    for (uint32_t dst = 0; dst < n_hc; dst++) {
+        float row_max = -INFINITY;
+        for (uint32_t src = 0; src < n_hc; src++) {
+            const uint32_t idx = src + dst * n_hc;
+            const uint32_t o = 2 * n_hc + idx;
+            c[idx] = mix[o] * scale[2] + base[o];
+            row_max = fmaxf(row_max, c[idx]);
+        }
+        float row_sum = 0.0f;
+        for (uint32_t src = 0; src < n_hc; src++) {
+            const uint32_t idx = src + dst * n_hc;
+            c[idx] = expf(c[idx] - row_max);
+            row_sum += c[idx];
+        }
+        const float inv = 1.0f / row_sum;
+        for (uint32_t src = 0; src < n_hc; src++) {
+            c[src + dst * n_hc] = c[src + dst * n_hc] * inv + eps;
+        }
+    }
+    /* column pass, then (iters-1) row+column rounds (reference order) */
+    for (uint32_t src = 0; src < n_hc; src++) {
+        float sum = 0.0f;
+        for (uint32_t dst = 0; dst < n_hc; dst++) sum += c[src + dst * n_hc];
+        const float inv = 1.0f / (sum + eps);
+        for (uint32_t dst = 0; dst < n_hc; dst++) c[src + dst * n_hc] *= inv;
+    }
+    for (uint32_t it = 1; it < iters; it++) {
+        for (uint32_t dst = 0; dst < n_hc; dst++) {
+            float sum = 0.0f;
+            for (uint32_t src = 0; src < n_hc; src++) sum += c[src + dst * n_hc];
+            const float inv = 1.0f / (sum + eps);
+            for (uint32_t src = 0; src < n_hc; src++) c[src + dst * n_hc] *= inv;
+        }
+        for (uint32_t src = 0; src < n_hc; src++) {
+            float sum = 0.0f;
+            for (uint32_t dst = 0; dst < n_hc; dst++) sum += c[src + dst * n_hc];
+            const float inv = 1.0f / (sum + eps);
+            for (uint32_t dst = 0; dst < n_hc; dst++) c[src + dst * n_hc] *= inv;
+        }
+    }
+    /* transpose into the mix kernel's [dst*n_hc + src] coefficient */
+    for (uint32_t dst = 0; dst < n_hc; dst++) {
+        for (uint32_t src = 0; src < n_hc; src++) {
+            coef[2 * n_hc + dst * n_hc + src] = c[dst + src * n_hc];
+        }
+    }
+}
+
+extern "C" int pulsar_dsv4_sinkhorn(
+        void *coef_dev, const void *mix_dev, const void *scale_dev,
+        const void *base_dev, uint32_t n_hc, uint32_t iters, float eps) {
+    if (!coef_dev || !mix_dev || !scale_dev || !base_dev || n_hc == 0 ||
+        n_hc > 4u || iters == 0) {
+        return 0;
+    }
+    dsv4_sinkhorn_kernel<<<1, 32>>>(
+            (float *)coef_dev, (const float *)mix_dev, (const float *)scale_dev,
+            (const float *)base_dev, n_hc, iters, eps);
+    return cuda_ok(cudaGetLastError(), "dsv4 sinkhorn launch");
+}
+
+/* hc_mix variant reading its coefficients from DEVICE memory (the
+ * sinkhorn output), so pre/post never round-trip the host. */
+__global__ static void dsv4_hc_mix_dev_kernel(
+        float *out,
+        const float *streams,
+        const float *block, /* NULL = no block term */
+        const float *coef,
+        uint32_t st_off,  /* coef offset of the [n_out*n_hc] stream matrix */
+        int blk_off,      /* coef offset of the [n_out] block gains; -1 = zeros */
+        uint32_t n_embd,
+        uint32_t n_hc,
+        uint32_t n_out) {
+    uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= n_embd) return;
+    float b = block ? block[d] : 0.0f;
+    for (uint32_t j = 0; j < n_out; j++) {
+        float acc = blk_off >= 0 ? coef[(uint32_t)blk_off + j] * b : 0.0f;
+        for (uint32_t src = 0; src < n_hc; src++) {
+            acc += coef[st_off + j * n_hc + src] * streams[(uint64_t)src * n_embd + d];
+        }
+        out[(uint64_t)j * n_embd + d] = acc;
+    }
+}
+
+extern "C" int pulsar_dsv4_hc_mix_dev(
+        void *out_dev, const void *streams_dev, const void *block_dev,
+        const void *coef_dev, uint32_t st_off, int blk_off,
+        uint32_t n_embd, uint32_t n_hc, uint32_t n_out) {
+    if (!out_dev || !streams_dev || !coef_dev || n_embd == 0 || n_hc == 0 ||
+        n_hc > 4u || n_out == 0 || n_out > 4u) {
+        return 0;
+    }
+    dsv4_hc_mix_dev_kernel<<<(n_embd + 255u) / 256u, 256>>>(
+            (float *)out_dev, (const float *)streams_dev,
+            (const float *)block_dev, (const float *)coef_dev,
+            st_off, blk_off, n_embd, n_hc, n_out);
+    return cuda_ok(cudaGetLastError(), "dsv4 hc mix dev launch");
+}
+
 /* ds4's dsv4_fp8_kv_quantize_row_inplace_cpu: the first head_dim-n_rot
  * dims of each row pass an e4m3fn round-trip in 64-wide blocks with a
  * power-of-2 scale from ceil(log2(amax/448)), clamped +-448. One warp
@@ -212,6 +334,223 @@ extern "C" int pulsar_dsv4_fp8_sim(
     uint32_t blocks = n_rows * (n_nope / 64u);
     dsv4_fp8_sim_kernel<<<blocks, 32>>>((float *)x_dev, n_rows, head_dim, n_nope);
     return cuda_ok(cudaGetLastError(), "dsv4 fp8 sim launch");
+}
+
+/* ---- device QAT helpers (indexer lane) ---- */
+
+__device__ static void dsv4_hadamard128_dev(float *x) {
+    for (uint32_t stride = 1; stride < 128; stride <<= 1) {
+        for (uint32_t base = 0; base < 128; base += 2u * stride) {
+            for (uint32_t i = 0; i < stride; i++) {
+                const float a = x[base + i];
+                const float b = x[base + stride + i];
+                x[base + i] = a + b;
+                x[base + stride + i] = a - b;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < 128; i++) x[i] *= 0.08838834764831845f;
+}
+
+__device__ static float dsv4_e2m1_roundtrip_dev(float x) {
+    const float vals[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    const float ax = fminf(fabsf(x), 6.0f);
+    int best = 0;
+    float best_diff = fabsf(ax - vals[0]);
+    for (int i = 1; i < 8; i++) {
+        const float diff = fabsf(ax - vals[i]);
+        if (diff < best_diff || (diff == best_diff && (i & 1) == 0 && (best & 1) != 0)) {
+            best = i;
+            best_diff = diff;
+        }
+    }
+    return sign * vals[best];
+}
+
+__device__ static void dsv4_qat_row_dev(float *x) {
+    dsv4_hadamard128_dev(x);
+    for (uint32_t off = 0; off < 128; off += 32u) {
+        float amax = 0.0f;
+        for (uint32_t i = 0; i < 32u; i++) amax = fmaxf(amax, fabsf(x[off + i]));
+        if (amax < 7.052966104933725e-38f) amax = 7.052966104933725e-38f;
+        const float scale = exp2f(ceilf(log2f(amax / 6.0f)));
+        for (uint32_t i = 0; i < 32u; i++) {
+            float v = fminf(fmaxf(x[off + i] / scale, -6.0f), 6.0f);
+            x[off + i] = dsv4_e2m1_roundtrip_dev(v) * scale;
+        }
+    }
+}
+
+/* Streaming compressor step, fully on-device (was per-token host math
+ * with two device syncs per lane): write the state row (+additive PE),
+ * and on a ratio boundary pool -> rms*norm -> rope at the compressed
+ * position -> fp8 sim (512-wide attn lane) or hadamard+e2m1 QAT
+ * (128-wide indexer lane) -> f16 round -> emit into the cache row,
+ * then the ratio-4 double-shift. ONE thread block; the serial tail
+ * (rope/QAT) runs on thread 0 - the arrays are <= 1024 wide and this
+ * replaces host math plus a sync, not a fast kernel. */
+__global__ static void dsv4_comp_step_kernel(
+        float *state_kv,     /* [rows][width] */
+        float *state_sc,
+        float *cache_row,    /* emit target: one [head_dim] row (or NULL) */
+        const float *kv_cur, /* [width] */
+        const float *sc_cur,
+        const float *ape,    /* [ratio-mod slots][width] */
+        const float *norm,   /* [head_dim] */
+        uint32_t width,
+        uint32_t head_dim,
+        uint32_t ratio,
+        uint32_t pos,
+        uint32_t emit,       /* boundary flag (host-deterministic) */
+        uint32_t is_idx,     /* QAT lane instead of fp8 */
+        float rms_eps,
+        /* rope (adjacent-pair yarn, last n_rot dims) */
+        uint32_t n_rot,
+        uint32_t n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t pos_mod = pos % ratio;
+    const uint32_t row = ratio == 4u ? ratio + pos_mod : pos_mod;
+    for (uint32_t j = tid; j < width; j += blockDim.x) {
+        state_kv[(uint64_t)row * width + j] = kv_cur[j];
+        state_sc[(uint64_t)row * width + j] = sc_cur[j] + ape[(uint64_t)pos_mod * width + j];
+    }
+    if (!emit) return;
+    __syncthreads();
+
+    /* pool per output dim (<= head_dim threads active) */
+    __shared__ float pooled[512];
+    __shared__ float red[256];
+    for (uint32_t j = tid; j < head_dim; j += blockDim.x) {
+        float max_score = -1.0e30f;
+        if (ratio == 4u) {
+            for (uint32_t r = 0; r < ratio; r++) {
+                max_score = fmaxf(max_score, state_sc[(uint64_t)r * width + j]);
+                max_score = fmaxf(max_score, state_sc[(uint64_t)(ratio + r) * width + head_dim + j]);
+            }
+        } else {
+            for (uint32_t r = 0; r < ratio; r++) {
+                max_score = fmaxf(max_score, state_sc[(uint64_t)r * width + j]);
+            }
+        }
+        float v = 0.0f;
+        if (max_score > -0.5e30f) {
+            float denom = 0.0f, sum = 0.0f;
+            if (ratio == 4u) {
+                for (uint32_t r = 0; r < ratio; r++) {
+                    const float wp = expf(state_sc[(uint64_t)r * width + j] - max_score);
+                    const float wc = expf(state_sc[(uint64_t)(ratio + r) * width + head_dim + j] - max_score);
+                    denom += wp + wc;
+                    sum += wp * state_kv[(uint64_t)r * width + j];
+                    sum += wc * state_kv[(uint64_t)(ratio + r) * width + head_dim + j];
+                }
+            } else {
+                for (uint32_t r = 0; r < ratio; r++) {
+                    const float ws = expf(state_sc[(uint64_t)r * width + j] - max_score);
+                    denom += ws;
+                    sum += ws * state_kv[(uint64_t)r * width + j];
+                }
+            }
+            v = denom > 0.0f ? sum / denom : 0.0f;
+        }
+        pooled[j] = v;
+    }
+    __syncthreads();
+
+    /* rms over head_dim (block reduce) */
+    float ss = 0.0f;
+    for (uint32_t j = tid; j < head_dim; j += blockDim.x) {
+        ss += pooled[j] * pooled[j];
+    }
+    red[tid] = ss;
+    __syncthreads();
+    for (uint32_t st = blockDim.x >> 1; st > 0; st >>= 1) {
+        if (tid < st) red[tid] += red[tid + st];
+        __syncthreads();
+    }
+    const float rms = rsqrtf(red[0] / (float)head_dim + rms_eps);
+    for (uint32_t j = tid; j < head_dim; j += blockDim.x) {
+        pooled[j] = pooled[j] * rms * norm[j];
+    }
+    __syncthreads();
+
+    /* serial tail on thread 0: rope + quant sim + f16 round + emit */
+    if (tid == 0) {
+        const uint32_t comp_pos = pos + 1u - ratio;
+        const uint32_t n_nope = head_dim - n_rot;
+        float c0 = 0.0f, c1 = 0.0f;
+        if (ext_factor != 0.0f) {
+            mla_rope_corr_dims(n_rot, n_ctx_orig, freq_base, 32.0f, 1.0f, &c0, &c1);
+        }
+        float theta_extrap = (float)comp_pos;
+        const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
+        for (uint32_t i = 0; i < n_rot; i += 2u) {
+            float cs, sn;
+            mla_rope_yarn(theta_extrap, freq_scale, c0, c1, (int)i,
+                          ext_factor, attn_factor, &cs, &sn);
+            float *t = pooled + n_nope;
+            const float x0 = t[i], x1 = t[i + 1u];
+            t[i] = x0 * cs - x1 * sn;
+            t[i + 1u] = x0 * sn + x1 * cs;
+            theta_extrap *= theta_scale;
+        }
+        if (is_idx) {
+            dsv4_qat_row_dev(pooled);
+        } else {
+            for (uint32_t off = 0; off < n_nope; off += 64u) {
+                float amax = 0.0f;
+                for (uint32_t i = 0; i < 64u; i++) amax = fmaxf(amax, fabsf(pooled[off + i]));
+                if (amax < 1.0e-4f) amax = 1.0e-4f;
+                const float scale = exp2f(ceilf(log2f(amax / 448.0f)));
+                for (uint32_t i = 0; i < 64u; i++) {
+                    float v = fminf(fmaxf(pooled[off + i] / scale, -448.0f), 448.0f);
+                    pooled[off + i] = e4m3_dec_common(e4m3_enc(v)) * scale;
+                }
+            }
+        }
+        for (uint32_t j = 0; j < head_dim; j++) {
+            cache_row[j] = __half2float(__float2half(pooled[j]));
+        }
+    }
+    __syncthreads();
+
+    /* ratio-4 double shift (reference's two memcpys collapse to one
+     * copy: rows 0..r get the current window, rows r..2r mirror them) */
+    if (ratio == 4u) {
+        for (uint32_t r = 0; r < ratio; r++) {
+            for (uint32_t j = tid; j < width; j += blockDim.x) {
+                const float kv = state_kv[(uint64_t)(ratio + r) * width + j];
+                const float sc = state_sc[(uint64_t)(ratio + r) * width + j];
+                state_kv[(uint64_t)r * width + j] = kv;
+                state_sc[(uint64_t)r * width + j] = sc;
+            }
+        }
+    }
+}
+
+extern "C" int pulsar_dsv4_comp_step(
+        void *state_kv_dev, void *state_sc_dev, void *cache_row_dev,
+        const void *kv_cur_dev, const void *sc_cur_dev, const void *ape_dev,
+        const void *norm_dev, uint32_t width, uint32_t head_dim,
+        uint32_t ratio, uint32_t pos, uint32_t emit, uint32_t is_idx,
+        float rms_eps, uint32_t n_rot, uint32_t n_ctx_orig, float freq_base,
+        float freq_scale, float ext_factor, float attn_factor) {
+    if (!state_kv_dev || !state_sc_dev || !kv_cur_dev || !sc_cur_dev ||
+        !ape_dev || !norm_dev || width == 0 || head_dim == 0 ||
+        head_dim > 512u || ratio == 0 || (emit && !cache_row_dev)) {
+        return 0;
+    }
+    dsv4_comp_step_kernel<<<1, 256>>>(
+            (float *)state_kv_dev, (float *)state_sc_dev, (float *)cache_row_dev,
+            (const float *)kv_cur_dev, (const float *)sc_cur_dev,
+            (const float *)ape_dev, (const float *)norm_dev,
+            width, head_dim, ratio, pos, emit, is_idx, rms_eps,
+            n_rot, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor);
+    return cuda_ok(cudaGetLastError(), "dsv4 comp step launch");
 }
 
 /* Round f32 values through f16 storage (ds4 caches rows as f16). */
@@ -428,6 +767,72 @@ extern "C" int pulsar_dsv4_selftest(void) {
         }
         cudaFree(dx);
         free(x); free(ref); free(got);
+    }
+
+    /* sinkhorn kernel vs a serial C reference */
+    {
+        const uint32_t NHC = 4, ITERS = 20;
+        const float eps = 1.0e-6f;
+        float mix[24], scale[3], base[24];
+        for (int i = 0; i < 24; i++) { mix[i] = gqa_test_randf(); base[i] = gqa_test_randf() * 0.5f; }
+        for (int i = 0; i < 3; i++) scale[i] = 0.5f + fabsf(gqa_test_randf());
+        /* reference */
+        float ref[24];
+        for (uint32_t i = 0; i < NHC; i++) {
+            ref[i] = 1.0f / (1.0f + expf(-(mix[i] * scale[0] + base[i]))) + eps;
+            ref[NHC + i] = 2.0f / (1.0f + expf(-(mix[NHC + i] * scale[1] + base[NHC + i])));
+        }
+        float c[16];
+        for (uint32_t dst = 0; dst < NHC; dst++) {
+            float mx = -1.0e30f;
+            for (uint32_t s2 = 0; s2 < NHC; s2++) {
+                c[s2 + dst * NHC] = mix[2 * NHC + s2 + dst * NHC] * scale[2] + base[2 * NHC + s2 + dst * NHC];
+                mx = fmaxf(mx, c[s2 + dst * NHC]);
+            }
+            float sum = 0.0f;
+            for (uint32_t s2 = 0; s2 < NHC; s2++) { c[s2 + dst * NHC] = expf(c[s2 + dst * NHC] - mx); sum += c[s2 + dst * NHC]; }
+            for (uint32_t s2 = 0; s2 < NHC; s2++) c[s2 + dst * NHC] = c[s2 + dst * NHC] / sum + eps;
+        }
+        for (uint32_t s2 = 0; s2 < NHC; s2++) {
+            float sum = 0.0f;
+            for (uint32_t dst = 0; dst < NHC; dst++) sum += c[s2 + dst * NHC];
+            for (uint32_t dst = 0; dst < NHC; dst++) c[s2 + dst * NHC] /= (sum + eps);
+        }
+        for (uint32_t it = 1; it < ITERS; it++) {
+            for (uint32_t dst = 0; dst < NHC; dst++) {
+                float sum = 0.0f;
+                for (uint32_t s2 = 0; s2 < NHC; s2++) sum += c[s2 + dst * NHC];
+                for (uint32_t s2 = 0; s2 < NHC; s2++) c[s2 + dst * NHC] /= (sum + eps);
+            }
+            for (uint32_t s2 = 0; s2 < NHC; s2++) {
+                float sum = 0.0f;
+                for (uint32_t dst = 0; dst < NHC; dst++) sum += c[s2 + dst * NHC];
+                for (uint32_t dst = 0; dst < NHC; dst++) c[s2 + dst * NHC] /= (sum + eps);
+            }
+        }
+        for (uint32_t dst = 0; dst < NHC; dst++) {
+            for (uint32_t s2 = 0; s2 < NHC; s2++) {
+                ref[2 * NHC + dst * NHC + s2] = c[dst + s2 * NHC];
+            }
+        }
+        void *dmix, *dscale, *dbase, *dcoef;
+        cudaMalloc(&dmix, 24 * 4);
+        cudaMalloc(&dscale, 3 * 4);
+        cudaMalloc(&dbase, 24 * 4);
+        cudaMalloc(&dcoef, 24 * 4);
+        cudaMemcpy(dmix, mix, 24 * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dscale, scale, 3 * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dbase, base, 24 * 4, cudaMemcpyHostToDevice);
+        ok &= pulsar_dsv4_sinkhorn(dcoef, dmix, dscale, dbase, NHC, ITERS, eps);
+        float got[24];
+        cudaMemcpy(got, dcoef, 24 * 4, cudaMemcpyDeviceToHost);
+        for (int i = 0; i < 24 && ok; i++) {
+            if (fabsf(got[i] - ref[i]) > 1.0e-5f) {
+                fprintf(stderr, "dsv4 selftest: sinkhorn mismatch at %d: %g vs %g\n", i, got[i], ref[i]);
+                ok = 0;
+            }
+        }
+        cudaFree(dmix); cudaFree(dscale); cudaFree(dbase); cudaFree(dcoef);
     }
 
     if (cudaDeviceSynchronize() != cudaSuccess) ok = 0;

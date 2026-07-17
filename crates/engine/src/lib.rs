@@ -588,10 +588,10 @@ mod real {
         sinks: DeviceBuf, // f32 [n_head] per-head sink logits
         hc_attn_fn: DeviceBuf, // f32 [n_hc*n_embd -> 6*n_hc] (f16 converted)
         hc_ffn_fn: DeviceBuf,
-        hc_attn_scale: Vec<f32>, // [3]
-        hc_attn_base: Vec<f32>,  // [6*n_hc]
-        hc_ffn_scale: Vec<f32>,
-        hc_ffn_base: Vec<f32>,
+        hc_attn_scale: DeviceBuf, // f32 [3]
+        hc_attn_base: DeviceBuf,  // f32 [6*n_hc]
+        hc_ffn_scale: DeviceBuf,
+        hc_ffn_base: DeviceBuf,
         /// host router bias (selection only, like the noaux V3 router)
         probs_b: Vec<f32>,
         /// hash-routing table [n_vocab][n_expert_used] (first
@@ -606,9 +606,9 @@ mod real {
     struct Dsv4CompW {
         kv_w: DeviceBuf,   // q8_0 [n_embd -> width] (f16 requantized)
         gate_w: DeviceBuf, // q8_0 [n_embd -> width]
-        /// additive PE, host [ratio-ish][width]: ape[pos_mod*width + j]
-        ape: Vec<f32>,
-        norm: Vec<f32>, // host RMS weight [head_dim]
+        /// additive PE, f32 [ratio-mod slots][width]
+        ape: DeviceBuf,
+        norm: DeviceBuf, // f32 RMS weight [head_dim]
         width: u32,
     }
 
@@ -1940,8 +1940,8 @@ mod real {
                             Ok(Dsv4CompW {
                                 kv_w: upload_f16_q8(&kv_name, budget)?,
                                 gate_w: upload_f16_q8(&t(&format!("{prefix}_gate.weight")), budget)?,
-                                ape: read_f16_as_f32(&file, &gguf, &t(&format!("{prefix}_ape.weight")))?,
-                                norm: read_tensor_f32(&file, &gguf, &t(&format!("{prefix}_norm.weight")))?,
+                                ape: DeviceBuf::from_f32(&read_f16_as_f32(&file, &gguf, &t(&format!("{prefix}_ape.weight")))?)?,
+                                norm: DeviceBuf::from_f32(&read_tensor_f32(&file, &gguf, &t(&format!("{prefix}_norm.weight")))?)?,
                                 width,
                             })
                         };
@@ -1966,10 +1966,10 @@ mod real {
                             sinks: upload(&file, &gguf, &t("attn_sinks.weight"))?,
                             hc_attn_fn: upload_f16_as_f32(&file, &gguf, &t("hc_attn_fn.weight"))?,
                             hc_ffn_fn: upload_f16_as_f32(&file, &gguf, &t("hc_ffn_fn.weight"))?,
-                            hc_attn_scale: read_tensor_f32(&file, &gguf, &t("hc_attn_scale.weight"))?,
-                            hc_attn_base: read_tensor_f32(&file, &gguf, &t("hc_attn_base.weight"))?,
-                            hc_ffn_scale: read_tensor_f32(&file, &gguf, &t("hc_ffn_scale.weight"))?,
-                            hc_ffn_base: read_tensor_f32(&file, &gguf, &t("hc_ffn_base.weight"))?,
+                            hc_attn_scale: DeviceBuf::from_f32(&read_tensor_f32(&file, &gguf, &t("hc_attn_scale.weight"))?)?,
+                            hc_attn_base: DeviceBuf::from_f32(&read_tensor_f32(&file, &gguf, &t("hc_attn_base.weight"))?)?,
+                            hc_ffn_scale: DeviceBuf::from_f32(&read_tensor_f32(&file, &gguf, &t("hc_ffn_scale.weight"))?)?,
+                            hc_ffn_base: DeviceBuf::from_f32(&read_tensor_f32(&file, &gguf, &t("hc_ffn_base.weight"))?)?,
                             // absent on hash layers (selection is tid2eid
                             // there); zeros keep the top-k path harmless
                             probs_b: if gguf.tensor(&t("exp_probs_b.bias")).is_some() {
