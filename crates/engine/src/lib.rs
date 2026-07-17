@@ -3914,13 +3914,19 @@ mod real {
                                 let [g3, u3, d3] = slabs_of(e as u32);
                                 let (go, uo, dno) =
                                     (off_of(g3.0, g3.1), off_of(u3.0, u3.1), off_of(d3.0, d3.1));
+                                // host-cached => CPU lane, even when a slab
+                                // also sits in dev_cache: exclusion made
+                                // ownership a first-touch race (dev_cache
+                                // captures a hot expert early => it never
+                                // enters the lane), which is bistable run
+                                // to run (GLM oscillated 1.6-2.8 tok/s).
+                                // Untouched dev_cache copies go cold and
+                                // evict, so VRAM ends up covering the disk
+                                // tail instead of double-caching RAM hits.
                                 if self
                                     .mtp
                                     .as_ref()
                                     .is_some_and(|mt| mt.res_map.contains_key(&go))
-                                    || st.dev_cache.map.contains_key(&go)
-                                    || st.dev_cache.map.contains_key(&uo)
-                                    || st.dev_cache.map.contains_key(&dno)
                                 {
                                     continue;
                                 }
