@@ -198,6 +198,211 @@ extern "C" int pulsar_qwen35_sigmoid_gate(
     return cuda_ok(cudaGetLastError(), "qwen35 sigmoid gate launch");
 }
 
+
+/* Batched variants for chain verify / chunked prefill: n_tok tokens
+ * processed SEQUENTIALLY inside one launch (the recurrences are
+ * per-token, but looping on-device removes 2*n_tok launch round-trips
+ * per layer and keeps the working set in registers). */
+
+/* conv+silu over n_tok tokens: thread owns a channel, window rides in
+ * registers (k <= 8). x/out are [n_tok][n_chan]; state as in the
+ * single-step kernel and left at the post-batch value. */
+__global__ static void qwen35_conv_batch_kernel(
+        float *out, const float *x, const float *kern, float *state,
+        uint32_t n_chan, uint32_t k, uint32_t n_tok) {
+    uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n_chan) return;
+    const float *kc = kern + (uint64_t)c * k;
+    float win[8];
+    for (uint32_t t = 0; t + 1 < k; t++) {
+        win[t] = state[(uint64_t)t * n_chan + c];
+    }
+    for (uint32_t tok = 0; tok < n_tok; tok++) {
+        const float cur = x[(uint64_t)tok * n_chan + c];
+        float acc = kc[k - 1] * cur;
+        for (uint32_t t = 0; t + 1 < k; t++) acc += kc[t] * win[t];
+        out[(uint64_t)tok * n_chan + c] = acc / (1.0f + expf(-acc));
+        for (uint32_t t = 0; t + 2 < k; t++) win[t] = win[t + 1];
+        win[k - 2] = cur;
+    }
+    for (uint32_t t = 0; t + 1 < k; t++) {
+        state[(uint64_t)t * n_chan + c] = win[t];
+    }
+}
+
+extern "C" int pulsar_qwen35_conv_batch(
+        void *out_dev, const void *x_dev, const void *kern_dev,
+        void *state_dev, uint32_t n_chan, uint32_t k, uint32_t n_tok) {
+    if (!out_dev || !x_dev || !kern_dev || !state_dev || n_chan == 0 ||
+        k < 2 || k > 8 || n_tok == 0) {
+        return 0;
+    }
+    qwen35_conv_batch_kernel<<<(n_chan + 255u) / 256u, 256>>>(
+            (float *)out_dev, (const float *)x_dev, (const float *)kern_dev,
+            (float *)state_dev, n_chan, k, n_tok);
+    return cuda_ok(cudaGetLastError(), "qwen35 conv batch launch");
+}
+
+/* GDN delta rule over n_tok tokens: thread j holds its state COLUMN
+ * S[:,j] in registers (dim <= 128 for the register budget) across the
+ * whole batch; k/q broadcast through shared memory per step. Layouts:
+ * q/k [n_tok][H_k][dim], v [n_tok][H_v][dim], g/beta [n_tok][H_v],
+ * out [n_tok][H_v][dim]. State read once, written once. */
+__global__ static void qwen35_gdn_batch_kernel(
+        float *out, float *state,
+        const float *q, const float *k, const float *v,
+        const float *g, const float *beta,
+        uint32_t h_v, uint32_t h_k, uint32_t dim, uint32_t n_tok) {
+    uint32_t h = blockIdx.x;
+    uint32_t j = threadIdx.x;
+    if (h >= h_v || j >= dim) return;
+    const uint32_t kh = h % h_k; /* ggml_repeat tiles */
+    float *Sg = state + (uint64_t)h * dim * dim;
+    const float qscale = rsqrtf((float)dim);
+
+    float S[128];
+    for (uint32_t i = 0; i < dim; i++) S[i] = Sg[(uint64_t)i * dim + j];
+
+    __shared__ float sq[128];
+    __shared__ float sk[128];
+    for (uint32_t tok = 0; tok < n_tok; tok++) {
+        const float *qh = q + ((uint64_t)tok * h_k + kh) * dim;
+        const float *kk = k + ((uint64_t)tok * h_k + kh) * dim;
+        __syncthreads();
+        for (uint32_t i = j; i < dim; i += blockDim.x) {
+            sq[i] = qh[i] * qscale;
+            sk[i] = kk[i];
+        }
+        __syncthreads();
+        const float decay = expf(g[(uint64_t)tok * h_v + h]);
+        float dot_k = 0.0f;
+        for (uint32_t i = 0; i < dim; i++) {
+            S[i] *= decay;
+            dot_k += S[i] * sk[i];
+        }
+        const float d =
+            (v[((uint64_t)tok * h_v + h) * dim + j] - dot_k) *
+            beta[(uint64_t)tok * h_v + h];
+        float o = 0.0f;
+        for (uint32_t i = 0; i < dim; i++) {
+            S[i] += sk[i] * d;
+            o += S[i] * sq[i];
+        }
+        out[((uint64_t)tok * h_v + h) * dim + j] = o;
+    }
+    for (uint32_t i = 0; i < dim; i++) Sg[(uint64_t)i * dim + j] = S[i];
+}
+
+extern "C" int pulsar_qwen35_gdn_batch(
+        void *out_dev, void *state_dev,
+        const void *q_dev, const void *k_dev, const void *v_dev,
+        const void *g_dev, const void *beta_dev,
+        uint32_t h_v, uint32_t h_k, uint32_t dim, uint32_t n_tok) {
+    if (!out_dev || !state_dev || !q_dev || !k_dev || !v_dev || !g_dev ||
+        !beta_dev || h_v == 0 || h_k == 0 || h_v % h_k != 0 || dim == 0 ||
+        dim > 128u || n_tok == 0) {
+        return 0;
+    }
+    qwen35_gdn_batch_kernel<<<h_v, dim>>>(
+            (float *)out_dev, (float *)state_dev,
+            (const float *)q_dev, (const float *)k_dev, (const float *)v_dev,
+            (const float *)g_dev, (const float *)beta_dev, h_v, h_k, dim, n_tok);
+    return cuda_ok(cudaGetLastError(), "qwen35 gdn batch launch");
+}
+
+/* Per-row scale: x[t][:] *= s[t] (batched shared-expert scalar gates). */
+__global__ static void qwen35_row_scale_kernel(
+        float *x, const float *s, uint32_t n_rows, uint32_t dim) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_rows * dim) return;
+    x[idx] *= s[idx / dim];
+}
+
+extern "C" int pulsar_qwen35_row_scale(
+        void *x_dev, const void *s_dev, uint32_t n_rows, uint32_t dim) {
+    if (!x_dev || !s_dev || n_rows == 0 || dim == 0) return 0;
+    uint32_t total = n_rows * dim;
+    qwen35_row_scale_kernel<<<(total + 255u) / 256u, 256>>>(
+            (float *)x_dev, (const float *)s_dev, n_rows, dim);
+    return cuda_ok(cudaGetLastError(), "qwen35 row scale launch");
+}
+
+/* Non-causal draft attention (DFlash block diffusion): n_q query rows
+ * attend over ALL n_kv rows. q [n_q][n_head][dim]; k/v contiguous rows
+ * [n_kv][n_kv_head][dim]; GQA block mapping (flash_attn_ext semantics:
+ * head h reads kv head h / (n_head/n_kv_head) - NOT the GDN tile map).
+ * One block per (q row, head), online softmax over row chunks. */
+__global__ static void qwen35_draft_attn_kernel(
+        float *out, const float *q, const float *k, const float *v,
+        uint32_t n_q, uint32_t n_kv, uint32_t n_head, uint32_t n_kv_head,
+        uint32_t dim, float scale) {
+    uint32_t t = blockIdx.x;
+    uint32_t h = blockIdx.y;
+    if (t >= n_q || h >= n_head) return;
+    const uint32_t kvh = h / (n_head / n_kv_head);
+    const float *qh = q + ((uint64_t)t * n_head + h) * dim;
+    const uint32_t tid = threadIdx.x;
+    __shared__ float sq[128];
+    __shared__ float s_w[128];
+    __shared__ float red[128];
+    for (uint32_t d = tid; d < dim; d += 128u) sq[d] = qh[d];
+    __syncthreads();
+    float acc = 0.0f; /* dim <= 128: thread d owns output dim d */
+    float den = 0.0f;
+    float m = -INFINITY;
+    const uint64_t kv_stride = (uint64_t)n_kv_head * dim;
+    for (uint32_t base = 0; base < n_kv; base += 128u) {
+        uint32_t chunk = n_kv - base < 128u ? n_kv - base : 128u;
+        float s = -INFINITY;
+        if (tid < chunk) {
+            const float *krow = k + (uint64_t)(base + tid) * kv_stride + (uint64_t)kvh * dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < dim; d++) dot += sq[d] * krow[d];
+            s = dot * scale;
+        }
+        red[tid] = s;
+        __syncthreads();
+        for (uint32_t st = 64u; st != 0; st >>= 1u) {
+            if (tid < st) red[tid] = fmaxf(red[tid], red[tid + st]);
+            __syncthreads();
+        }
+        float m_new = fmaxf(m, red[0]);
+        float corr = expf(m - m_new);
+        acc *= corr;
+        den *= corr;
+        if (tid < chunk) s_w[tid] = expf(s - m_new);
+        __syncthreads();
+        for (uint32_t r = 0; r < chunk; r++) {
+            float wgt = s_w[r];
+            den += wgt;
+            if (tid < dim) {
+                acc += wgt * v[(uint64_t)(base + r) * kv_stride + (uint64_t)kvh * dim + tid];
+            }
+        }
+        m = m_new;
+        __syncthreads();
+    }
+    if (tid < dim) {
+        out[((uint64_t)t * n_head + h) * dim + tid] = acc / den;
+    }
+}
+
+extern "C" int pulsar_qwen35_draft_attn(
+        void *out_dev, const void *q_dev, const void *k_dev, const void *v_dev,
+        uint32_t n_q, uint32_t n_kv, uint32_t n_head, uint32_t n_kv_head,
+        uint32_t dim, float scale) {
+    if (!out_dev || !q_dev || !k_dev || !v_dev || n_q == 0 || n_kv == 0 ||
+        n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
+        dim == 0 || dim > 128u) {
+        return 0;
+    }
+    dim3 grid(n_q, n_head, 1);
+    qwen35_draft_attn_kernel<<<grid, 128>>>(
+            (float *)out_dev, (const float *)q_dev, (const float *)k_dev,
+            (const float *)v_dev, n_q, n_kv, n_head, n_kv_head, dim, scale);
+    return cuda_ok(cudaGetLastError(), "qwen35 draft attn launch");
+}
+
 /* ---- selftest ----------------------------------------------------------- */
 
 extern "C" int pulsar_qwen35_selftest(void) {
@@ -368,6 +573,166 @@ extern "C" int pulsar_qwen35_selftest(void) {
         }
         cudaFree(dfused); cudaFree(dq2); cudaFree(dgate);
         free(fused); free(gq); free(gg); free(gs);
+    }
+
+    /* batch kernels vs the single-step kernels (sequential equivalence) */
+    {
+        const uint32_t T = 5;
+        /* conv */
+        float *kern = (float *)malloc((size_t)NCH * K * 4);
+        float *xs = (float *)malloc((size_t)T * NCH * 4);
+        for (uint32_t i = 0; i < NCH * K; i++) kern[i] = gqa_test_randf();
+        for (uint32_t i = 0; i < T * NCH; i++) xs[i] = gqa_test_randf();
+        void *dkern, *dstate1, *dstate2, *dx, *dout1, *dout2;
+        cudaMalloc(&dkern, (size_t)NCH * K * 4);
+        cudaMalloc(&dstate1, (size_t)(K - 1) * NCH * 4);
+        cudaMalloc(&dstate2, (size_t)(K - 1) * NCH * 4);
+        cudaMalloc(&dx, (size_t)T * NCH * 4);
+        cudaMalloc(&dout1, (size_t)T * NCH * 4);
+        cudaMalloc(&dout2, (size_t)T * NCH * 4);
+        cudaMemcpy(dkern, kern, (size_t)NCH * K * 4, cudaMemcpyHostToDevice);
+        cudaMemset(dstate1, 0, (size_t)(K - 1) * NCH * 4);
+        cudaMemset(dstate2, 0, (size_t)(K - 1) * NCH * 4);
+        cudaMemcpy(dx, xs, (size_t)T * NCH * 4, cudaMemcpyHostToDevice);
+        for (uint32_t t = 0; t < T; t++) {
+            ok &= pulsar_qwen35_conv_step(
+                    (float *)dout1 + (size_t)t * NCH,
+                    (const float *)dx + (size_t)t * NCH, dkern, dstate1, NCH, K);
+        }
+        ok &= pulsar_qwen35_conv_batch(dout2, dx, dkern, dstate2, NCH, K, T);
+        float *o1 = (float *)malloc((size_t)T * NCH * 4);
+        float *o2 = (float *)malloc((size_t)T * NCH * 4);
+        float *st1 = (float *)malloc((size_t)(K - 1) * NCH * 4);
+        float *st2 = (float *)malloc((size_t)(K - 1) * NCH * 4);
+        cudaMemcpy(o1, dout1, (size_t)T * NCH * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(o2, dout2, (size_t)T * NCH * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(st1, dstate1, (size_t)(K - 1) * NCH * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(st2, dstate2, (size_t)(K - 1) * NCH * 4, cudaMemcpyDeviceToHost);
+        for (uint32_t i = 0; i < T * NCH && ok; i++) {
+            if (o1[i] != o2[i]) { fprintf(stderr, "qwen35 selftest: conv batch out mismatch\n"); ok = 0; }
+        }
+        for (uint32_t i = 0; i < (K - 1) * NCH && ok; i++) {
+            if (st1[i] != st2[i]) { fprintf(stderr, "qwen35 selftest: conv batch state mismatch\n"); ok = 0; }
+        }
+        cudaFree(dkern); cudaFree(dstate1); cudaFree(dstate2);
+        cudaFree(dx); cudaFree(dout1); cudaFree(dout2);
+        free(kern); free(xs); free(o1); free(o2); free(st1); free(st2);
+
+        /* gdn batch vs single steps */
+        const uint64_t sbytes = (uint64_t)HV * DIM * DIM * 4;
+        float *q = (float *)malloc((size_t)T * HK * DIM * 4);
+        float *kv = (float *)malloc((size_t)T * HK * DIM * 4);
+        float *vv = (float *)malloc((size_t)T * HV * DIM * 4);
+        float *gg = (float *)malloc((size_t)T * HV * 4);
+        float *bb = (float *)malloc((size_t)T * HV * 4);
+        for (uint32_t i = 0; i < T * HK * DIM; i++) { q[i] = gqa_test_randf(); kv[i] = gqa_test_randf(); }
+        for (uint32_t i = 0; i < T * HV * DIM; i++) vv[i] = gqa_test_randf();
+        for (uint32_t i = 0; i < T * HV; i++) { gg[i] = -fabsf(gqa_test_randf()); bb[i] = 0.5f + 0.4f * gqa_test_randf(); }
+        void *dS1, *dS2, *dq, *dk, *dv, *dg, *db, *do1, *do2;
+        cudaMalloc(&dS1, sbytes); cudaMemset(dS1, 0, sbytes);
+        cudaMalloc(&dS2, sbytes); cudaMemset(dS2, 0, sbytes);
+        cudaMalloc(&dq, (size_t)T * HK * DIM * 4);
+        cudaMalloc(&dk, (size_t)T * HK * DIM * 4);
+        cudaMalloc(&dv, (size_t)T * HV * DIM * 4);
+        cudaMalloc(&dg, (size_t)T * HV * 4);
+        cudaMalloc(&db, (size_t)T * HV * 4);
+        cudaMalloc(&do1, (size_t)T * HV * DIM * 4);
+        cudaMalloc(&do2, (size_t)T * HV * DIM * 4);
+        cudaMemcpy(dq, q, (size_t)T * HK * DIM * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dk, kv, (size_t)T * HK * DIM * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dv, vv, (size_t)T * HV * DIM * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dg, gg, (size_t)T * HV * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(db, bb, (size_t)T * HV * 4, cudaMemcpyHostToDevice);
+        for (uint32_t t = 0; t < T; t++) {
+            ok &= pulsar_qwen35_gdn_step(
+                    (float *)do1 + (size_t)t * HV * DIM, dS1,
+                    (const float *)dq + (size_t)t * HK * DIM,
+                    (const float *)dk + (size_t)t * HK * DIM,
+                    (const float *)dv + (size_t)t * HV * DIM,
+                    (const float *)dg + (size_t)t * HV,
+                    (const float *)db + (size_t)t * HV, HV, HK, DIM);
+        }
+        ok &= pulsar_qwen35_gdn_batch(do2, dS2, dq, dk, dv, dg, db, HV, HK, DIM, T);
+        float *go1 = (float *)malloc((size_t)T * HV * DIM * 4);
+        float *go2 = (float *)malloc((size_t)T * HV * DIM * 4);
+        float *gs1 = (float *)malloc(sbytes);
+        float *gs2 = (float *)malloc(sbytes);
+        cudaMemcpy(go1, do1, (size_t)T * HV * DIM * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(go2, do2, (size_t)T * HV * DIM * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(gs1, dS1, sbytes, cudaMemcpyDeviceToHost);
+        cudaMemcpy(gs2, dS2, sbytes, cudaMemcpyDeviceToHost);
+        for (uint32_t i = 0; i < T * HV * DIM && ok; i++) {
+            float diff = fabsf(go1[i] - go2[i]);
+            if (diff > 1.0e-5f * fmaxf(1.0f, fabsf(go1[i]))) {
+                fprintf(stderr, "qwen35 selftest: gdn batch out mismatch at %u\n", i);
+                ok = 0;
+            }
+        }
+        for (uint64_t i = 0; i < (uint64_t)HV * DIM * DIM && ok; i++) {
+            float diff = fabsf(gs1[i] - gs2[i]);
+            if (diff > 1.0e-5f * fmaxf(1.0f, fabsf(gs1[i]))) {
+                fprintf(stderr, "qwen35 selftest: gdn batch state mismatch\n");
+                ok = 0;
+            }
+        }
+        cudaFree(dS1); cudaFree(dS2); cudaFree(dq); cudaFree(dk); cudaFree(dv);
+        cudaFree(dg); cudaFree(db); cudaFree(do1); cudaFree(do2);
+        free(q); free(kv); free(vv); free(gg); free(bb);
+        free(go1); free(go2); free(gs1); free(gs2);
+    }
+
+    /* draft attention vs host reference (non-causal GQA) */
+    {
+        const uint32_t NQ = 3, NKV = 70, NH = 8, NKVH = 2, D = 128;
+        const float scale = 1.0f / sqrtf((float)D);
+        float *q = (float *)malloc((size_t)NQ * NH * D * 4);
+        float *k = (float *)malloc((size_t)NKV * NKVH * D * 4);
+        float *v = (float *)malloc((size_t)NKV * NKVH * D * 4);
+        for (uint32_t i = 0; i < NQ * NH * D; i++) q[i] = gqa_test_randf();
+        for (uint32_t i = 0; i < NKV * NKVH * D; i++) { k[i] = gqa_test_randf(); v[i] = gqa_test_randf(); }
+        void *dq, *dk, *dv, *dout;
+        cudaMalloc(&dq, (size_t)NQ * NH * D * 4);
+        cudaMalloc(&dk, (size_t)NKV * NKVH * D * 4);
+        cudaMalloc(&dv, (size_t)NKV * NKVH * D * 4);
+        cudaMalloc(&dout, (size_t)NQ * NH * D * 4);
+        cudaMemcpy(dq, q, (size_t)NQ * NH * D * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dk, k, (size_t)NKV * NKVH * D * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dv, v, (size_t)NKV * NKVH * D * 4, cudaMemcpyHostToDevice);
+        ok &= pulsar_qwen35_draft_attn(dout, dq, dk, dv, NQ, NKV, NH, NKVH, D, scale);
+        float *got = (float *)malloc((size_t)NQ * NH * D * 4);
+        cudaMemcpy(got, dout, (size_t)NQ * NH * D * 4, cudaMemcpyDeviceToHost);
+        for (uint32_t t = 0; t < NQ && ok; t++) {
+            for (uint32_t h = 0; h < NH && ok; h++) {
+                const uint32_t kvh = h / (NH / NKVH);
+                const float *qh = q + ((size_t)t * NH + h) * D;
+                float *sc = (float *)malloc(NKV * 4);
+                float mx = -1.0e30f;
+                for (uint32_t r = 0; r < NKV; r++) {
+                    const float *kr = k + ((size_t)r * NKVH + kvh) * D;
+                    float dot = 0.0f;
+                    for (uint32_t d2 = 0; d2 < D; d2++) dot += qh[d2] * kr[d2];
+                    sc[r] = dot * scale;
+                    if (sc[r] > mx) mx = sc[r];
+                }
+                float den = 0.0f;
+                for (uint32_t r = 0; r < NKV; r++) { sc[r] = expf(sc[r] - mx); den += sc[r]; }
+                for (uint32_t d2 = 0; d2 < D && ok; d2++) {
+                    float o = 0.0f;
+                    for (uint32_t r = 0; r < NKV; r++) {
+                        o += sc[r] * v[((size_t)r * NKVH + kvh) * D + d2];
+                    }
+                    o /= den;
+                    float diff = fabsf(o - got[((size_t)t * NH + h) * D + d2]);
+                    if (diff > 2.0e-4f * fmaxf(1.0f, fabsf(o))) {
+                        fprintf(stderr, "qwen35 selftest: draft attn mismatch\n");
+                        ok = 0;
+                    }
+                }
+                free(sc);
+            }
+        }
+        cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dout);
+        free(q); free(k); free(v); free(got);
     }
 
     if (cudaDeviceSynchronize() != cudaSuccess) ok = 0;

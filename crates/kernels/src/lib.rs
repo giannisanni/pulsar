@@ -120,6 +120,10 @@ mod real {
         fn pulsar_qwen35_gdn_step(out: *mut c_void, state: *mut c_void, q: *const c_void, k: *const c_void, v: *const c_void, g: *const c_void, beta: *const c_void, h_v: u32, h_k: u32, dim: u32) -> i32;
         fn pulsar_qwen35_split_gate(q: *mut c_void, gate: *mut c_void, fused: *const c_void, n_head: u32, dim: u32) -> i32;
         fn pulsar_qwen35_sigmoid_gate(x: *mut c_void, gate: *const c_void, n: u32) -> i32;
+        fn pulsar_qwen35_conv_batch(out: *mut c_void, x: *const c_void, kern: *const c_void, state: *mut c_void, n_chan: u32, k: u32, n_tok: u32) -> i32;
+        fn pulsar_qwen35_gdn_batch(out: *mut c_void, state: *mut c_void, q: *const c_void, k: *const c_void, v: *const c_void, g: *const c_void, beta: *const c_void, h_v: u32, h_k: u32, dim: u32, n_tok: u32) -> i32;
+        fn pulsar_qwen35_row_scale(x: *mut c_void, s: *const c_void, n_rows: u32, dim: u32) -> i32;
+        fn pulsar_qwen35_draft_attn(out: *mut c_void, q: *const c_void, k: *const c_void, v: *const c_void, n_q: u32, n_kv: u32, n_head: u32, n_kv_head: u32, dim: u32, scale: f32) -> i32;
         fn pulsar_qwen35_selftest() -> i32;
         fn pulsar_mla_kv_lora_rms_norm(out: *mut c_void, kv_raw: *const c_void, w: *const c_void, n_tok: u32, kv_raw_dim: u32, kv_lora_dim: u32, eps: f32) -> i32;
         fn pulsar_mla_store_compact_kv(kv_lora_cache: *mut c_void, k_rope_cache: *mut c_void, kv_norm: *const c_void, kv_raw: *const c_void, pos0: u32, n_tok: u32, cache_cap: u32, kv_raw_dim: u32, kv_lora_dim: u32, qk_rope: u32) -> i32;
@@ -965,6 +969,29 @@ mod real {
     /// x *= sigmoid(gate) elementwise.
     pub fn qwen35_sigmoid_gate(x: &mut DeviceBuf, gate: &DeviceBuf, n: u32) -> Result {
         check(unsafe { pulsar_qwen35_sigmoid_gate(x.ptr_mut(), gate.ptr(), n) }, "qwen35_sigmoid_gate")
+    }
+
+    /// Batched conv+silu: n_tok tokens sequentially in one launch.
+    pub fn qwen35_conv_batch(out: &mut DeviceBuf, x: &DeviceBuf, kern: &DeviceBuf, state: &mut DeviceBuf, n_chan: u32, k: u32, n_tok: u32) -> Result {
+        check(unsafe { pulsar_qwen35_conv_batch(out.ptr_mut(), x.ptr(), kern.ptr(), state.ptr_mut(), n_chan, k, n_tok) }, "qwen35_conv_batch")
+    }
+
+    /// Batched GDN delta rule: state columns ride registers across n_tok
+    /// sequential steps (dim <= 128).
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_gdn_batch(out: &mut DeviceBuf, state: &mut DeviceBuf, q: &DeviceBuf, k: &DeviceBuf, v: &DeviceBuf, g: &DeviceBuf, beta: &DeviceBuf, h_v: u32, h_k: u32, dim: u32, n_tok: u32) -> Result {
+        check(unsafe { pulsar_qwen35_gdn_batch(out.ptr_mut(), state.ptr_mut(), q.ptr(), k.ptr(), v.ptr(), g.ptr(), beta.ptr(), h_v, h_k, dim, n_tok) }, "qwen35_gdn_batch")
+    }
+
+    /// x[row] *= s[row] (batched per-token scalar gates).
+    pub fn qwen35_row_scale(x: &mut DeviceBuf, s: &DeviceBuf, n_rows: u32, dim: u32) -> Result {
+        check(unsafe { pulsar_qwen35_row_scale(x.ptr_mut(), s.ptr(), n_rows, dim) }, "qwen35_row_scale")
+    }
+
+    /// Non-causal GQA attention over contiguous K/V rows (DFlash draft).
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_draft_attn(out: &mut DeviceBuf, q: &DeviceBuf, k: &DeviceBuf, v: &DeviceBuf, n_q: u32, n_kv: u32, n_head: u32, n_kv_head: u32, dim: u32, scale: f32) -> Result {
+        check(unsafe { pulsar_qwen35_draft_attn(out.ptr_mut(), q.ptr(), k.ptr(), v.ptr(), n_q, n_kv, n_head, n_kv_head, dim, scale) }, "qwen35_draft_attn")
     }
 
     pub fn qwen35_selftest() -> bool {
