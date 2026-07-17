@@ -1146,6 +1146,17 @@ mod real {
             self.cache.contains_key(&offset)
         }
 
+        /// Raise warm-seeded entries above run-time newcomers (freq 1) so
+        /// io-timing churn can't evict the census-hot band - lane
+        /// membership and perf were run-to-run bistable without this.
+        fn bless(&mut self, offsets: impl Iterator<Item = u64>) {
+            for off in offsets {
+                if let Some(e) = self.cache.get_mut(&off) {
+                    e.freq = e.freq.max(2);
+                }
+            }
+        }
+
         /// Take ownership of a prefetched slab (evicting to budget).
         fn absorb(&mut self, offset: u64, slab: stream::fetch::Slab) {
             if self.cache.contains_key(&offset) {
@@ -2811,6 +2822,7 @@ mod real {
                 Ok(())
             })?;
             self.store.ensure_with(&host_tier, |_, _| Ok(()))?;
+            self.store.bless(host_tier.iter().map(|r| r.offset));
             self.store.reset_stats();
             self.dev_cache.hits = 0;
             self.dev_cache.misses = 0;
