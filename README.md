@@ -78,6 +78,16 @@ tok/s bench are untouched. Known remaining lever: each q-head group
 re-reads its shared kv-head rows, so a kv-head-centric layout has
 several-fold headroom left at depth.
 
+A CPU expert lane (opt-in, `PULSAR_CPU=1`) computes host-cache-hit
+experts on the CPU instead of uploading them: an AVX2 iq2_xxs x q8_K
+kernel sustains 42 GB/s across the 9900X's cores, above the 28.7 GB/s
+the same bytes would cost crossing PCIe, and the dots overlap the GPU
+resolve. Host-cached experts stop competing for upload bandwidth and
+VRAM cache slots, so both effects compound: Hy3 measures 5.0 to 7.0
+tok/s (+40%) and GLM-5.2 1.6 to 2.8 on good runs. GLM's exact gain
+varies run to run with how the cache ecology settles (the floor stays
+at baseline); iq2_xxs expert mixes only for now.
+
 Decode rate slides with output length on the streaming models: a longer
 generation routes to a wider set of experts, so the disk-miss fraction
 creeps up until the working set saturates. Hy3 measures 5.7 tok/s at n=64,
