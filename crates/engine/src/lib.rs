@@ -1404,14 +1404,21 @@ mod real {
 
         /// quants the lane can compute; extend together with dot()
         pub fn supported(quant: u32) -> bool {
-            quant == kernels::QUANT_IQ2_XXS || quant == kernels::QUANT_Q2_K
+            [
+                kernels::QUANT_IQ2_XXS,
+                kernels::QUANT_Q2_K,
+                kernels::QUANT_Q3_K,
+                kernels::QUANT_Q4_K,
+            ]
+            .contains(&quant)
         }
 
         pub fn dot(quant: u32, row: &[u8], xq: &quant::cpu_dot::Q8KRow, n: usize) -> f32 {
-            if quant == kernels::QUANT_Q2_K {
-                quant::cpu_dot::vec_dot_q2_k_q8_k(row, xq, n)
-            } else {
-                quant::cpu_dot::vec_dot_iq2_xxs_q8_k(row, xq, n)
+            match quant {
+                q if q == kernels::QUANT_Q2_K => quant::cpu_dot::vec_dot_q2_k_q8_k(row, xq, n),
+                q if q == kernels::QUANT_Q3_K => quant::cpu_dot::vec_dot_q3_k_q8_k(row, xq, n),
+                q if q == kernels::QUANT_Q4_K => quant::cpu_dot::vec_dot_q4_k_q8_k(row, xq, n),
+                _ => quant::cpu_dot::vec_dot_iq2_xxs_q8_k(row, xq, n),
             }
         }
 
