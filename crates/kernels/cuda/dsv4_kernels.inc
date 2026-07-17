@@ -609,6 +609,34 @@ static void dsv4_ref_attention(
     }
 }
 
+/* Host copies of the yarn rope helpers (the mla_* ones are __device__). */
+static void dsv4_ref_corr_dims(
+        uint32_t n_dims, uint32_t n_ctx_orig, float freq_base,
+        float beta_fast, float beta_slow, float *c0, float *c1) {
+    const float denom = 2.0f * logf(freq_base);
+    const float f_fast = (float)n_dims *
+        logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom;
+    const float f_slow = (float)n_dims *
+        logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom;
+    *c0 = fmaxf(0.0f, floorf(f_fast));
+    *c1 = fminf((float)n_dims - 1.0f, ceilf(f_slow));
+}
+
+static void dsv4_ref_rope_yarn(
+        float theta_extrap, float freq_scale, float c0, float c1, int i0,
+        float ext_factor, float mscale, float *cos_theta, float *sin_theta) {
+    const float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    if (ext_factor != 0.0f) {
+        const float y = ((float)(i0 / 2) - c0) / fmaxf(0.001f, c1 - c0);
+        const float ramp = (1.0f - fminf(1.0f, fmaxf(0.0f, y))) * ext_factor;
+        theta = theta_interp * (1.0f - ramp) + theta_extrap * ramp;
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    *cos_theta = cosf(theta) * mscale;
+    *sin_theta = sinf(theta) * mscale;
+}
+
 /* Host e4m3fn round-trip via nearest-even value scan (e4m3_enc is
  * device-only: __float2int_rn). Byte values 0..126 decode to a
  * monotonically increasing positive ladder; even index parity == even
@@ -938,13 +966,13 @@ extern "C" int pulsar_dsv4_selftest(void) {
                     const uint32_t comp_pos = pos + 1u - ratio;
                     const uint32_t n_nope = hd - n_rot;
                     float c0, c1;
-                    mla_rope_corr_dims(n_rot, 65536u, freq_base, 32.0f, 1.0f, &c0, &c1);
+                    dsv4_ref_corr_dims(n_rot, 65536u, freq_base, 32.0f, 1.0f, &c0, &c1);
                     float theta_extrap = (float)comp_pos;
                     const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
                     for (uint32_t i = 0; i < n_rot; i += 2u) {
                         float cs, sn;
-                        mla_rope_yarn(theta_extrap, freq_scale, c0, c1, (int)i,
-                                      ext_factor, attn_factor, &cs, &sn);
+                        dsv4_ref_rope_yarn(theta_extrap, freq_scale, c0, c1, (int)i,
+                                           ext_factor, attn_factor, &cs, &sn);
                         float *t = ref_row + n_nope;
                         const float x0 = t[i], x1 = t[i + 1u];
                         t[i] = x0 * cs - x1 * sn;
