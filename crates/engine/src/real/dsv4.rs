@@ -14,6 +14,9 @@ use super::{Attn, Ffn, LayerW, Model, Result, Shape, State, SLAB_SLACK};
 use kernels::DeviceBuf;
 
 const NEG_INF: f32 = -1.0e30; // DS4_NEG_INF (finite on purpose)
+/// Batched prefill chunk width (matches the qwen35 blueprint; the
+/// per-token interleave keeps the SWA ring correct within a chunk).
+const T_MAX: usize = 16;
 const ROUTER_FLOOR: f32 = 6.103515625e-5;
 
 /* ---- host float helpers (reference math) ------------------------------- */
@@ -639,16 +642,18 @@ impl Dsv4Rt {
         }
         let rank = 1024u32; // output_lora_rank (V4 Flash and Pro)
         Ok(Dsv4Rt {
-            hc_cur: DeviceBuf::alloc((s.n_hc * s.n_embd) as usize * 4)?,
-            hc_next: DeviceBuf::alloc((s.n_hc * s.n_embd) as usize * 4)?,
-            mix: DeviceBuf::alloc(6 * s.n_hc as usize * 4)?,
-            low: DeviceBuf::alloc((s.n_out_group * rank).max(s.n_idx_head * s.n_idx_dim) as usize * 4)?,
-            comp_kv: DeviceBuf::alloc(2 * s.head_dim as usize * 4)?,
-            comp_sc: DeviceBuf::alloc(2 * s.head_dim as usize * 4)?,
+            // token-major stream layout [T][n_hc][n_embd]; decode (t=1)
+            // coincides with the old single-token layout
+            hc_cur: DeviceBuf::alloc(T_MAX * (s.n_hc * s.n_embd) as usize * 4)?,
+            hc_next: DeviceBuf::alloc(T_MAX * (s.n_hc * s.n_embd) as usize * 4)?,
+            mix: DeviceBuf::alloc(T_MAX * 6 * s.n_hc as usize * 4)?,
+            low: DeviceBuf::alloc(T_MAX * (s.n_out_group * rank).max(s.n_idx_head * s.n_idx_dim) as usize * 4)?,
+            comp_kv: DeviceBuf::alloc(T_MAX * 2 * s.head_dim as usize * 4)?,
+            comp_sc: DeviceBuf::alloc(T_MAX * 2 * s.head_dim as usize * 4)?,
             idx_w: DeviceBuf::alloc(s.n_idx_head.max(1) as usize * 4)?,
             allowed: DeviceBuf::alloc(max_ratio_cap)?,
-            coef_attn: DeviceBuf::alloc(6 * s.n_hc as usize * 4)?,
-            coef_ffn: DeviceBuf::alloc(6 * s.n_hc as usize * 4)?,
+            coef_attn: DeviceBuf::alloc(T_MAX * 6 * s.n_hc as usize * 4)?,
+            coef_ffn: DeviceBuf::alloc(T_MAX * 6 * s.n_hc as usize * 4)?,
             layers,
         })
     }
@@ -730,28 +735,51 @@ impl Model {
     fn forward_dsv4_inner(&self, st: &mut State, rt: &mut Dsv4Rt, tokens: &[u32], pos0: u32, rows: u32) -> Result<Option<Vec<f32>>> {
         let s = self.shape;
         let row = s.n_embd as usize * 4;
-        for (i, &tok) in tokens.iter().enumerate() {
-            let pos = pos0 + i as u32;
-            if pos == 0 {
-                rt.reset()?;
-            }
-            st.tok.write(0, kernels::as_bytes(&[tok as i32]))?;
-            kernels::embed_q8_0(&mut st.cur, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, 1)?;
-            // hc_from_plain_embedding: all streams start as the embedding
-            for h in 0..s.n_hc as usize {
-                kernels::copy_d2d(&mut rt.hc_cur, h * row, &st.cur, 0, row)?;
-            }
-            for (il, l) in self.layers.iter().enumerate() {
-                self.eval_dsv4_layer(st, rt, il, l, tok, pos)?;
+        if pos0 == 0 {
+            rt.reset()?;
+        }
+        let mut pos = pos0;
+        let mut last_t = 1usize;
+        for chunk in tokens.chunks(T_MAX) {
+            let t = chunk.len();
+            // the batched path assumes no indexer masking inside the
+            // chunk (fires past 512 comp rows = ctx > 2048); past that
+            // boundary fall to single-token steps
+            let t = if (pos + t as u32) / 4 > s.n_idx_topk { 1 } else { t };
+            for sub in chunk.chunks(t) {
+                let t = sub.len();
+                let ids: Vec<i32> = sub.iter().map(|&x| x as i32).collect();
+                st.tok.write(0, kernels::as_bytes(&ids))?;
+                kernels::embed_q8_0(&mut st.cur, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, t as u32)?;
+                // hc_from_plain_embedding, token-major streams
+                for (i, _) in sub.iter().enumerate() {
+                    for h in 0..s.n_hc as usize {
+                        kernels::copy_d2d(
+                            &mut rt.hc_cur,
+                            (i * s.n_hc as usize + h) * row,
+                            &st.cur,
+                            i * row,
+                            row,
+                        )?;
+                    }
+                }
+                for (il, l) in self.layers.iter().enumerate() {
+                    self.eval_dsv4_layer(st, rt, il, l, sub, pos, t as u32)?;
+                }
+                pos += t as u32;
+                last_t = t;
             }
         }
         if rows == 0 {
             return Ok(None);
         }
 
-        // output head: HC merge -> output_norm -> lm head
+        // output head over the LAST token's streams
         let out = self.dsv4_out.as_ref().ok_or("dsv4 output head missing")?;
         let ones = self.ones_hc.as_ref().ok_or("ones_hc missing")?;
+        let hc_row = (s.n_hc * s.n_embd) as usize * 4;
+        kernels::copy_d2d(&mut rt.hc_next, 0, &rt.hc_cur, (last_t - 1) * hc_row, hc_row)?;
+        std::mem::swap(&mut rt.hc_cur, &mut rt.hc_next);
         kernels::rms_norm(&mut rt.hc_next, &rt.hc_cur, ones, s.n_hc * s.n_embd, 1, s.rms_eps)?;
         kernels::matmul_f32(&mut rt.mix, &out.fn_w, &rt.hc_next, s.n_hc * s.n_embd, s.n_hc, 1)?;
         let pre = rt.mix.read_f32(s.n_hc as usize)?;
@@ -771,103 +799,137 @@ impl Model {
     /// the Sinkhorn split ON DEVICE into a coef buffer (was 2 host
     /// readbacks per layer per token), reduce the streams into st.cur.
     /// `ffn` picks which coef buffer holds this half's gates.
-    fn dsv4_hc_pre(&self, st: &mut State, rt: &mut Dsv4Rt, fn_w: &DeviceBuf, scale: &DeviceBuf, base: &DeviceBuf, ffn: bool) -> Result {
+    fn dsv4_hc_pre(&self, st: &mut State, rt: &mut Dsv4Rt, fn_w: &DeviceBuf, scale: &DeviceBuf, base: &DeviceBuf, ffn: bool, t: u32) -> Result {
         let s = self.shape;
         let ones = self.ones_hc.as_ref().ok_or("ones_hc missing")?;
-        kernels::rms_norm(&mut rt.hc_next, &rt.hc_cur, ones, s.n_hc * s.n_embd, 1, s.rms_eps)?;
-        kernels::matmul_f32(&mut rt.mix, fn_w, &rt.hc_next, s.n_hc * s.n_embd, 6 * s.n_hc, 1)?;
+        // token-major streams: the flat norm is per token over 4*n_embd
+        kernels::rms_norm(&mut rt.hc_next, &rt.hc_cur, ones, s.n_hc * s.n_embd, t, s.rms_eps)?;
+        kernels::matmul_f32(&mut rt.mix, fn_w, &rt.hc_next, s.n_hc * s.n_embd, 6 * s.n_hc, t)?;
         let coef = if ffn { &mut rt.coef_ffn } else { &mut rt.coef_attn };
-        kernels::dsv4_sinkhorn(coef, &rt.mix, scale, base, s.n_hc, s.hc_sinkhorn, s.hc_eps)?;
+        kernels::dsv4_sinkhorn(coef, &rt.mix, scale, base, s.n_hc, s.hc_sinkhorn, s.hc_eps, t)?;
         let coef = if ffn { &rt.coef_ffn } else { &rt.coef_attn };
-        kernels::dsv4_hc_mix_dev(&mut st.cur, &rt.hc_cur, None, coef, 0, -1, s.n_embd, s.n_hc, 1)?;
+        kernels::dsv4_hc_mix_dev(&mut st.cur, &rt.hc_cur, None, coef, 0, -1, s.n_embd, s.n_hc, 1, t)?;
         Ok(())
     }
 
     /// hc_post: streams' = post*block_out + comb-mix of streams, gates
     /// read from the half's device coef buffer.
-    fn dsv4_hc_post(&self, rt: &mut Dsv4Rt, block_out: &DeviceBuf, ffn: bool) -> Result {
+    fn dsv4_hc_post(&self, rt: &mut Dsv4Rt, block_out: &DeviceBuf, ffn: bool, t: u32) -> Result {
         let s = self.shape;
         let coef = if ffn { &rt.coef_ffn } else { &rt.coef_attn };
-        kernels::dsv4_hc_mix_dev(&mut rt.hc_next, &rt.hc_cur, Some(block_out), coef, 2 * s.n_hc, s.n_hc as i32, s.n_embd, s.n_hc, s.n_hc)?;
+        kernels::dsv4_hc_mix_dev(&mut rt.hc_next, &rt.hc_cur, Some(block_out), coef, 2 * s.n_hc, s.n_hc as i32, s.n_embd, s.n_hc, s.n_hc, t)?;
         std::mem::swap(&mut rt.hc_cur, &mut rt.hc_next);
         Ok(())
     }
 
-    fn eval_dsv4_layer(&self, st: &mut State, rt: &mut Dsv4Rt, il: usize, l: &LayerW, token: u32, pos: u32) -> Result {
+    fn eval_dsv4_layer(&self, st: &mut State, rt: &mut Dsv4Rt, il: usize, l: &LayerW, tokens: &[u32], pos0: u32, t: u32) -> Result {
         let s = self.shape;
         let eps = s.rms_eps;
         let Attn::Dsv4(w) = &l.attn else {
             return Err("dsv4 layer without Dsv4 attn weights".into());
         };
         let rope = rope_cfg(&s, w.ratio);
-        let n_raw = (pos + 1).min(s.n_swa);
         let q_dim = s.n_head * s.head_dim;
+        let hd4 = s.head_dim as usize * 4;
 
-        // ---- attention half
-        self.dsv4_hc_pre(st, rt, &w.hc_attn_fn, &w.hc_attn_scale, &w.hc_attn_base, false)?;
-        kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, 1, eps)?;
-        // q: lora bottleneck + per-head weightless rms norm
-        kernels::matmul_q8_0(&mut st.q_rank, &w.q_a, &st.normed, s.n_embd, s.n_lora_q, 1)?;
-        kernels::rms_norm(&mut st.q_rank_norm, &st.q_rank, &w.q_a_norm, s.n_lora_q, 1, eps)?;
-        kernels::matmul_q8_0(&mut st.q, &w.q_b, &st.q_rank_norm, s.n_lora_q, q_dim, 1)?;
-        kernels::gqa_head_rms_norm(&mut st.q, None, s.n_head, s.head_dim, eps)?;
-        // kv: single 512-wide latent row, K == V
-        kernels::matmul_q8_0(&mut st.k, &w.kv, &st.normed, s.n_embd, s.head_dim, 1)?;
-        kernels::rms_norm(&mut st.v, &st.k, &w.kv_a_norm, s.head_dim, 1, eps)?;
-        kernels::dsv4_rope_tail(&mut st.q, 1, s.n_head, s.head_dim, s.rot_dim, pos, &rope, false)?;
-        kernels::dsv4_rope_tail(&mut st.v, 1, 1, s.head_dim, s.rot_dim, pos, &rope, false)?;
-        kernels::dsv4_fp8_sim(&mut st.v, 1, s.head_dim, s.rot_dim)?;
-        kernels::dsv4_f16_round(&mut st.v, s.head_dim)?;
-        kernels::copy_d2d(
-            &mut st.kcache[il],
-            (pos % s.n_swa) as usize * s.head_dim as usize * 4,
-            &st.v,
-            0,
-            s.head_dim as usize * 4,
-        )?;
-
-        // ---- streaming compressor (+ indexer lane and selection)
-        let lrt = &mut rt.layers[il];
-        let mut use_mask = false;
-        // boundary flags are deterministic in pos - no readbacks needed
-        let emit = w.ratio != 0 && (pos + 1) % w.ratio == 0;
+        // ---- attention half (matmuls/norms/rope batched)
+        self.dsv4_hc_pre(st, rt, &w.hc_attn_fn, &w.hc_attn_scale, &w.hc_attn_base, false, t)?;
+        kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, t, eps)?;
+        kernels::matmul_q8_0(&mut st.q_rank, &w.q_a, &st.normed, s.n_embd, s.n_lora_q, t)?;
+        kernels::rms_norm(&mut st.q_rank_norm, &st.q_rank, &w.q_a_norm, s.n_lora_q, t, eps)?;
+        kernels::matmul_q8_0(&mut st.q, &w.q_b, &st.q_rank_norm, s.n_lora_q, q_dim, t)?;
+        kernels::gqa_head_rms_norm(&mut st.q, None, t * s.n_head, s.head_dim, eps)?;
+        kernels::matmul_q8_0(&mut st.k, &w.kv, &st.normed, s.n_embd, s.head_dim, t)?;
+        kernels::rms_norm(&mut st.v, &st.k, &w.kv_a_norm, s.head_dim, t, eps)?;
+        kernels::dsv4_rope_tail(&mut st.q, t, s.n_head, s.head_dim, s.rot_dim, pos0, &rope, false)?;
+        kernels::dsv4_rope_tail(&mut st.v, t, 1, s.head_dim, s.rot_dim, pos0, &rope, false)?;
+        kernels::dsv4_fp8_sim(&mut st.v, t, s.head_dim, s.rot_dim)?;
+        kernels::dsv4_f16_round(&mut st.v, t * s.head_dim)?;
+        // compressor projections batched (per-token rows consumed below)
         if let Some(comp) = &w.comp {
-            kernels::matmul_q8_0(&mut rt.comp_kv, &comp.kv_w, &st.normed, s.n_embd, comp.width, 1)?;
-            kernels::matmul_q8_0(&mut rt.comp_sc, &comp.gate_w, &st.normed, s.n_embd, comp.width, 1)?;
-            let lane = lrt.comp.as_mut().ok_or("compressor state missing")?;
-            kernels::dsv4_comp_step(
-                &mut lane.st_kv, &mut lane.st_sc,
-                &mut st.vcache[il], lrt.n_comp as usize * s.head_dim as usize * 4,
-                &rt.comp_kv, &rt.comp_sc, &comp.ape, &comp.norm,
-                comp.width, s.head_dim, lane.ratio, pos, emit, false, eps, &rope,
-            )?;
-            if emit {
-                lrt.n_comp += 1;
-            }
+            kernels::matmul_q8_0(&mut rt.comp_kv, &comp.kv_w, &st.normed, s.n_embd, comp.width, t)?;
+            kernels::matmul_q8_0(&mut rt.comp_sc, &comp.gate_w, &st.normed, s.n_embd, comp.width, t)?;
         }
-        if let Some(idx) = &w.idx {
-            kernels::matmul_q8_0(&mut rt.comp_kv, &idx.comp.kv_w, &st.normed, s.n_embd, idx.comp.width, 1)?;
-            kernels::matmul_q8_0(&mut rt.comp_sc, &idx.comp.gate_w, &st.normed, s.n_embd, idx.comp.width, 1)?;
-            let lane = lrt.idx.as_mut().ok_or("indexer state missing")?;
-            let (cache, n_idx) = (&mut lrt.idx_cache, lrt.n_idx_comp);
-            kernels::dsv4_comp_step(
-                &mut lane.st_kv, &mut lane.st_sc,
-                cache, n_idx as usize * s.n_idx_dim as usize * 4,
-                &rt.comp_kv, &rt.comp_sc, &idx.comp.ape, &idx.comp.norm,
-                idx.comp.width, s.n_idx_dim, lane.ratio, pos, emit, true, eps, &rope,
+
+        // ---- per-token interleave: ring append -> comp step -> attend.
+        // LOAD-BEARING: batched ring appends would clobber earlier
+        // tokens' windows (ring cap 128 < chunk span + window).
+        let mut use_mask = false;
+        for i in 0..t as usize {
+            let pos = pos0 + i as u32;
+            let n_raw = (pos + 1).min(s.n_swa);
+            let emit = w.ratio != 0 && (pos + 1) % w.ratio == 0;
+            kernels::copy_d2d(
+                &mut st.kcache[il],
+                (pos % s.n_swa) as usize * hd4,
+                &st.v,
+                i * hd4,
+                hd4,
             )?;
-            if emit {
-                lrt.n_idx_comp += 1;
+            let lrt = &mut rt.layers[il];
+            if let Some(comp) = &w.comp {
+                let lane = lrt.comp.as_mut().ok_or("compressor state missing")?;
+                kernels::dsv4_comp_step(
+                    &mut lane.st_kv, &mut lane.st_sc,
+                    &mut st.vcache[il], lrt.n_comp as usize * hd4,
+                    &rt.comp_kv, &rt.comp_sc, i * comp.width as usize * 4,
+                    &comp.ape, &comp.norm,
+                    comp.width, s.head_dim, lane.ratio, pos, emit, false, eps, &rope,
+                )?;
+                if emit {
+                    lrt.n_comp += 1;
+                }
             }
-            if lrt.n_idx_comp > s.n_idx_topk {
-                // top-k selection (fires past 512 comp rows = ctx > 2k):
-                // the ONE remaining host round-trip on ratio-4 layers -
-                // it reads the device indexer cache back per selection
+            let n_comp = rt.layers[il].n_comp;
+            kernels::dsv4_attention_at(
+                &mut st.heads,
+                i * q_dim as usize * 4,
+                &st.q,
+                i * q_dim as usize * 4,
+                &st.kcache[il],
+                n_raw,
+                (n_comp > 0).then_some(&st.vcache[il]),
+                n_comp,
+                None,
+                &w.sinks,
+                s.n_head,
+                s.head_dim,
+                1.0 / (s.head_dim as f32).sqrt(),
+            )?;
+        }
+        // indexer lane: projections batched, steps per token (its cache
+        // feeds SELECTION only, which the chunk gate keeps inactive for
+        // batched chunks; single-token steps handle the masked regime)
+        if let Some(idx) = &w.idx {
+            kernels::matmul_q8_0(&mut rt.comp_kv, &idx.comp.kv_w, &st.normed, s.n_embd, idx.comp.width, t)?;
+            kernels::matmul_q8_0(&mut rt.comp_sc, &idx.comp.gate_w, &st.normed, s.n_embd, idx.comp.width, t)?;
+            for i in 0..t as usize {
+                let pos = pos0 + i as u32;
+                let emit = (pos + 1) % w.ratio == 0;
+                let lrt = &mut rt.layers[il];
+                let lane = lrt.idx.as_mut().ok_or("indexer state missing")?;
+                let (cache, n_idx) = (&mut lrt.idx_cache, lrt.n_idx_comp);
+                kernels::dsv4_comp_step(
+                    &mut lane.st_kv, &mut lane.st_sc,
+                    cache, n_idx as usize * s.n_idx_dim as usize * 4,
+                    &rt.comp_kv, &rt.comp_sc, i * idx.comp.width as usize * 4,
+                    &idx.comp.ape, &idx.comp.norm,
+                    idx.comp.width, s.n_idx_dim, lane.ratio, pos, emit, true, eps, &rope,
+                )?;
+                if emit {
+                    lrt.n_idx_comp += 1;
+                }
+            }
+            // top-k selection: single-token regime only (t == 1 past
+            // the 2048 boundary, enforced by the chunk gate)
+            if t == 1 && rt.layers[il].n_idx_comp > s.n_idx_topk {
+                let pos = pos0;
                 kernels::matmul_q8_0(&mut rt.low, &idx.q_b, &st.q_rank_norm, s.n_lora_q, s.n_idx_head * s.n_idx_dim, 1)?;
                 kernels::matmul_f32(&mut rt.idx_w, &idx.proj, &st.normed, s.n_embd, s.n_idx_head, 1)?;
                 kernels::sync()?;
                 let mut q = rt.low.read_f32((s.n_idx_head * s.n_idx_dim) as usize)?;
                 let weights = rt.idx_w.read_f32(s.n_idx_head as usize)?;
+                let lrt = &rt.layers[il];
                 let idx_cache_host = lrt
                     .idx_cache
                     .read_f32(lrt.n_idx_comp as usize * s.n_idx_dim as usize)?;
@@ -888,74 +950,85 @@ impl Model {
                 }
             }
         }
+        if use_mask {
+            // masked single-token attention re-runs with the selection
+            // (the unmasked pass above already wrote heads; rerun row 0)
+            let n_raw = (pos0 + 1).min(s.n_swa);
+            let n_comp = rt.layers[il].n_comp;
+            kernels::dsv4_attention(
+                &mut st.heads,
+                &st.q,
+                &st.kcache[il],
+                n_raw,
+                (n_comp > 0).then_some(&st.vcache[il]),
+                n_comp,
+                Some(&rt.allowed),
+                &w.sinks,
+                s.n_head,
+                s.head_dim,
+                1.0 / (s.head_dim as f32).sqrt(),
+            )?;
+        }
 
-        let n_comp = rt.layers[il].n_comp;
-        kernels::dsv4_attention(
-            &mut st.heads,
-            &st.q,
-            &st.kcache[il],
-            n_raw,
-            (n_comp > 0).then_some(&st.vcache[il]),
-            n_comp,
-            use_mask.then_some(&rt.allowed),
-            &w.sinks,
-            s.n_head,
-            s.head_dim,
-            1.0 / (s.head_dim as f32).sqrt(),
-        )?;
-        // un-rotate the value-side rope before the grouped projection
-        kernels::dsv4_rope_tail(&mut st.heads, 1, s.n_head, s.head_dim, s.rot_dim, pos, &rope, true)?;
-        // grouped output: n_out_group banks of [group_dim -> rank]
+        // ---- batched tail: un-rope, grouped out, hc_post
+        kernels::dsv4_rope_tail(&mut st.heads, t, s.n_head, s.head_dim, s.rot_dim, pos0, &rope, true)?;
         let rank = 1024usize;
         let group_dim = (q_dim / s.n_out_group) as usize;
         let w_row_bytes = (group_dim / 32) * 34;
-        for g in 0..s.n_out_group as usize {
-            kernels::matmul_q8_0_off(
-                &mut rt.low,
-                g * rank * 4,
-                &w.out_a,
-                g * rank * w_row_bytes,
-                &st.heads,
-                g * group_dim * 4,
-                group_dim as u32,
-                rank as u32,
-                1,
-            )?;
+        for i in 0..t as usize {
+            for g in 0..s.n_out_group as usize {
+                kernels::matmul_q8_0_off(
+                    &mut rt.low,
+                    (i * s.n_out_group as usize * rank + g * rank) * 4,
+                    &w.out_a,
+                    g * rank * w_row_bytes,
+                    &st.heads,
+                    (i * q_dim as usize + g * group_dim) * 4,
+                    group_dim as u32,
+                    rank as u32,
+                    1,
+                )?;
+            }
         }
-        kernels::matmul_q8_0(&mut st.attn_out, &l.attn_output, &rt.low, (s.n_out_group as usize * rank) as u32, s.n_embd, 1)?;
-        self.dsv4_hc_post(rt, &st.attn_out, false)?;
+        kernels::matmul_q8_0(&mut st.attn_out, &l.attn_output, &rt.low, (s.n_out_group as usize * rank) as u32, s.n_embd, t)?;
+        self.dsv4_hc_post(rt, &st.attn_out, false, t)?;
 
-        // ---- ffn half (shared expert + routed MoE, host router)
-        self.dsv4_hc_pre(st, rt, &w.hc_ffn_fn, &w.hc_ffn_scale, &w.hc_ffn_base, true)?;
-        kernels::rms_norm(&mut st.normed, &st.cur, &l.ffn_norm, s.n_embd, 1, eps)?;
+        // ---- ffn half: ONE router readback + ONE MoE union per chunk
+        self.dsv4_hc_pre(st, rt, &w.hc_ffn_fn, &w.hc_ffn_scale, &w.hc_ffn_base, true, t)?;
+        kernels::rms_norm(&mut st.normed, &st.cur, &l.ffn_norm, s.n_embd, t, eps)?;
         let Ffn::Moe { gate_inp, shexp, gate_exps, up_exps, down_exps, .. } = &l.ffn else {
             return Err("dsv4 layer without MoE ffn".into());
         };
-        kernels::matmul_f32(&mut st.router_logits, gate_inp, &st.normed, s.n_embd, s.n_expert, 1)?;
-        let logits = st.router_logits.read_f32(s.n_expert as usize)?;
-        let (selected, weights) = route(
-            &logits,
-            &w.probs_b,
-            w.tid2eid.as_ref(),
-            token,
-            s.n_expert_used as usize,
-            s.expert_weight_scale,
-        )?;
+        kernels::matmul_f32(&mut st.router_logits, gate_inp, &st.normed, s.n_embd, s.n_expert, t)?;
+        let logits = st.router_logits.read_f32((t * s.n_expert) as usize)?;
+        let mut selected = Vec::with_capacity((t * s.n_expert_used) as usize);
+        let mut weights = Vec::with_capacity((t * s.n_expert_used) as usize);
+        for (i, &tok) in tokens.iter().enumerate() {
+            let (sel, wts) = route(
+                &logits[i * s.n_expert as usize..(i + 1) * s.n_expert as usize],
+                &w.probs_b,
+                w.tid2eid.as_ref(),
+                tok,
+                s.n_expert_used as usize,
+                s.expert_weight_scale,
+            )?;
+            selected.extend_from_slice(&sel);
+            weights.extend_from_slice(&wts);
+        }
         st.router_selected.write(0, kernels::as_bytes(&selected))?;
         st.router_weights.write(0, kernels::as_bytes(&weights))?;
-        // shared expert launches before the expert resolve blocks
         if let Some((sg, su, sd)) = shexp {
-            kernels::matmul_q8_0(&mut st.gate_act, sg, &st.normed, s.n_embd, s.n_ff_exp, 1)?;
-            kernels::matmul_q8_0(&mut st.up_act, su, &st.normed, s.n_embd, s.n_ff_exp, 1)?;
-            kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, s.n_ff_exp, s.clamp_exp, 1.0, 0)?;
-            kernels::matmul_q8_0(&mut st.shared_out, sd, &st.ffn_mid, s.n_ff_exp, s.n_embd, 1)?;
+            kernels::matmul_q8_0(&mut st.gate_act, sg, &st.normed, s.n_embd, s.n_ff_exp, t)?;
+            kernels::matmul_q8_0(&mut st.up_act, su, &st.normed, s.n_embd, s.n_ff_exp, t)?;
+            kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, t * s.n_ff_exp, s.clamp_exp, 1.0, 0)?;
+            kernels::matmul_q8_0(&mut st.shared_out, sd, &st.ffn_mid, s.n_ff_exp, s.n_embd, t)?;
         } else {
-            kernels::zero(&mut st.shared_out, s.n_embd as usize * 4)?;
+            kernels::zero(&mut st.shared_out, (t * s.n_embd) as usize * 4)?;
         }
-        kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, 1)?;
-        self.dsv4_moe(st, &selected, gate_exps, up_exps, down_exps, 3, 1)?;
-        kernels::add(&mut st.ffn_out, &st.moe_out, &st.shared_out, s.n_embd)?;
-        self.dsv4_hc_post(rt, &st.ffn_out, true)?;
+        kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
+        self.dsv4_moe(st, &selected, gate_exps, up_exps, down_exps, 3, t)?;
+        kernels::add(&mut st.ffn_out, &st.moe_out, &st.shared_out, t * s.n_embd)?;
+        self.dsv4_hc_post(rt, &st.ffn_out, true, t)?;
         Ok(())
     }
 

@@ -114,8 +114,8 @@ mod real {
         fn pulsar_dsv4_attention(out: *mut c_void, q: *const c_void, raw: *const c_void, n_raw: u32, comp: *const c_void, n_comp: u32, allowed: *const c_void, sinks: *const c_void, n_head: u32, head_dim: u32, scale: f32) -> i32;
         fn pulsar_dsv4_fp8_sim(x: *mut c_void, n_rows: u32, head_dim: u32, n_rot: u32) -> i32;
         fn pulsar_dsv4_f16_round(x: *mut c_void, n: u32) -> i32;
-        fn pulsar_dsv4_sinkhorn(coef: *mut c_void, mix: *const c_void, scale: *const c_void, base: *const c_void, n_hc: u32, iters: u32, eps: f32) -> i32;
-        fn pulsar_dsv4_hc_mix_dev(out: *mut c_void, streams: *const c_void, block: *const c_void, coef: *const c_void, st_off: u32, blk_off: i32, n_embd: u32, n_hc: u32, n_out: u32) -> i32;
+        fn pulsar_dsv4_sinkhorn(coef: *mut c_void, mix: *const c_void, scale: *const c_void, base: *const c_void, n_hc: u32, iters: u32, eps: f32, n_tok: u32) -> i32;
+        fn pulsar_dsv4_hc_mix_dev(out: *mut c_void, streams: *const c_void, block: *const c_void, coef: *const c_void, st_off: u32, blk_off: i32, n_embd: u32, n_hc: u32, n_out: u32, n_tok: u32) -> i32;
         fn pulsar_dsv4_comp_step(state_kv: *mut c_void, state_sc: *mut c_void, cache_row: *mut c_void, kv_cur: *const c_void, sc_cur: *const c_void, ape: *const c_void, norm: *const c_void, width: u32, head_dim: u32, ratio: u32, pos: u32, emit: u32, is_idx: u32, rms_eps: f32, n_rot: u32, n_ctx_orig: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32) -> i32;
         fn pulsar_dsv4_selftest() -> i32;
         fn pulsar_qwen35_conv_step(out: *mut c_void, x: *const c_void, kern: *const c_void, state: *mut c_void, n_chan: u32, k: u32) -> i32;
@@ -927,9 +927,18 @@ mod real {
     /// rows (K == V), optional per-comp-row visibility mask.
     #[allow(clippy::too_many_arguments)]
     pub fn dsv4_attention(out: &mut DeviceBuf, q: &DeviceBuf, raw: &DeviceBuf, n_raw: u32, comp: Option<&DeviceBuf>, n_comp: u32, allowed: Option<&DeviceBuf>, sinks: &DeviceBuf, n_head: u32, head_dim: u32, scale: f32) -> Result {
+        dsv4_attention_at(out, 0, q, 0, raw, n_raw, comp, n_comp, allowed, sinks, n_head, head_dim, scale)
+    }
+
+    /// dsv4_attention with byte offsets into out/q (chunked prefill's
+    /// per-token interleave).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv4_attention_at(out: &mut DeviceBuf, out_off: usize, q: &DeviceBuf, q_off: usize, raw: &DeviceBuf, n_raw: u32, comp: Option<&DeviceBuf>, n_comp: u32, allowed: Option<&DeviceBuf>, sinks: &DeviceBuf, n_head: u32, head_dim: u32, scale: f32) -> Result {
+        let out_ptr = unsafe { (out.ptr_mut() as *mut u8).add(out_off) as *mut c_void };
+        let q_ptr = unsafe { (q.ptr() as *const u8).add(q_off) as *const c_void };
         check(
             unsafe {
-                pulsar_dsv4_attention(out.ptr_mut(), q.ptr(), raw.ptr(), n_raw, comp.map_or(std::ptr::null(), |b| b.ptr()), n_comp, allowed.map_or(std::ptr::null(), |b| b.ptr()), sinks.ptr(), n_head, head_dim, scale)
+                pulsar_dsv4_attention(out_ptr, q_ptr, raw.ptr(), n_raw, comp.map_or(std::ptr::null(), |b| b.ptr()), n_comp, allowed.map_or(std::ptr::null(), |b| b.ptr()), sinks.ptr(), n_head, head_dim, scale)
             },
             "dsv4_attention",
         )
@@ -948,25 +957,28 @@ mod real {
 
     /// Device-side Sinkhorn HC gate split: mix[6*n_hc] -> coef buffer
     /// (pre | post | comb in kernel layout), zero host round-trips.
-    pub fn dsv4_sinkhorn(coef: &mut DeviceBuf, mix: &DeviceBuf, scale: &DeviceBuf, base: &DeviceBuf, n_hc: u32, iters: u32, eps: f32) -> Result {
-        check(unsafe { pulsar_dsv4_sinkhorn(coef.ptr_mut(), mix.ptr(), scale.ptr(), base.ptr(), n_hc, iters, eps) }, "dsv4_sinkhorn")
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv4_sinkhorn(coef: &mut DeviceBuf, mix: &DeviceBuf, scale: &DeviceBuf, base: &DeviceBuf, n_hc: u32, iters: u32, eps: f32, n_tok: u32) -> Result {
+        check(unsafe { pulsar_dsv4_sinkhorn(coef.ptr_mut(), mix.ptr(), scale.ptr(), base.ptr(), n_hc, iters, eps, n_tok) }, "dsv4_sinkhorn")
     }
 
     /// hc_mix with device-resident coefficients (offsets into the
     /// sinkhorn coef buffer; blk_off -1 = no block gains).
     #[allow(clippy::too_many_arguments)]
-    pub fn dsv4_hc_mix_dev(out: &mut DeviceBuf, streams: &DeviceBuf, block: Option<&DeviceBuf>, coef: &DeviceBuf, st_off: u32, blk_off: i32, n_embd: u32, n_hc: u32, n_out: u32) -> Result {
-        check(unsafe { pulsar_dsv4_hc_mix_dev(out.ptr_mut(), streams.ptr(), block.map_or(std::ptr::null(), |b| b.ptr()), coef.ptr(), st_off, blk_off, n_embd, n_hc, n_out) }, "dsv4_hc_mix_dev")
+    pub fn dsv4_hc_mix_dev(out: &mut DeviceBuf, streams: &DeviceBuf, block: Option<&DeviceBuf>, coef: &DeviceBuf, st_off: u32, blk_off: i32, n_embd: u32, n_hc: u32, n_out: u32, n_tok: u32) -> Result {
+        check(unsafe { pulsar_dsv4_hc_mix_dev(out.ptr_mut(), streams.ptr(), block.map_or(std::ptr::null(), |b| b.ptr()), coef.ptr(), st_off, blk_off, n_embd, n_hc, n_out, n_tok) }, "dsv4_hc_mix_dev")
     }
 
     /// Streaming compressor step fully on-device; cache_row is the
     /// emit target (pass a dummy when emit is false).
     #[allow(clippy::too_many_arguments)]
-    pub fn dsv4_comp_step(state_kv: &mut DeviceBuf, state_sc: &mut DeviceBuf, cache_row: &mut DeviceBuf, cache_off: usize, kv_cur: &DeviceBuf, sc_cur: &DeviceBuf, ape: &DeviceBuf, norm: &DeviceBuf, width: u32, head_dim: u32, ratio: u32, pos: u32, emit: bool, is_idx: bool, rms_eps: f32, r: &RopeCfg) -> Result {
+    pub fn dsv4_comp_step(state_kv: &mut DeviceBuf, state_sc: &mut DeviceBuf, cache_row: &mut DeviceBuf, cache_off: usize, kv_cur: &DeviceBuf, sc_cur: &DeviceBuf, cur_off: usize, ape: &DeviceBuf, norm: &DeviceBuf, width: u32, head_dim: u32, ratio: u32, pos: u32, emit: bool, is_idx: bool, rms_eps: f32, r: &RopeCfg) -> Result {
         let row_ptr = unsafe { (cache_row.ptr_mut() as *mut u8).add(cache_off) as *mut c_void };
+        let kv_ptr = unsafe { (kv_cur.ptr() as *const u8).add(cur_off) as *const c_void };
+        let sc_ptr = unsafe { (sc_cur.ptr() as *const u8).add(cur_off) as *const c_void };
         check(
             unsafe {
-                pulsar_dsv4_comp_step(state_kv.ptr_mut(), state_sc.ptr_mut(), row_ptr, kv_cur.ptr(), sc_cur.ptr(), ape.ptr(), norm.ptr(), width, head_dim, ratio, pos, emit as u32, is_idx as u32, rms_eps, 64, r.n_ctx_orig, r.freq_base, r.freq_scale, r.ext_factor, r.attn_factor)
+                pulsar_dsv4_comp_step(state_kv.ptr_mut(), state_sc.ptr_mut(), row_ptr, kv_ptr, sc_ptr, ape.ptr(), norm.ptr(), width, head_dim, ratio, pos, emit as u32, is_idx as u32, rms_eps, 64, r.n_ctx_orig, r.freq_base, r.freq_scale, r.ext_factor, r.attn_factor)
             },
             "dsv4_comp_step",
         )

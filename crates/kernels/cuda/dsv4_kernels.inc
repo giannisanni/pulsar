@@ -178,14 +178,16 @@ extern "C" int pulsar_dsv4_attention(
  * Serial math on ONE thread: n_hc = 4, 20 iterations - nothing to
  * parallelize, correctness over elegance. */
 __global__ static void dsv4_sinkhorn_kernel(
-        float *coef,
-        const float *mix,
+        float *coef,        /* [n_tok][6*n_hc] */
+        const float *mix,   /* [n_tok][6*n_hc] */
         const float *scale, /* [3] */
         const float *base,  /* [6*n_hc] */
         uint32_t n_hc,
         uint32_t iters,
         float eps) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    if (threadIdx.x != 0) return;
+    coef += (uint64_t)blockIdx.x * 6u * n_hc;
+    mix += (uint64_t)blockIdx.x * 6u * n_hc;
     for (uint32_t i = 0; i < n_hc; i++) {
         coef[i] = 1.0f / (1.0f + expf(-(mix[i] * scale[0] + base[i]))) + eps;
         const uint32_t o = n_hc + i;
@@ -242,12 +244,13 @@ __global__ static void dsv4_sinkhorn_kernel(
 
 extern "C" int pulsar_dsv4_sinkhorn(
         void *coef_dev, const void *mix_dev, const void *scale_dev,
-        const void *base_dev, uint32_t n_hc, uint32_t iters, float eps) {
+        const void *base_dev, uint32_t n_hc, uint32_t iters, float eps,
+        uint32_t n_tok) {
     if (!coef_dev || !mix_dev || !scale_dev || !base_dev || n_hc == 0 ||
-        n_hc > 4u || iters == 0) {
+        n_hc > 4u || iters == 0 || n_tok == 0) {
         return 0;
     }
-    dsv4_sinkhorn_kernel<<<1, 32>>>(
+    dsv4_sinkhorn_kernel<<<n_tok, 32>>>(
             (float *)coef_dev, (const float *)mix_dev, (const float *)scale_dev,
             (const float *)base_dev, n_hc, iters, eps);
     return cuda_ok(cudaGetLastError(), "dsv4 sinkhorn launch");
@@ -255,6 +258,10 @@ extern "C" int pulsar_dsv4_sinkhorn(
 
 /* hc_mix variant reading its coefficients from DEVICE memory (the
  * sinkhorn output), so pre/post never round-trip the host. */
+/* Layouts are TOKEN-MAJOR: streams [n_tok][n_hc][n_embd], out
+ * [n_tok][n_out][n_embd] (n_out=1 collapses to [n_tok][n_embd]),
+ * block [n_tok][n_embd], coef [n_tok][6*n_hc]. Decode (n_tok=1)
+ * coincides with the old single-token layout. */
 __global__ static void dsv4_hc_mix_dev_kernel(
         float *out,
         const float *streams,
@@ -267,7 +274,11 @@ __global__ static void dsv4_hc_mix_dev_kernel(
         uint32_t n_out) {
     uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= n_embd) return;
-    float b = block ? block[d] : 0.0f;
+    const uint32_t tok = blockIdx.y;
+    streams += (uint64_t)tok * n_hc * n_embd;
+    out += (uint64_t)tok * n_out * n_embd;
+    coef += (uint64_t)tok * 6u * n_hc;
+    float b = block ? block[(uint64_t)tok * n_embd + d] : 0.0f;
     for (uint32_t j = 0; j < n_out; j++) {
         float acc = blk_off >= 0 ? coef[(uint32_t)blk_off + j] * b : 0.0f;
         for (uint32_t src = 0; src < n_hc; src++) {
@@ -280,12 +291,13 @@ __global__ static void dsv4_hc_mix_dev_kernel(
 extern "C" int pulsar_dsv4_hc_mix_dev(
         void *out_dev, const void *streams_dev, const void *block_dev,
         const void *coef_dev, uint32_t st_off, int blk_off,
-        uint32_t n_embd, uint32_t n_hc, uint32_t n_out) {
+        uint32_t n_embd, uint32_t n_hc, uint32_t n_out, uint32_t n_tok) {
     if (!out_dev || !streams_dev || !coef_dev || n_embd == 0 || n_hc == 0 ||
-        n_hc > 4u || n_out == 0 || n_out > 4u) {
+        n_hc > 4u || n_out == 0 || n_out > 4u || n_tok == 0) {
         return 0;
     }
-    dsv4_hc_mix_dev_kernel<<<(n_embd + 255u) / 256u, 256>>>(
+    dim3 grid((n_embd + 255u) / 256u, n_tok, 1);
+    dsv4_hc_mix_dev_kernel<<<grid, 256>>>(
             (float *)out_dev, (const float *)streams_dev,
             (const float *)block_dev, (const float *)coef_dev,
             st_off, blk_off, n_embd, n_hc, n_out);
