@@ -124,6 +124,7 @@ mod real {
         fn pulsar_qwen35_gdn_batch(out: *mut c_void, state: *mut c_void, q: *const c_void, k: *const c_void, v: *const c_void, g: *const c_void, beta: *const c_void, h_v: u32, h_k: u32, dim: u32, n_tok: u32) -> i32;
         fn pulsar_qwen35_row_scale(x: *mut c_void, s: *const c_void, n_rows: u32, dim: u32) -> i32;
         fn pulsar_qwen35_draft_attn(out: *mut c_void, q: *const c_void, k: *const c_void, v: *const c_void, n_q: u32, n_kv: u32, n_head: u32, n_kv_head: u32, dim: u32, scale: f32) -> i32;
+        fn pulsar_qwen35_rope_yarn(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, pos0: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32, n_ctx_orig: u32) -> i32;
         fn pulsar_qwen35_selftest() -> i32;
         fn pulsar_mla_kv_lora_rms_norm(out: *mut c_void, kv_raw: *const c_void, w: *const c_void, n_tok: u32, kv_raw_dim: u32, kv_lora_dim: u32, eps: f32) -> i32;
         fn pulsar_mla_store_compact_kv(kv_lora_cache: *mut c_void, k_rope_cache: *mut c_void, kv_norm: *const c_void, kv_raw: *const c_void, pos0: u32, n_tok: u32, cache_cap: u32, kv_raw_dim: u32, kv_lora_dim: u32, qk_rope: u32) -> i32;
@@ -992,6 +993,12 @@ mod real {
     #[allow(clippy::too_many_arguments)]
     pub fn qwen35_draft_attn(out: &mut DeviceBuf, q: &DeviceBuf, k: &DeviceBuf, v: &DeviceBuf, n_q: u32, n_kv: u32, n_head: u32, n_kv_head: u32, dim: u32, scale: f32) -> Result {
         check(unsafe { pulsar_qwen35_draft_attn(out.ptr_mut(), q.ptr(), k.ptr(), v.ptr(), n_q, n_kv, n_head, n_kv_head, dim, scale) }, "qwen35_draft_attn")
+    }
+
+    /// NEOX-paired YaRN rope over the full head (DFlash draft: trained
+    /// with rope_scaling yarn; ggml semantics via RopeCfg).
+    pub fn qwen35_rope_yarn(x: &mut DeviceBuf, n_tok: u32, n_head: u32, head_dim: u32, pos0: u32, r: &RopeCfg) -> Result {
+        check(unsafe { pulsar_qwen35_rope_yarn(x.ptr_mut(), n_tok, n_head, head_dim, pos0, r.freq_base, r.freq_scale, r.ext_factor, r.attn_factor, r.beta_fast, r.beta_slow, r.n_ctx_orig) }, "qwen35_rope_yarn")
     }
 
     pub fn qwen35_selftest() -> bool {

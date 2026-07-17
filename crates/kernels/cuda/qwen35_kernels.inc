@@ -403,6 +403,58 @@ extern "C" int pulsar_qwen35_draft_attn(
     return cuda_ok(cudaGetLastError(), "qwen35 draft attn launch");
 }
 
+/* NEOX-paired YaRN rope (DFlash draft: trained with rope_scaling yarn
+ * factor 64 / orig 4096 on theta 10M - plain rope smears its positions
+ * 64x). Pair (i, i+half); cos/sin from the mla yarn helpers (ggml
+ * semantics: pass attn_factor 1.0 and the kernel-internal
+ * 1 + 0.1 ln(1/freq_scale) supplies the HF mscale). */
+__global__ static void qwen35_rope_yarn_kernel(
+        float *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
+        uint32_t pos0, float freq_base, float freq_scale,
+        float ext_factor, float attn_factor, float beta_fast,
+        float beta_slow, uint32_t n_ctx_orig) {
+    const uint32_t half = head_dim / 2u;
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t pairs = n_tok * n_head * half;
+    if (gid >= pairs) return;
+    const uint32_t p = gid % half;
+    const uint32_t tmp = gid / half;
+    const uint32_t h = tmp % n_head;
+    const uint32_t tok = tmp / n_head;
+    float c0 = 0.0f, c1 = 0.0f;
+    if (ext_factor != 0.0f) {
+        mla_rope_corr_dims(head_dim, n_ctx_orig, freq_base,
+                           beta_fast, beta_slow, &c0, &c1);
+    }
+    const float theta_extrap = (float)(pos0 + tok) *
+        powf(freq_base, -2.0f * (float)p / (float)head_dim);
+    float cs, sn;
+    mla_rope_yarn(theta_extrap, freq_scale, c0, c1, (int)(2u * p),
+                  ext_factor, attn_factor, &cs, &sn);
+    float *row = x + ((uint64_t)tok * n_head + h) * head_dim;
+    const float x0 = row[p];
+    const float x1 = row[p + half];
+    row[p] = x0 * cs - x1 * sn;
+    row[p + half] = x0 * sn + x1 * cs;
+}
+
+extern "C" int pulsar_qwen35_rope_yarn(
+        void *x_dev, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
+        uint32_t pos0, float freq_base, float freq_scale, float ext_factor,
+        float attn_factor, float beta_fast, float beta_slow,
+        uint32_t n_ctx_orig) {
+    if (!x_dev || n_tok == 0 || n_head == 0 || head_dim == 0 ||
+        (head_dim & 1u) != 0) {
+        return 0;
+    }
+    const uint32_t pairs = n_tok * n_head * (head_dim / 2u);
+    qwen35_rope_yarn_kernel<<<(pairs + 255u) / 256u, 256>>>(
+            (float *)x_dev, n_tok, n_head, head_dim, pos0, freq_base,
+            freq_scale, ext_factor, attn_factor, beta_fast, beta_slow,
+            n_ctx_orig);
+    return cuda_ok(cudaGetLastError(), "qwen35 rope yarn launch");
+}
+
 /* ---- selftest ----------------------------------------------------------- */
 
 extern "C" int pulsar_qwen35_selftest(void) {

@@ -233,7 +233,7 @@ pub struct DraftModel {
     n_head: u32,
     n_kv: u32,
     head_dim: u32,
-    rope_base: f32,
+    rope: kernels::RopeCfg,
     n_embd: u32,
     ff: u32,
     // scratch
@@ -275,6 +275,39 @@ impl DraftModel {
             .arch_meta("rope.freq_base")
             .and_then(gguf::Value::as_f32)
             .unwrap_or(10_000_000.0);
+        // the z-lab draft is TRAINED with yarn (factor 64 / orig 4096);
+        // ggml semantics: attn_factor 1.0, the kernel-internal
+        // 1 + 0.1 ln(1/freq_scale) supplies the HF mscale
+        let yarn_factor = g
+            .arch_meta("rope.scaling.factor")
+            .and_then(gguf::Value::as_f32)
+            .unwrap_or(1.0);
+        let rope = if yarn_factor > 1.0 {
+            kernels::RopeCfg {
+                n_ctx_orig: g
+                    .arch_meta("rope.scaling.original_context_length")
+                    .and_then(gguf::Value::as_u64)
+                    .unwrap_or(4096) as u32,
+                freq_base: rope_base,
+                freq_scale: 1.0 / yarn_factor,
+                ext_factor: 1.0,
+                attn_factor: 1.0,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                kq_mult: 1.0,
+            }
+        } else {
+            kernels::RopeCfg {
+                n_ctx_orig: 0,
+                freq_base: rope_base,
+                freq_scale: 1.0,
+                ext_factor: 0.0,
+                attn_factor: 1.0,
+                beta_fast: 0.0,
+                beta_slow: 0.0,
+                kq_mult: 1.0,
+            }
+        };
         let layer_ids: Vec<usize> = match g.arch_meta("dflash.target_layer_ids") {
             Some(gguf::Value::Array(a)) => {
                 a.iter().filter_map(gguf::Value::as_u64).map(|v| v as usize).collect()
@@ -317,7 +350,7 @@ impl DraftModel {
             n_head,
             n_kv,
             head_dim,
-            rope_base,
+            rope,
             n_embd,
             ff,
             feat_in: f32s(RING_CAP * n_cap * n_embd as usize)?,
@@ -579,8 +612,8 @@ impl Model {
             kernels::matmul_q8_0(&mut d.q, &l.wq, &d.hn, s.n_embd, q_dim, bs as u32)?;
             kernels::gqa_head_rms_norm(&mut d.q, Some(&l.q_norm), bs as u32 * d.n_head, d.head_dim, eps)?;
             // plain neox rope, full head, rebased positions
-            kernels::gqa_rope(&mut d.kcat, total_k, d.n_kv, d.head_dim, d.head_dim, 0, d.rope_base, None)?;
-            kernels::gqa_rope(&mut d.q, bs as u32, d.n_head, d.head_dim, d.head_dim, w_eff as u32, d.rope_base, None)?;
+            kernels::qwen35_rope_yarn(&mut d.kcat, total_k, d.n_kv, d.head_dim, 0, &d.rope)?;
+            kernels::qwen35_rope_yarn(&mut d.q, bs as u32, d.n_head, d.head_dim, w_eff as u32, &d.rope)?;
             // non-causal attention over all context + block rows
             kernels::qwen35_draft_attn(
                 &mut d.attn, &d.q, &d.kcat, &d.vcat,
