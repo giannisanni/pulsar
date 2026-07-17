@@ -35,7 +35,7 @@ Gen5 NVMe.
 | Model | Total | Active / token | gguf | Decode, warm | vs ds4, same box |
 |---|---|---|---|---|---|
 | Gemma 4 26B-A4B | 26B | 4B | 16GB (Q4_K_XL) | **41 tok/s** | – |
-| Qwen3.6-35B-A3B | 35B | 3B (top-8 of 256 + shared) | 17GB (Q3_K_XL) | **33.5 tok/s** | – |
+| Qwen3.6-35B-A3B | 35B | 3B (top-8 of 256 + shared) | 17GB (Q3_K_XL) | **35.8 tok/s** | – |
 | DeepSeek-V4-Flash | 284B | ~8B (top-6 of 256 + shared) | 87GB (ds4 recipe) | **5.9 tok/s** | – |
 | Hy3 295B | 295B | 21B (top-8 of 192) | 79GB (IQ2_XXS) | **5.3 tok/s** | 0.64–0.70 |
 | Qwen3-235B-A22B | 235B | 22B (top-8 of 128) | 83GB (Q2_K_XL) | **4.6 tok/s** | – |
@@ -309,8 +309,24 @@ DeepSeek-V4-Flash (deepseek4): hyper-connection residual streams,
 streaming compressed KV + sink attention, indexer QAT top-k, token-id
 hash routing.
 
+Also done, honestly measured: DFlash block-diffusion speculative
+decoding for Qwen3.6 (the lucebox recipe: a 515MB matched draft
+proposes 16 tokens conditioned on 5 captured target hidden states, one
+batched target forward verifies the block, recurrent state snapshots
+roll back rejections). The machinery works - structured text accepts
+whole 16-blocks - but it ships opt-in experimental
+(`PULSAR_DFLASH=draft.gguf`) because on the reference box it is
+net-slower: each verify unions ~110 distinct experts per layer where
+sequential decode touches 8, and that union streams over PCIe while
+sequential decode rides a 94%-hit VRAM cache. Same law MTP taught:
+speculation pays when the verify union is weight-resident. The flip is
+scoped: expert tiers on the second GPU serve the union at VRAM speed.
+
 Not yet:
 
+- DFlash perf pass: tier-aware expert resolve for the hybrid families
+  (~14GB of experts fit the spare 16GB card whole), draft context-KV
+  ring, fast GDN rollback
 - deepseek4 perf pass: batched prefill (prompts currently process
   sequentially), resident tiers + cross-layer prefetch for the dsv4
   resolve, fewer host syncs on the hyper-connection gates
@@ -319,10 +335,6 @@ Not yet:
   unpacker per format)
 - shard-streaming quantize in `pulsar-quant` (fetch → quantize → delete,
   for BF16 sources bigger than the disk)
-- DFlash speculative decoding for Qwen3.6 (matched block-diffusion
-  draft + tree verify, the lucebox recipe): 6-8 accepted tokens per
-  round on a model whose weights already sit in cache is the regime
-  where speculation finally pays here
 
 ## License
 
