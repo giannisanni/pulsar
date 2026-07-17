@@ -2520,6 +2520,42 @@ __global__ static void matmul_kq_kernel(
     if (lane == 0) out[(uint64_t)token * out_dim + row] = acc;
 }
 
+/* Token-tiled variant: one warp owns a row for ALL TT tokens, so the
+ * row bytes are read once (L1-hot across the register token loop)
+ * instead of once per token - on a 248k-row lm head the legacy grid
+ * re-reads ~417MB per token (DFlash verify/draft: 6.7GB per call). */
+template <typename DOT, int TT>
+__global__ static void matmul_kq_tokens_kernel(
+        float *out,
+        const char *w,
+        const block_q8_K *xq,
+        uint32_t in_blocks,
+        uint32_t out_dim,
+        uint64_t row_bytes) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= out_dim) return;
+    const char *wr = w + (uint64_t)row * row_bytes;
+    float acc[TT];
+    #pragma unroll
+    for (int t = 0; t < TT; t++) acc[t] = 0.0f;
+    for (uint32_t b = lane; b < in_blocks; b += 32u) {
+        #pragma unroll
+        for (int t = 0; t < TT; t++) {
+            acc[t] += DOT::block(wr, xq + (uint64_t)t * in_blocks, b);
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < TT; t++) {
+        float a = acc[t];
+        #pragma unroll
+        for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
+            a += __shfl_xor_sync(0xffffffffu, a, mask);
+        }
+        if (lane == 0) out[(uint64_t)t * out_dim + row] = a;
+    }
+}
+
 extern "C" int pulsar_matmul_kq(
         void *out_dev,
         const void *w_dev,
@@ -2534,6 +2570,27 @@ extern "C" int pulsar_matmul_kq(
     }
     const uint32_t in_blocks = in_dim / PULSAR_QK_K;
     dim3 block(32, 4, 1);
+    /* verify/draft-sized batches take the token-tiled kernel: one row
+     * read serves all 16 tokens (identical math, per-token order) */
+    if (n_tok == 16u) {
+        dim3 tgrid((out_dim + 3u) / 4u, 1, 1);
+        switch (quant) {
+#define PULSAR_KQ16(Q, DOT)                                                    \
+        case Q:                                                                \
+            matmul_kq_tokens_kernel<DOT, 16><<<tgrid, block>>>(                \
+                    (float *)out_dev, (const char *)w_dev,                     \
+                    (const block_q8_K *)xq_dev, in_blocks, out_dim, row_bytes); \
+            return cuda_ok(cudaGetLastError(), "matmul_kq16 launch")
+        PULSAR_KQ16(PULSAR_QUANT_Q2_K, dot_q2_K);
+        PULSAR_KQ16(PULSAR_QUANT_IQ2_XXS, dot_iq2_xxs);
+        PULSAR_KQ16(PULSAR_QUANT_Q4_K, dot_q4_K);
+        PULSAR_KQ16(PULSAR_QUANT_Q5_K, dot_q5_K);
+        PULSAR_KQ16(PULSAR_QUANT_Q6_K, dot_q6_K);
+        PULSAR_KQ16(PULSAR_QUANT_Q3_K, dot_q3_K);
+#undef PULSAR_KQ16
+        default: return 0;
+        }
+    }
     dim3 grid((out_dim + 3u) / 4u, n_tok, 1);
     switch (quant) {
     case PULSAR_QUANT_Q2_K:
