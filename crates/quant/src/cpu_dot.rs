@@ -72,11 +72,11 @@ fn sign_mask(s7: u32) -> u32 {
 pub fn vec_dot_iq2_xxs_q8_k(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx512bw")
-            && std::arch::is_x86_feature_detected!("avx512vnni")
-        {
-            return unsafe { avx512::vec_dot(row, x, n) };
-        }
+        // AVX-512 VNNI was tried and measured SLOWER (2.1 vs 4.8 GB/s
+        // single-thread on the 9900X: zmm assembly from 8 scattered grid
+        // loads + scalar sign-mask chain stalls it), and the aggregate is
+        // RAM-bound at 12 threads anyway - AVX2 is the keeper (git log
+        // has the kernel if wider tables ever change the math)
         if std::arch::is_x86_feature_detected!("avx2") {
             return unsafe { avx2::vec_dot(row, x, n) };
         }
@@ -184,69 +184,6 @@ mod avx2 {
             let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b0100_1110));
             let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b1011_0001));
             let bsum = _mm_cvtsi128_si32(s);
-            total += 0.125 * xd * *x.d.get_unchecked(ibl) * bsum as f32;
-        }
-        total
-    }
-}
-
-/// AVX-512 VNNI path: two 32-value sub-blocks per zmm. Signs come in as
-/// an __mmask64 (no vpsignb in AVX-512; mask_sub negates the flagged q8
-/// bytes), vpdpbusd does grid_u8 x q8_i8 straight into i32 lanes (4x u8
-/// x i8 products max 4*43*127 fits, non-saturating variant), and a per-
-/// pair mullo applies the two sub-block scales via a split ls vector.
-/// Same exact integer bsum and float order as scalar = bitwise.
-#[cfg(target_arch = "x86_64")]
-mod avx512 {
-    use super::*;
-    use std::arch::x86_64::*;
-
-    #[inline]
-    fn rd32(b: &[u8], o: usize) -> u32 {
-        u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
-    }
-
-    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
-    pub unsafe fn vec_dot(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
-        let t = tables();
-        let nb = n / QK_K;
-        debug_assert!(row.len() >= nb * IQ2_XXS_BLOCK_BYTES);
-        let mut total = 0f32;
-        for ibl in 0..nb {
-            let blk = &row[ibl * IQ2_XXS_BLOCK_BYTES..(ibl + 1) * IQ2_XXS_BLOCK_BYTES];
-            let xd = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
-            let q8 = x.qs.as_ptr().add(ibl * QK_K);
-            let mut acc = _mm512_setzero_si512();
-            for p in 0..QK_K / 64 {
-                let (a, b) = (2 * p, 2 * p + 1);
-                let (a0a, a1a) = (rd32(blk, 2 + 8 * a), rd32(blk, 6 + 8 * a));
-                let (a0b, a1b) = (rd32(blk, 2 + 8 * b), rd32(blk, 6 + 8 * b));
-                let grid = _mm512_set_epi64(
-                    t.grid[((a0b >> 24) & 0xff) as usize] as i64,
-                    t.grid[((a0b >> 16) & 0xff) as usize] as i64,
-                    t.grid[((a0b >> 8) & 0xff) as usize] as i64,
-                    t.grid[(a0b & 0xff) as usize] as i64,
-                    t.grid[((a0a >> 24) & 0xff) as usize] as i64,
-                    t.grid[((a0a >> 16) & 0xff) as usize] as i64,
-                    t.grid[((a0a >> 8) & 0xff) as usize] as i64,
-                    t.grid[(a0a & 0xff) as usize] as i64,
-                );
-                let mut m = 0u64;
-                for k in 0..4 {
-                    m |= (sign_mask((a1a >> (7 * k)) & 127) as u64) << (8 * k);
-                    m |= (sign_mask((a1b >> (7 * k)) & 127) as u64) << (32 + 8 * k);
-                }
-                let q8v = _mm512_loadu_si512(q8.add(64 * p) as *const _);
-                let q8s = _mm512_mask_sub_epi8(q8v, m, _mm512_setzero_si512(), q8v);
-                let dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), grid, q8s);
-                let ls = _mm512_inserti64x4(
-                    _mm512_castsi256_si512(_mm256_set1_epi32((2 * (a1a >> 28) + 1) as i32)),
-                    _mm256_set1_epi32((2 * (a1b >> 28) + 1) as i32),
-                    1,
-                );
-                acc = _mm512_add_epi32(acc, _mm512_mullo_epi32(dot, ls));
-            }
-            let bsum = _mm512_reduce_add_epi32(acc);
             total += 0.125 * xd * *x.d.get_unchecked(ibl) * bsum as f32;
         }
         total
