@@ -899,6 +899,7 @@ impl Model {
     /// eval_layer's resolve when the dsv4 perf pass starts.
     pub(super) fn dsv4_moe(&self, st: &mut State, selected: &[i32], gate_exps: &super::ExpertTensor, up_exps: &super::ExpertTensor, down_exps: &super::ExpertTensor, act_op: u32, n_tok: u32) -> Result {
         let s = self.shape;
+        let primary = kernels::get_device();
         let mut distinct: Vec<i32> = selected
             .iter()
             .copied()
@@ -906,8 +907,35 @@ impl Model {
             .collect();
         distinct.sort_unstable();
         distinct.dedup();
+        // resident-tier experts compute on their own card (the whole
+        // point for the hybrid families: a 16-row verify union served
+        // at VRAM speed instead of streaming over PCIe every round)
+        let mut tier_map: std::collections::HashMap<i32, (usize, kernels::ExpertPtrs)> =
+            std::collections::HashMap::new();
+        for &e in &distinct {
+            let g_off = gate_exps.abs_offset + e as u64 * gate_exps.expert_bytes;
+            let u_off = up_exps.abs_offset + e as u64 * up_exps.expert_bytes;
+            let d_off = down_exps.abs_offset + e as u64 * down_exps.expert_bytes;
+            for (ti, t) in st.tiers.iter().enumerate() {
+                if let (Some(&g), Some(&u), Some(&d)) =
+                    (t.map.get(&g_off), t.map.get(&u_off), t.map.get(&d_off))
+                {
+                    tier_map.insert(e, (ti, kernels::ExpertPtrs { gate: g, up: u, down: d }));
+                    break;
+                }
+            }
+        }
         let mut offsets = Vec::with_capacity(3 * distinct.len());
         for &e in &distinct {
+            if tier_map.contains_key(&e) {
+                // keep the census warm for resident slabs or their heat
+                // freezes at placement time
+                for t in [gate_exps, up_exps, down_exps] {
+                    let off = t.abs_offset + e as u64 * t.expert_bytes;
+                    st.dev_cache.touch.entry(off).or_insert((0, t.expert_bytes)).0 += 1;
+                }
+                continue;
+            }
             for t in [gate_exps, up_exps, down_exps] {
                 offsets.push(stream::Read {
                     offset: t.abs_offset + e as u64 * t.expert_bytes,
@@ -959,9 +987,21 @@ impl Model {
             Ok(())
         })?;
         let mut ptrs = Vec::with_capacity(selected.len());
-        for &e in selected {
+        let mut tptrs: Vec<Vec<kernels::ExpertPtrs>> = st
+            .tiers
+            .iter()
+            .map(|_| vec![kernels::ExpertPtrs::NULL; selected.len()])
+            .collect();
+        let mut tier_slots = vec![0u64; st.tiers.len()];
+        for (si, &e) in selected.iter().enumerate() {
             if e < 0 || e as u32 >= s.n_expert {
                 ptrs.push(kernels::ExpertPtrs::NULL);
+                continue;
+            }
+            if let Some(&(ti, tp)) = tier_map.get(&e) {
+                ptrs.push(kernels::ExpertPtrs::NULL);
+                tptrs[ti][si] = tp;
+                tier_slots[ti] += 1;
                 continue;
             }
             ptrs.push(kernels::ExpertPtrs {
@@ -971,6 +1011,37 @@ impl Model {
             });
         }
         st.expert_ptrs.write(0, kernels::as_bytes(&ptrs))?;
+
+        // tier partials first: their kernels run on the other card,
+        // overlapping the primary's MoE below (st.normed still holds
+        // the FFN input in both hybrid layer graphs)
+        let mut active = Vec::new();
+        for ti in 0..st.tiers.len() {
+            if tier_slots[ti] == 0 {
+                continue;
+            }
+            let normed_bytes = (n_tok * s.n_embd) as usize * 4;
+            let weight_bytes = (n_tok * s.n_expert_used) as usize * 4;
+            let tier = &mut st.tiers[ti];
+            tier.hits += tier_slots[ti];
+            kernels::copy_across(&mut tier.xin, &st.normed, normed_bytes)?;
+            kernels::copy_across(&mut tier.weights, &st.router_weights, weight_bytes)?;
+            kernels::set_device(tier.dev)?;
+            tier.ptrs.write(0, kernels::as_bytes(&tptrs[ti]))?;
+            kernels::quantize_q8_k(&mut tier.xq, &tier.xin, s.n_embd, n_tok)?;
+            kernels::moe_pair_swiglu(
+                &mut tier.mid, &tier.ptrs, &tier.weights, &tier.xq,
+                s.n_embd, s.n_ff_exp, s.n_expert_used, n_tok, gate_exps.row_bytes, gate_exps.quant, act_op,
+            )?;
+            kernels::quantize_q8_k(&mut tier.midq, &tier.mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
+            kernels::moe_down(
+                &mut tier.out, &tier.ptrs, &tier.midq,
+                s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
+            )?;
+            kernels::set_device(primary)?;
+            active.push(ti);
+        }
+
         // router weight applies before the down projection (ds4 order);
         // act_op 3 = deepseek4 clamped silu, 0 = plain silu (qwen35)
         kernels::moe_pair_swiglu(
@@ -982,6 +1053,19 @@ impl Model {
             &mut st.moe_out, &st.expert_ptrs, &st.midq,
             s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
         )?;
+
+        // gather tier partials (blocking copy issued on the tier device
+        // = ordered after its kernels). NOTE: summing partials reorders
+        // float adds vs the single-device loop - the documented tier
+        // drift class; PULSAR_TIERS=off restores exact.
+        for ti in active {
+            let n = (n_tok * s.n_embd) as usize * 4;
+            let tier = &st.tiers[ti];
+            kernels::set_device(tier.dev)?;
+            kernels::copy_across(&mut st.tier_ret, &tier.out, n)?;
+            kernels::set_device(primary)?;
+            kernels::add_assign(&mut st.moe_out, &st.tier_ret, n_tok * s.n_embd)?;
+        }
         Ok(())
     }
 }

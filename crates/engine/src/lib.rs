@@ -2288,11 +2288,7 @@ mod real {
         if std::env::var("PULSAR_TIERS").ok().as_deref() == Some("off") {
             return Ok(Vec::new());
         }
-        if matches!(s.family, Family::Dsv4 | Family::Qwen35) {
-            // ponytail: the lean hybrid-family resolve doesn't consult
-            // tiers yet - loading them would park dead weight
-            return Ok(Vec::new());
-        }
+
         // dedicated cards first; the attn card joins LAST with whatever
         // VRAM the resident attn stack left over (the free-space check
         // below decides if that's worth a tier)
