@@ -1075,6 +1075,9 @@ impl Model {
             act_op,
         );
         let mut cpu_guard: Option<super::cpu_tier::WaitGuard> = None;
+        // PULSAR_CPU_STEAL=0: leave dev-cache-resident experts to the GPU
+        // (see the eval_layer seam for the tradeoff)
+        let cpu_steal = std::env::var("PULSAR_CPU_STEAL").ok().as_deref() != Some("0");
         if cpu_on {
             let mut pins = Vec::new();
             for &e in &distinct {
@@ -1084,6 +1087,13 @@ impl Model {
                 let go = gate_exps.abs_offset + e as u64 * gate_exps.expert_bytes;
                 let uo = up_exps.abs_offset + e as u64 * up_exps.expert_bytes;
                 let dno = down_exps.abs_offset + e as u64 * down_exps.expert_bytes;
+                if !cpu_steal
+                    && (st.dev_cache.map.contains_key(&go)
+                        || st.dev_cache.map.contains_key(&uo)
+                        || st.dev_cache.map.contains_key(&dno))
+                {
+                    continue;
+                }
                 if self.mtp.as_ref().is_some_and(|mt| mt.res_map.contains_key(&go)) {
                     continue;
                 }
