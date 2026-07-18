@@ -44,7 +44,7 @@ Gen5 NVMe.
 | Qwen3-235B-A22B | 235B | 22B (top-8 of 128) | 83GB (Q2_K_XL) | **5.3 tok/s** (6.4 w/ CPU lane) | – |
 | MiniMax M3 | 428B | 23B | 134GB (Q2_K_XL) | **4.5 tok/s** (4.9 w/ CPU lane) | – |
 | GLM-5.2 | 744B | 40B | 211GB (ds4 recipe) | **1.7 tok/s** (1.9–2.8 w/ CPU lane) | 0.40 |
-| TML Inkling | 975B | 41B (6 + 2 shared) | 296GB (Q2_K_XL) | **1.6 tok/s** | – |
+| TML Inkling | 975B | 41B (6 + 2 shared) | 296GB (Q2_K_XL) | **1.6 tok/s** (1.75 w/ CPU lane) | – |
 | Kimi K2.7 Code† | ~1T | 32B | 339GB (Q2_K_XL) | **1.3 tok/s** | – |
 
 All figures are sustained warm decode at n=64, temp 0, second run onward.
@@ -89,9 +89,9 @@ DeepSeek-V4-Flash measures 8.1 to 11.4 tok/s (+41%), Hy3 5.0 to 7.0
 to run with how the cache ecology settles (the floor stays at
 baseline). Covers iq2_xxs, iq2_xs, iq3_xxs, q2_K, q3_K and q4_K
 expert tensors, which spans the ds4 recipes and the UD-Q2_K_XL mixes:
-Qwen3-235B 5.3 to 6.4 (+21%), MiniMax M3 4.7 to 4.9 (its IQ mix
-engages on 54 of 57 MoE layers; the three iq4_xs-down layers stay on
-the GPU).
+Qwen3-235B 5.3 to 6.4 (+21%), TML Inkling 1.63 to 1.75 (+7%),
+MiniMax M3 4.7 to 4.9 (its IQ mix engages on 54 of 57 MoE layers; the
+three iq4_xs-down layers stay on the GPU).
 
 Decode rate slides with output length on the streaming models: a longer
 generation routes to a wider set of experts, so the disk-miss fraction
