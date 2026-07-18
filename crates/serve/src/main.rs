@@ -200,6 +200,9 @@ fn handle_chat(
     let streaming = req["stream"].as_bool().unwrap_or(false);
 
     let prompt = encode_messages(tok, markers, messages);
+    if std::env::var_os("PULSAR_DEBUG_IDS").is_some() {
+        eprintln!("pulsar-serve: prompt ids {prompt:?}");
+    }
     if prompt.len() as u32 + 2 >= st.ctx() {
         return respond_json(
             stream,
