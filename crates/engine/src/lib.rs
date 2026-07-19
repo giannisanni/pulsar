@@ -5435,13 +5435,22 @@ mod real {
         } else {
             st.max_batch() as usize
         };
+        let prof_chunks = std::env::var_os("PULSAR_PROFILE").is_some();
         for chunk in prompt.chunks(chunk_cap) {
             if cancel() {
                 return Ok(pos);
             }
+            let t0 = std::time::Instant::now();
             logits = model.forward_batch(st, chunk, pos, true)?;
             if spec {
                 model.mtp_prefill_fill(st, chunk.len() as u32, pos)?;
+            }
+            if prof_chunks {
+                eprintln!(
+                    "pulsar: prefill chunk @{pos} len {} in {:.2}s",
+                    chunk.len(),
+                    t0.elapsed().as_secs_f64()
+                );
             }
             pos += chunk.len() as u32;
         }
