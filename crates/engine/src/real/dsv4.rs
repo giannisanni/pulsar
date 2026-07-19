@@ -856,6 +856,17 @@ impl Model {
         kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, t, eps)?;
         kernels::matmul_q8_0(&mut st.q_rank, &w.q_a, &st.normed, s.n_embd, s.n_lora_q, t)?;
         kernels::rms_norm(&mut st.q_rank_norm, &st.q_rank, &w.q_a_norm, s.n_lora_q, t, eps)?;
+        if std::env::var_os("PULSAR_HID_LOG").is_some() && (2030..2053).contains(&(pos0 + t - 1)) {
+            kernels::sync()?;
+            let rows = st.normed.read_f32(t as usize * s.n_embd as usize)?;
+            for i in 0..t as usize {
+                let mut h = 0u64;
+                for &v in &rows[i * s.n_embd as usize..(i + 1) * s.n_embd as usize] {
+                    h = h.wrapping_mul(1099511628211).wrapping_add(v.to_bits() as u64);
+                }
+                eprintln!("hid L{il} @{} h={h:x}", pos0 + i as u32);
+            }
+        }
         kernels::matmul_q8_0(&mut st.q, &w.q_b, &st.q_rank_norm, s.n_lora_q, q_dim, t)?;
         kernels::gqa_head_rms_norm(&mut st.q, None, t * s.n_head, s.head_dim, eps)?;
         kernels::matmul_q8_0(&mut st.k, &w.kv, &st.normed, s.n_embd, s.head_dim, t)?;
