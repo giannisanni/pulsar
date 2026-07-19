@@ -4672,6 +4672,16 @@ mod real {
                                 ) else {
                                     continue;
                                 };
+                                // PULSAR_CPU_CAP: bound lane experts per
+                                // layer (bisection tool for the GLM loop)
+                                if let Some(cap) = std::env::var("PULSAR_CPU_CAP")
+                                    .ok()
+                                    .and_then(|v| v.parse::<usize>().ok())
+                                {
+                                    if lane.idx.len() >= cap {
+                                        continue;
+                                    }
+                                }
                                 lane.add(e, gp.0, unsafe { upp.0.add(*fused_up_off as usize) }, dp.0);
                                 pins.extend([go, uo, dno]);
                             }
