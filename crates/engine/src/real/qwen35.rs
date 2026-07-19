@@ -15,8 +15,18 @@
 //! makes DFlash verify (16 candidate rows for the cost of a few
 //! sequential tokens) and chunked prefill work.
 
-use super::{Attn, Ffn, LayerW, Model, Result, State};
+use super::{Attn, Ffn, LayerW, MatW, Model, Result, State};
 use kernels::DeviceBuf;
+
+/// Matmul over either weight encoding. `x` is the f32 input; `xq` must
+/// hold its q8_K quantization when the weight is K-quant (callers
+/// quantize once per distinct input).
+fn matw(out: &mut DeviceBuf, w: &MatW, x: &DeviceBuf, xq: &DeviceBuf, in_dim: u32, out_dim: u32, t: u32) -> Result {
+    match w {
+        MatW::Q8(b) => kernels::matmul_q8_0(out, b, x, in_dim, out_dim, t),
+        MatW::Kq(k) => kernels::matmul_kq(out, &k.w, xq, in_dim, out_dim, t, k.row_bytes, k.quant),
+    }
+}
 
 /// Verify/prefill chunk width (DFlash block size; also the register
 /// budget the batched GDN kernel was written for).
@@ -696,14 +706,14 @@ impl Model {
 
         if let Some(gdn) = &w.gdn {
             // ---- Gated DeltaNet (recurrences loop inside the launches)
-            kernels::matmul_q8_0(&mut rt.qkv, &gdn.wqkv, &st.normed, s.n_embd, conv_dim, t)?;
-            if dbg {
-                eprintln!("  qkv {:?} z {:?}", &rt.qkv.read_f32(2)?, {
-                    kernels::matmul_q8_0(&mut rt.z, &gdn.wz, &st.normed, s.n_embd, value_dim, t)?;
-                    rt.z.read_f32(2)?
-                });
+            if matches!(gdn.wqkv, MatW::Kq(_)) {
+                kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
             }
-            kernels::matmul_q8_0(&mut rt.z, &gdn.wz, &st.normed, s.n_embd, value_dim, t)?;
+            matw(&mut rt.qkv, &gdn.wqkv, &st.normed, &st.xq, s.n_embd, conv_dim, t)?;
+            matw(&mut rt.z, &gdn.wz, &st.normed, &st.xq, s.n_embd, value_dim, t)?;
+            if dbg {
+                eprintln!("  qkv {:?} z {:?}", &rt.qkv.read_f32(2)?, &rt.z.read_f32(2)?);
+            }
             // g/beta coefficients fully on-device (no host readbacks)
             kernels::matmul_f32(&mut rt.g, &gdn.alpha_w, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
             kernels::matmul_f32(&mut rt.beta, &gdn.beta_w, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
@@ -740,16 +750,22 @@ impl Model {
             }
             kernels::gqa_head_rms_norm(&mut rt.gdn_o, Some(&gdn.ssm_norm), t * s.ssm_v_heads, s.ssm_state, eps)?;
             kernels::swiglu(&mut rt.gdn_tmp, &rt.z, &rt.gdn_o, t * value_dim, 0.0, 1.0, 0)?;
-            kernels::matmul_q8_0(&mut st.attn_out, &gdn.ssm_out, &rt.gdn_tmp, value_dim, s.n_embd, t)?;
+            if matches!(gdn.ssm_out, MatW::Kq(_)) {
+                kernels::quantize_q8_k(&mut st.midq, &rt.gdn_tmp, value_dim, t)?;
+            }
+            matw(&mut st.attn_out, &gdn.ssm_out, &rt.gdn_tmp, &st.midq, value_dim, s.n_embd, t)?;
         } else if let Some(attn) = &w.attn {
             // ---- sigmoid-gated full attention (partial neox rope)
             let hd = s.head_dim;
-            kernels::matmul_q8_0(&mut rt.qfull, &attn.wq, &st.normed, s.n_embd, 2 * s.n_head * hd, t)?;
+            if matches!(attn.wq, MatW::Kq(_)) {
+                kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
+            }
+            matw(&mut rt.qfull, &attn.wq, &st.normed, &st.xq, s.n_embd, 2 * s.n_head * hd, t)?;
             // per-token rows are contiguous: treat (token, head) as one
             // flat head axis for the strided split
             kernels::qwen35_split_gate(&mut st.q, &mut rt.gate, &rt.qfull, t * s.n_head, hd)?;
-            kernels::matmul_q8_0(&mut st.k, &attn.wk, &st.normed, s.n_embd, s.n_head_kv * hd, t)?;
-            kernels::matmul_q8_0(&mut st.v, &attn.wv, &st.normed, s.n_embd, s.n_head_kv * hd, t)?;
+            matw(&mut st.k, &attn.wk, &st.normed, &st.xq, s.n_embd, s.n_head_kv * hd, t)?;
+            matw(&mut st.v, &attn.wv, &st.normed, &st.xq, s.n_embd, s.n_head_kv * hd, t)?;
             kernels::gqa_head_rms_norm(&mut st.q, Some(&attn.q_norm), t * s.n_head, hd, eps)?;
             kernels::gqa_head_rms_norm(&mut st.k, Some(&attn.k_norm), t * s.n_head_kv, hd, eps)?;
             kernels::gqa_rope(&mut st.q, t, s.n_head, hd, s.rot_dim, pos, s.rope_freq_base, None)?;
@@ -762,7 +778,10 @@ impl Model {
                 1.0 / (hd as f32).sqrt(), 0, None, 0, 0,
             )?;
             kernels::qwen35_sigmoid_gate(&mut st.heads, &rt.gate, t * s.n_head * hd)?;
-            kernels::matmul_q8_0(&mut st.attn_out, &l.attn_output, &st.heads, s.n_head * hd, s.n_embd, t)?;
+            if matches!(attn.out, MatW::Kq(_)) {
+                kernels::quantize_q8_k(&mut st.midq, &st.heads, s.n_head * hd, t)?;
+            }
+            matw(&mut st.attn_out, &attn.out, &st.heads, &st.midq, s.n_head * hd, s.n_embd, t)?;
         } else {
             return Err("qwen35 layer with neither attn nor gdn".into());
         }

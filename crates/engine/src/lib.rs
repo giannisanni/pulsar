@@ -475,6 +475,32 @@ mod real {
         quant: u32,
     }
 
+    /// A matmul weight in whichever encoding the file made cheap to run:
+    /// q8_0 (matmul_q8_0 on f32 activations) or native K-quant
+    /// (matmul_kq on q8_K activations - half the bytes of the q8_0
+    /// requant for a Q4_K file). qwen35 only.
+    enum MatW {
+        Q8(DeviceBuf),
+        Kq(KqW),
+    }
+
+    impl MatW {
+        /// True when this tensor should stay native: a K-quant with a
+        /// warp-cooperative dot and a 256-divisible contraction dim.
+        fn keep_native(t: &TensorInfo) -> bool {
+            matches!(t.ty, TensorType::Q4K | TensorType::Q6K) && t.dims[0] % 256 == 0
+        }
+
+        fn load(file: &VFile, g: &Gguf, name: &str) -> Result<MatW> {
+            let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
+            if Self::keep_native(t) {
+                Ok(MatW::Kq(upload_kq(file, g, name)?))
+            } else {
+                Ok(MatW::Q8(upload(file, g, name)?))
+            }
+        }
+    }
+
     enum Ffn {
         Dense {
             gate: DeviceBuf,
@@ -591,17 +617,20 @@ mod real {
     /// Full-attention layer (every full_attn_interval-th): the q
     /// projection is fused per head [q head_dim | gate head_dim].
     struct Qwen35Attn {
-        wq: DeviceBuf, // q8_0 [n_embd -> 2*n_head*head_dim]
-        wk: DeviceBuf, // q8_0 [n_embd -> n_kv*head_dim]
-        wv: DeviceBuf,
+        wq: MatW, // [n_embd -> 2*n_head*head_dim]
+        wk: MatW, // [n_embd -> n_kv*head_dim]
+        wv: MatW,
+        /// output projection [n_head*head_dim -> n_embd] (LayerW's
+        /// attn_output slot stays a dummy for qwen35)
+        out: MatW,
         q_norm: DeviceBuf, // f32 [head_dim]
         k_norm: DeviceBuf,
     }
 
     /// Gated DeltaNet layer: conv window + delta-rule state, no KV.
     struct Qwen35Gdn {
-        wqkv: DeviceBuf, // q8_0 [n_embd -> 2*key_dim + value_dim]
-        wz: DeviceBuf,   // q8_0 [n_embd -> value_dim] (attn_gate)
+        wqkv: MatW, // [n_embd -> 2*key_dim + value_dim]
+        wz: MatW,   // [n_embd -> value_dim] (attn_gate)
         conv: DeviceBuf, // f32 [conv_dim][ssm_conv_k]
         alpha_w: DeviceBuf, // f32 [n_embd -> ssm_v_heads]
         beta_w: DeviceBuf,
@@ -609,7 +638,7 @@ mod real {
         a: DeviceBuf,
         dt_bias: DeviceBuf,
         ssm_norm: DeviceBuf, // f32 [ssm_state] per-v-head gated rms weight
-        ssm_out: DeviceBuf,  // q8_0 [value_dim -> n_embd]
+        ssm_out: MatW,  // [value_dim -> n_embd]
     }
 
     /// deepseek4 per-layer stack: V4 attention, hyper-connection
@@ -2049,9 +2078,9 @@ mod real {
                     .filter(|&d| d != primary)
                     .max_by_key(|&d| kernels::mem_info(d).map(|(f, _)| f).unwrap_or(0))
                     .unwrap();
-                // VRAM bytes, not file bytes: the loader requants K-quant
-                // matmul_q8_0 tensors to q8_0 (~1.9x for Q4_K); only the
-                // DenseKq ffn triple uploads raw
+                // VRAM bytes, not file bytes: MatW/DenseKq tensors upload
+                // raw K-quant; the rest of the K-quants (and the embedding
+                // table) requant to q8_0 (~1.9x for Q4_K)
                 let vram = |t: &TensorInfo| -> u64 {
                     let raw = t.byte_size().unwrap_or(0);
                     let kq = matches!(
@@ -2062,7 +2091,11 @@ mod real {
                     let ffn_raw = t.name.ends_with("ffn_gate.weight")
                         || t.name.ends_with("ffn_up.weight")
                         || t.name.ends_with("ffn_down.weight");
-                    if kq && !ffn_raw { t.n_elements() / 32 * 34 } else { raw }
+                    if kq && !(ffn_raw || MatW::keep_native(t)) {
+                        t.n_elements() / 32 * 34
+                    } else {
+                        raw
+                    }
                 };
                 let lbytes: Vec<u64> = (0..shape.n_exec_layer)
                     .map(|il| {
@@ -2075,39 +2108,21 @@ mod real {
                     })
                     .collect();
                 // resident on the primary regardless of the split: lm head
-                // (native K-quant) + the q8_0 embedding table
+                // (native K-quant) + the q8_0-converted embedding table
                 let fixed: u64 = gguf.tensor("output.weight").and_then(|t| t.byte_size()).unwrap_or(0)
-                    + gguf.tensor("token_embd.weight").map(&vram).unwrap_or(0);
-                // ponytail: fixed 1.5 primary-bandwidth factor (5060 Ti vs
-                // 4060 Ti VRAM bw); probe real bandwidths if a box needs it
-                let bw0 = 1.5f64;
-                let mut n0 = match std::env::var("PULSAR_SPLIT").ok().and_then(|v| v.parse::<usize>().ok()) {
-                    Some(n) => n.min(lbytes.len()),
-                    None => {
-                        let total: u64 = lbytes.iter().sum();
-                        let mut acc = 0u64;
-                        let mut best = (f64::MAX, lbytes.len());
-                        for n in 0..=lbytes.len() {
-                            let t0 = (fixed + acc) as f64 / bw0;
-                            let t1 = (total - acc) as f64;
-                            let worst = t0.max(t1);
-                            if worst < best.0 {
-                                best = (worst, n);
-                            }
-                            if n < lbytes.len() {
-                                acc += lbytes[n];
-                            }
-                        }
-                        best.1
-                    }
-                };
-                // capacity clamp: fixed + primary layers + KV/scratch
-                // reserve must fit the primary's free VRAM
+                    + gguf.tensor("token_embd.weight").map(|t| t.n_elements() / 32 * 34).unwrap_or(0);
+                // layers run SEQUENTIALLY within a token, so total time is
+                // sum(bytes/bw) per card - minimized by filling the fast
+                // primary to capacity, not by balancing
+                let mut n0 = lbytes.len();
                 if let Ok((free, _)) = kernels::mem_info(primary) {
                     let reserve = 2u64 << 30;
                     while n0 > 0 && fixed + lbytes[..n0].iter().sum::<u64>() + reserve > free as u64 {
                         n0 -= 1;
                     }
+                }
+                if let Some(n) = std::env::var("PULSAR_SPLIT").ok().and_then(|v| v.parse::<usize>().ok()) {
+                    n0 = n.min(lbytes.len());
                 }
                 for d in layer_dev.iter_mut().skip(n0) {
                     *d = second;
@@ -2488,9 +2503,10 @@ mod real {
                         Attn::Qwen35(Box::new(Qwen35W {
                             attn: if is_attn {
                                 Some(Qwen35Attn {
-                                    wq: upload(&file, &gguf, &t("attn_q.weight"))?,
-                                    wk: upload(&file, &gguf, &t("attn_k.weight"))?,
-                                    wv: upload(&file, &gguf, &t("attn_v.weight"))?,
+                                    wq: MatW::load(&file, &gguf, &t("attn_q.weight"))?,
+                                    wk: MatW::load(&file, &gguf, &t("attn_k.weight"))?,
+                                    wv: MatW::load(&file, &gguf, &t("attn_v.weight"))?,
+                                    out: MatW::load(&file, &gguf, &t("attn_output.weight"))?,
                                     q_norm: upload(&file, &gguf, &t("attn_q_norm.weight"))?,
                                     k_norm: upload(&file, &gguf, &t("attn_k_norm.weight"))?,
                                 })
@@ -2501,15 +2517,15 @@ mod real {
                                 None
                             } else {
                                 Some(Qwen35Gdn {
-                                    wqkv: upload(&file, &gguf, &t("attn_qkv.weight"))?,
-                                    wz: upload(&file, &gguf, &t("attn_gate.weight"))?,
+                                    wqkv: MatW::load(&file, &gguf, &t("attn_qkv.weight"))?,
+                                    wz: MatW::load(&file, &gguf, &t("attn_gate.weight"))?,
                                     conv: upload(&file, &gguf, &t("ssm_conv1d.weight"))?,
                                     alpha_w: upload_as_f32(&file, &gguf, &t("ssm_alpha.weight"))?,
                                     beta_w: upload_as_f32(&file, &gguf, &t("ssm_beta.weight"))?,
                                     a: upload(&file, &gguf, &t("ssm_a"))?,
                                     dt_bias: upload(&file, &gguf, &t("ssm_dt.bias"))?,
                                     ssm_norm: upload(&file, &gguf, &t("ssm_norm.weight"))?,
-                                    ssm_out: upload(&file, &gguf, &t("ssm_out.weight"))?,
+                                    ssm_out: MatW::load(&file, &gguf, &t("ssm_out.weight"))?,
                                 })
                             },
                             // dense qwen35 has no shared expert (and so
@@ -2525,10 +2541,9 @@ mod real {
                 let attn_output = if dsv4_arch {
                     // V4's second-stage output projection
                     upload_attn(&file, &gguf, &t("attn_output_b.weight"), &mut *attn_vram_budget)?
-                } else if shape.family == Family::Qwen35
-                    && gguf.tensor(&t("attn_output.weight")).is_none()
-                {
-                    // GDN layers project through ssm_out instead
+                } else if shape.family == Family::Qwen35 {
+                    // GDN layers project through ssm_out; attn layers
+                    // through Qwen35Attn.out (MatW)
                     DeviceBuf::alloc(1)?
                 } else {
                     upload_attn(&file, &gguf, &t("attn_output.weight"), &mut *attn_vram_budget)?
