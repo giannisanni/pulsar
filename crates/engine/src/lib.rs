@@ -2450,14 +2450,15 @@ mod real {
             };
             // No-attn-GPU Mla: an oversized budget OOMs the load instead
             // of degrading (measured: 8GB+ on a 16GB primary fails at
-            // cudaMalloc mid-upload). Clamp to free VRAM minus what the
-            // capacity solver, KV, and scratch still need. The 6GB
+            // cudaMalloc mid-upload; 10GB with 15.4 free still died in the
+            // solver). Clamp to free minus a measured 9GB reserve (KV,
+            // activations, staging, MLA scratch, CUDA context). The 6GB
             // default is already the feasible top on a 16GB card; per-
             // tensor placement has no headroom beyond this clamp because
             // every attn byte is read exactly once per token (flat value).
             if attn_dev.is_none() && shape.family == Family::Mla && attn_vram_budget < i64::MAX {
                 if let Ok((free, _)) = kernels::mem_info(primary) {
-                    let cap = (free as i64) - (5i64 << 30);
+                    let cap = (free as i64) - (9i64 << 30);
                     if cap > 0 && attn_vram_budget > cap {
                         eprintln!(
                             "pulsar: attn VRAM budget clamped {:.1} -> {:.1}GB (free {:.1}GB)",
