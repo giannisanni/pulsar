@@ -459,8 +459,9 @@ impl Model {
             for (il, l) in self.layers.iter().enumerate() {
                 self.eval_qwen35_layer(st, rt, il, l, pos, t)?;
                 if std::env::var_os("PULSAR_DEBUG_L2").is_some() {
-                    let v = st.cur.read_f32(8)?;
-                    eprintln!("L{il}: {:?}", &v[..4.min(v.len())]);
+                    let a = st.after_attn.read_f32(4)?;
+                    let v = st.cur.read_f32(4)?;
+                    eprintln!("L{il}: attn {:?} cur {:?}", &a[..2], &v[..2]);
                 }
             }
             pos += t;
