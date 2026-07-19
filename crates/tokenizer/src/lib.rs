@@ -363,8 +363,11 @@ impl ChatMarkers {
                 if let (Some(ts), Some(te)) =
                     (t.find_token("<think>"), t.find_token("</think>"))
                 {
-                    v.extend([ts, te]);
-                    v.extend(t.encode("\n"));
+                    // exact official form: <think>\n\n</think>\n\n
+                    v.push(ts);
+                    v.extend(t.encode("\n\n"));
+                    v.push(te);
+                    v.extend(t.encode("\n\n"));
                 }
                 v
             }
