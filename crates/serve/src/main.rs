@@ -318,6 +318,13 @@ fn handle_chat(
         let fin = serde_json::json!({
             "id": id, "object": "chat.completion.chunk", "model": model_name,
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            // clients derive context fill from usage; without it the
+            // stream reads as 0 tokens forever
+            "usage": {
+                "prompt_tokens": prompt.len(),
+                "completion_tokens": n_out,
+                "total_tokens": prompt.len() + n_out,
+            },
         });
         let _ = write!(stream, "data: {fin}\n\ndata: [DONE]\n\n");
         let _ = stream.flush();
