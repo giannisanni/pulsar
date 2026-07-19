@@ -4947,6 +4947,9 @@ mod real {
             let row = model.shape.n_embd as usize * 4;
             let depth_max = model.mtp_depth.max(1);
             let debug = std::env::var_os("PULSAR_MTP_DEBUG").is_some();
+            let timing = std::env::var_os("PULSAR_MTP_TIMING").is_some();
+            let (mut t_draft, mut t_verify, mut t_refwd, mut t_fill) =
+                (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
             let mut emitted = 0usize;
             let mut next = argmax(logits.as_deref().ok_or("no logits")?);
             'round: while emitted < max_tokens {
@@ -4962,6 +4965,7 @@ mod real {
                 // output hidden (approximate but cheap - one layer/step).
                 // Anchor the true pre-chain hidden for the fill pass.
                 kernels::copy_d2d(&mut st.mtp_hidden_save, 0, &st.mtp_hidden, 0, row)?;
+                let t0 = std::time::Instant::now();
                 let depth = depth_max.min(st.ctx() - pos - 2);
                 let mut chain = vec![next];
                 for i in 0..depth {
@@ -4973,6 +4977,7 @@ mod real {
                         break; // no point speculating past a stop token
                     }
                 }
+                t_draft += t0.elapsed();
                 let k = chain.len() - 1; // drafts in flight
 
                 // Verify the whole chain in ONE forward: the per-layer
@@ -4987,22 +4992,26 @@ mod real {
                 // is exactly right (free), partial acceptance restores
                 // and re-forwards the accepted prefix.
                 let recurrent = model.shape.family == Family::Qwen35;
+                let t0 = std::time::Instant::now();
                 if recurrent {
                     st.qwen35.as_mut().ok_or("qwen35 state missing")?.gdn_snapshot()?;
                 }
                 let all = model
                     .forward_rows(st, &chain, pos, (k + 1) as u32)?
                     .ok_or("no verify logits")?;
+                t_verify += t0.elapsed();
                 let mut j = 0usize;
                 while j < k && argmax(&all[j * v..(j + 1) * v]) == chain[j + 1] {
                     st.mtp_accepted += 1;
                     j += 1;
                 }
                 if recurrent && j < k {
+                    let t0 = std::time::Instant::now();
                     st.qwen35.as_mut().ok_or("qwen35 state missing")?.gdn_restore()?;
                     // no logits; leaves st.cur/st.tok holding exactly the
                     // accepted rows for the fill pass below
                     model.forward_batch(st, &chain[..=j], pos, false)?;
+                    t_refwd += t0.elapsed();
                 }
                 if debug {
                     let nans = all.iter().filter(|x| !x.is_finite()).count();
@@ -5014,7 +5023,15 @@ mod real {
                 // st.cur its verified hiddens - exactly what a prefill
                 // chunk looks like to mtp_prefill_fill.
                 kernels::copy_d2d(&mut st.mtp_hidden, 0, &st.mtp_hidden_save, 0, row)?;
+                let t0 = std::time::Instant::now();
                 model.mtp_prefill_fill(st, (j + 1) as u32, pos)?;
+                t_fill += t0.elapsed();
+                if timing && emitted % 64 == 0 {
+                    eprintln!(
+                        "mtp timing @{emitted}: draft {:.2}s verify {:.2}s refwd {:.2}s fill {:.2}s",
+                        t_draft.as_secs_f64(), t_verify.as_secs_f64(), t_refwd.as_secs_f64(), t_fill.as_secs_f64()
+                    );
+                }
                 pos += (j + 1) as u32;
                 next = argmax(&all[j * v..(j + 1) * v]);
 
