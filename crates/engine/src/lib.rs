@@ -1596,6 +1596,17 @@ mod real {
                 pool.submit(jobs)
             }
 
+            /// debug: (first mids, per-expert slot weights, expert order)
+            pub fn dbg(&self) -> (Vec<f32>, Vec<Vec<f32>>, Vec<i32>) {
+                let mut order: Vec<(i32, usize)> = self.idx.iter().map(|(&e, &ci)| (e, ci)).collect();
+                order.sort_by_key(|&(_, ci)| ci);
+                (
+                    self.mids.iter().take(4).copied().collect(),
+                    self.pairs.iter().map(|p| p.iter().map(|x| x.1).collect()).collect(),
+                    order.into_iter().map(|(e, _)| e).collect(),
+                )
+            }
+
             /// after the stage-A join: quantize mids, run the down-proj
             /// fan-out, return the per-token f32 partial [n_tok * ne]
             pub fn finish(&self, pool: &Pool, n_tok: usize) -> Vec<f32> {
@@ -5015,6 +5026,21 @@ mod real {
                             )?;
                             kernels::sync()?;
                             verify_gpu = Some(st.moe_out.read_f32((n_tok * s.n_embd) as usize)?);
+                            if il == 30 {
+                                // stage-A cross-check: GPU mid rows for the
+                                // first lane slot vs the lane's own mids
+                                if let Some((slot, _)) = vptrs.iter().enumerate().find(|(_, p)| !p.gate.is_null()) {
+                                    // join stage A so lane mids are final
+                                    drop(cpu_guard.take());
+                                    let mid = st.moe_mid.read_f32(s.n_expert_used as usize * s.n_ff_exp as usize)?;
+                                    let base = slot * s.n_ff_exp as usize;
+                                    let rw2 = st.router_weights.read_f32(n_used)?;
+                                    eprintln!(
+                                        "verify L30 slot {slot} e={}: gpu mid {:?} rw {:?} lane {:?}",
+                                        selected[slot], &mid[base..base + 4], &rw2[..n_used.min(12)], lane.dbg()
+                                    );
+                                }
+                            }
                             st.expert_ptrs.write(0, kernels::as_bytes(&ptrs))?;
                         }
 
