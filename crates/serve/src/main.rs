@@ -282,6 +282,31 @@ fn handle_chat(
             stream,
             "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n"
         )?;
+        stream.flush()?;
+        // Long prefills are silent for minutes; proxies kill idle reads.
+        // A side thread drips SSE comments until the first token lands
+        // (a comment between events is legal, clients ignore it).
+        let ka_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ka_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ka_thread = {
+            let started = ka_started.clone();
+            let stop = ka_stop.clone();
+            let mut ks = stream.try_clone()?;
+            std::thread::spawn(move || {
+                use std::sync::atomic::Ordering;
+                loop {
+                    for _ in 0..15 {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        if stop.load(Ordering::Relaxed) || started.load(Ordering::Relaxed) {
+                            return;
+                        }
+                    }
+                    if ks.write_all(b": prefill keepalive\n\n").and_then(|_| ks.flush()).is_err() {
+                        return;
+                    }
+                }
+            })
+        };
         let mut bytes: Vec<u8> = Vec::new();
         let mut n_out = 0usize;
         let mut send_err = None;
@@ -300,6 +325,7 @@ fn handle_chat(
                 s
             },
             |t| {
+                ka_started.store(true, std::sync::atomic::Ordering::Relaxed);
                 n_out += 1;
                 emitted.push(t);
                 bytes.extend_from_slice(&tok.decode(&[t]));
@@ -331,6 +357,8 @@ fn handle_chat(
                 "total_tokens": prompt.len() + n_out,
             },
         });
+        ka_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = ka_thread.join();
         let _ = write!(stream, "data: {fin}\n\ndata: [DONE]\n\n");
         let _ = stream.flush();
         eprintln!("pulsar-serve: {id}: {} prompt + {n_out} completion tokens (streamed)", prompt.len());
