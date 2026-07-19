@@ -2824,7 +2824,7 @@ extern "C" int pulsar_matmul_kq(
     /* multi-token batches (MTP/DFlash verify, chunked prefill) tile
      * tokens over one weight read; q4_K/q6_K ride the warp-cooperative
      * dots for any 2..16 rows */
-    if (n_tok >= 2u && n_tok <= 16u) {
+    if (n_tok >= 2u && n_tok <= 16u && !getenv("PULSAR_KQW_OFF")) {
         dim3 tgrid((out_dim + 3u) / 4u, 1, 1);
         /* smallest register-budget tile that fits n_tok */
         #define PULSAR_KQW_T(WDOT)                                             \
