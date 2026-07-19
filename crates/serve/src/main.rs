@@ -76,6 +76,11 @@ fn run() -> engine::Result {
             Ok(s) => s,
             Err(_) => continue,
         };
+        // the accept loop is sequential: a half-open socket that never
+        // sends its body would block EVERY later request forever (a
+        // client retry storm during a restart left exactly that ghost)
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(120)));
         request_id += 1;
         let result = (|| -> engine::Result {
             let mut reader = BufReader::new(stream.try_clone()?);
