@@ -358,6 +358,17 @@ impl ChatMarkers {
             ChatStyle::ChatMl => {
                 let mut v = vec![self.assistant];
                 v.extend(t.encode("assistant\n"));
+                // hybrid-thinking ChatML models (qwen3.6): thinking off
+                // via the empty think block, mirroring enable_thinking=false
+                if let (Some(ts), Some(te)) =
+                    (t.find_token("<think>"), t.find_token("</think>"))
+                {
+                    // exact official form: <think>\n\n</think>\n\n
+                    v.push(ts);
+                    v.extend(t.encode("\n\n"));
+                    v.push(te);
+                    v.extend(t.encode("\n\n"));
+                }
                 v
             }
             ChatStyle::Gemma => {
