@@ -81,8 +81,11 @@ calc_attn_vram_gb() {
 }
 
 # ---- GPU auto-selection ----
-# Score stream candidate: theoretical PCIe-ish bandwidth ~ gen * width
-# (labels can lie; Pulsar still H2D-probes at runtime among visible devices).
+# Score stream candidate: theoretical PCIe-ish bandwidth ~ gen * width.
+# Use the link's MAX capability, not .current: idle GPUs downtrain to gen1
+# (measured: a Gen5 card reads gen1 at idle), which would randomize the
+# pick on same-width boxes. Capability is a stable ORDERING; the engine
+# still H2D-probes real bandwidth at runtime among visible devices.
 # Score attn candidate: free MiB (capacity for MLA stack + tier residual).
 command -v nvidia-smi >/dev/null || {
   echo "ERROR: nvidia-smi not found" >&2
@@ -91,7 +94,7 @@ command -v nvidia-smi >/dev/null || {
 
 # index, name, total_mb, free_mb, pcie_gen, pcie_width
 mapfile -t GPU_ROWS < <(
-  nvidia-smi --query-gpu=index,name,memory.total,memory.free,pcie.link.gen.current,pcie.link.width.current \
+  nvidia-smi --query-gpu=index,name,memory.total,memory.free,pcie.link.gen.max,pcie.link.width.max,pcie.link.gen.current,pcie.link.width.current \
     --format=csv,noheader,nounits 2>/dev/null | sed 's/, /,/g'
 )
 
@@ -120,7 +123,7 @@ is_denylisted() {
 
 echo "scanning GPUs (min ${MIN_VRAM_MB} MiB total VRAM)..."
 for row in "${GPU_ROWS[@]}"; do
-  IFS=',' read -r idx name total free gen width <<<"$row"
+  IFS=',' read -r idx name total free gen width cgen cwidth <<<"$row"
   idx="${idx// /}"
   name="${name# }"
   total="${total// /}"
@@ -130,6 +133,11 @@ for row in "${GPU_ROWS[@]}"; do
   # nvidia-smi may print [N/A]
   [[ "$total" =~ ^[0-9]+$ ]] || total=0
   [[ "$free" =~ ^[0-9]+$ ]] || free=0
+  cgen="${cgen// /}"
+  cwidth="${cwidth// /}"
+  # older drivers report [N/A] for max: fall back to the trained link
+  [[ "$gen" =~ ^[0-9]+$ ]] || gen="$cgen"
+  [[ "$width" =~ ^[0-9]+$ ]] || width="$cwidth"
   [[ "$gen" =~ ^[0-9]+$ ]] || gen=0
   [[ "$width" =~ ^[0-9]+$ ]] || width=0
   pcie=$(( gen * width ))
