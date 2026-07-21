@@ -32,6 +32,7 @@ fn run() -> engine::Result {
     let mut port = 11435u16;
     let mut host = String::from("127.0.0.1");
     let mut ctx = 8192u32;
+    let mut prefix_file: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut need = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -40,6 +41,7 @@ fn run() -> engine::Result {
             "--port" => port = need("--port")?.parse()?,
             "--host" => host = need("--host")?.to_string(),
             "--ctx" => ctx = need("--ctx")?.parse()?,
+            "--prefix-file" => prefix_file = Some(need("--prefix-file")?),
             other => return Err(format!("unknown arg {other}").into()),
         }
     }
@@ -71,6 +73,25 @@ fn run() -> engine::Result {
     // token ids fully forwarded into the engine (KV + recurrent state
     // consistent with them); the next request prefills only its suffix
     let mut hist: Vec<u32> = Vec::new();
+    // --prefix-file: resume the persisted prefill state (dsv4). A stale
+    // or mismatched file is skipped, never fatal.
+    let prefix_path = prefix_file.as_ref().map(std::path::PathBuf::from);
+    if let Some(pp) = &prefix_path {
+        if pp.exists() {
+            let t0 = std::time::Instant::now();
+            match st.load_prefix(&model, pp) {
+                Ok(h) => {
+                    eprintln!(
+                        "pulsar-serve: prefix restored from {} ({} tokens, {} ckpts, {:.1}s)",
+                        pp.display(), h.len(), st.ckpt_count(), t0.elapsed().as_secs_f32()
+                    );
+                    hist = h;
+                }
+                Err(e) => eprintln!("pulsar-serve: prefix file skipped: {e}"),
+            }
+        }
+    }
+    let mut last_saved = hist.len();
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,
@@ -137,6 +158,23 @@ fn run() -> engine::Result {
             let _ = stream.write_all(
                 b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n",
             );
+        }
+        // persist the prefill investment once it has grown meaningfully;
+        // a save costs seconds, a lost prefix costs a 20-40 min re-prefill
+        if let Some(pp) = &prefix_path {
+            if hist.len() >= last_saved + 2048 {
+                let t0 = std::time::Instant::now();
+                match st.save_prefix(&model, &hist, pp) {
+                    Ok(()) => {
+                        eprintln!(
+                            "pulsar-serve: prefix saved ({} tokens, {:.1}s)",
+                            hist.len(), t0.elapsed().as_secs_f32()
+                        );
+                        last_saved = hist.len();
+                    }
+                    Err(e) => eprintln!("pulsar-serve: prefix save failed: {e}"),
+                }
+            }
         }
     }
     Ok(())

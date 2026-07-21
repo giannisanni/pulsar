@@ -3543,6 +3543,120 @@ mod real {
             self.ckpts.clear();
         }
 
+        /// Persist the current dsv4 prefix state (recurrent runtime, the
+        /// append-only caches up to `hist.len()`, and the rollback
+        /// checkpoints) so a fresh process can resume without re-prefilling.
+        /// The big caches are append-only: rows past a later restore point
+        /// are simply overwritten on replay, exactly like the in-process
+        /// rollback. MTP-slot state is intentionally not saved - drafts
+        /// self-heal through verify (brief acceptance dip, never wrong
+        /// output). dsv4-only; other families return Err.
+        pub fn save_prefix(&self, m: &Model, hist: &[u32], path: &Path) -> Result {
+            let s = m.shape;
+            if s.family != Family::Dsv4 {
+                return Err("prefix persist: dsv4 only".into());
+            }
+            let rt = self.dsv4.as_ref().ok_or("dsv4 state missing")?;
+            let mut out = Vec::with_capacity(64 << 20);
+            out.extend_from_slice(b"PLSRPFX2");
+            for v in [s.n_exec_layer, s.n_embd, s.n_vocab, self.ctx, s.n_swa, s.head_dim, s.n_idx_dim] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.extend_from_slice(&(hist.len() as u64).to_le_bytes());
+            out.extend_from_slice(kernels::as_bytes(hist));
+            rt.save_layers(&mut out)?;
+            let counts = rt.layer_counts();
+            let put = |out: &mut Vec<u8>, b: &DeviceBuf, bytes: usize| -> Result {
+                let bytes = bytes.min(b.bytes());
+                let mut host = vec![0u8; bytes];
+                b.read(0, &mut host)?;
+                out.extend_from_slice(&(bytes as u64).to_le_bytes());
+                out.extend_from_slice(&host);
+                Ok(())
+            };
+            for il in 0..s.n_exec_layer as usize {
+                let (n_comp, _) = counts[il];
+                put(&mut out, &self.kcache[il], self.kcache[il].bytes())?;
+                put(&mut out, &self.vcache[il], n_comp as usize * s.head_dim as usize * 4)?;
+                let ik = &self.idx_kcache[il];
+                let used = if ik.bytes() > 4 { hist.len() * s.n_idx_dim as usize * 2 } else { 0 };
+                put(&mut out, ik, used)?;
+            }
+            out.extend_from_slice(&(self.ckpts.len() as u32).to_le_bytes());
+            for (pos, ck) in &self.ckpts {
+                out.extend_from_slice(&pos.to_le_bytes());
+                match ck {
+                    RecurrentCkpt::Dsv4(layers) => dsv4::ckpt_write(&mut out, layers)?,
+                    _ => return Err("prefix persist: non-dsv4 checkpoint".into()),
+                }
+            }
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, &out)?;
+            std::fs::rename(&tmp, path)?;
+            Ok(())
+        }
+
+        /// Load a prefix written by save_prefix into this (fresh) State.
+        /// Returns the persisted history tokens; the caller installs them
+        /// as its prompt-cache hist. Shape/ctx mismatches reject the file.
+        pub fn load_prefix(&mut self, m: &Model, path: &Path) -> Result<Vec<u32>> {
+            let s = m.shape;
+            let data = std::fs::read(path)?;
+            let mut inp: &[u8] = &data;
+            if inp.len() < 8 || &inp[..8] != b"PLSRPFX2" {
+                return Err("prefix file: bad magic".into());
+            }
+            inp = &inp[8..];
+            let mut u32s = [0u32; 7];
+            for v in &mut u32s {
+                *v = u32::from_le_bytes(inp[..4].try_into().unwrap());
+                inp = &inp[4..];
+            }
+            if u32s != [s.n_exec_layer, s.n_embd, s.n_vocab, self.ctx, s.n_swa, s.head_dim, s.n_idx_dim] {
+                return Err("prefix file: shape/ctx mismatch".into());
+            }
+            let nh = u64::from_le_bytes(inp[..8].try_into().unwrap()) as usize;
+            inp = &inp[8..];
+            let hist: Vec<u32> = inp[..nh * 4]
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            inp = &inp[nh * 4..];
+            let rt = self.dsv4.as_mut().ok_or("dsv4 state missing")?;
+            rt.load_layers(&mut inp)?;
+            let take = |inp: &mut &[u8], b: &mut DeviceBuf| -> Result {
+                let n = u64::from_le_bytes(inp[..8].try_into().unwrap()) as usize;
+                *inp = &inp[8..];
+                if n > b.bytes() {
+                    return Err("prefix file: cache larger than allocation".into());
+                }
+                if n > 0 {
+                    b.write(0, &inp[..n])?;
+                }
+                *inp = &inp[n..];
+                Ok(())
+            };
+            for il in 0..s.n_exec_layer as usize {
+                take(&mut inp, &mut self.kcache[il])?;
+                take(&mut inp, &mut self.vcache[il])?;
+                take(&mut inp, &mut self.idx_kcache[il])?;
+            }
+            let nck = u32::from_le_bytes(inp[..4].try_into().unwrap()) as usize;
+            inp = &inp[4..];
+            self.ckpts.clear();
+            for _ in 0..nck {
+                let pos = u32::from_le_bytes(inp[..4].try_into().unwrap());
+                inp = &inp[4..];
+                let layers = dsv4::ckpt_read(&mut inp)?;
+                self.ckpts.push((pos, RecurrentCkpt::Dsv4(layers)));
+            }
+            Ok(hist)
+        }
+
+        pub fn ckpt_count(&self) -> usize {
+            self.ckpts.len()
+        }
+
         pub fn ctx(&self) -> u32 {
             self.ctx
         }

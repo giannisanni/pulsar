@@ -1654,3 +1654,162 @@ mod tests {
         }
     }
 }
+
+/* ---- prefix persistence (serve --prefix-file) --------------------------- */
+
+fn put_buf(out: &mut Vec<u8>, b: &DeviceBuf, bytes: usize) -> Result {
+    let mut host = vec![0u8; bytes];
+    b.read(0, &mut host)?;
+    out.extend_from_slice(&(bytes as u64).to_le_bytes());
+    out.extend_from_slice(&host);
+    Ok(())
+}
+
+fn take_buf(inp: &mut &[u8], b: &mut DeviceBuf) -> Result {
+    let n = u64::from_le_bytes(inp[..8].try_into().unwrap()) as usize;
+    *inp = &inp[8..];
+    if n > b.bytes() {
+        return Err("prefix file: buffer larger than allocation".into());
+    }
+    b.write(0, &inp[..n])?;
+    *inp = &inp[n..];
+    Ok(())
+}
+
+fn put_lane(out: &mut Vec<u8>, lane: &Option<DevLane>) -> Result {
+    match lane {
+        Some(l) => {
+            out.push(1);
+            put_buf(out, &l.st_kv, l.st_kv.bytes())?;
+            put_buf(out, &l.st_sc, l.st_sc.bytes())?;
+        }
+        None => out.push(0),
+    }
+    Ok(())
+}
+
+fn take_lane(inp: &mut &[u8], lane: &mut Option<DevLane>) -> Result {
+    let has = inp[0] == 1;
+    *inp = &inp[1..];
+    if has {
+        let l = lane.as_mut().ok_or("prefix file: lane mismatch")?;
+        take_buf(inp, &mut l.st_kv)?;
+        take_buf(inp, &mut l.st_sc)?;
+    }
+    Ok(())
+}
+
+/// ckpt lanes ride the same wire format; DeviceBuf pairs in RecurrentCkpt
+/// entries are full-size copies, so put_buf/take_buf apply unchanged.
+pub(super) fn ckpt_write(out: &mut Vec<u8>, ck: &[Dsv4LayerCkpt]) -> Result {
+    out.extend_from_slice(&(ck.len() as u32).to_le_bytes());
+    for c in ck {
+        match &c.comp {
+            Some((kv, sc)) => {
+                out.push(1);
+                put_buf(out, kv, kv.bytes())?;
+                put_buf(out, sc, sc.bytes())?;
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(&c.n_comp.to_le_bytes());
+        match &c.idx {
+            Some((kv, sc)) => {
+                out.push(1);
+                put_buf(out, kv, kv.bytes())?;
+                put_buf(out, sc, sc.bytes())?;
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(&c.n_idx_comp.to_le_bytes());
+        out.extend_from_slice(&(c.host_len as u64).to_le_bytes());
+    }
+    Ok(())
+}
+
+pub(super) fn ckpt_read(inp: &mut &[u8]) -> Result<Vec<Dsv4LayerCkpt>> {
+    let n = u32::from_le_bytes(inp[..4].try_into().unwrap()) as usize;
+    *inp = &inp[4..];
+    let mut out = Vec::with_capacity(n);
+    let mut pair = |inp: &mut &[u8]| -> Result<Option<(DeviceBuf, DeviceBuf)>> {
+        let has = inp[0] == 1;
+        *inp = &inp[1..];
+        if !has {
+            return Ok(None);
+        }
+        let mut rd = |inp: &mut &[u8]| -> Result<DeviceBuf> {
+            let bytes = u64::from_le_bytes(inp[..8].try_into().unwrap()) as usize;
+            *inp = &inp[8..];
+            let mut b = DeviceBuf::alloc(bytes.max(4))?;
+            b.write(0, &inp[..bytes])?;
+            *inp = &inp[bytes..];
+            Ok(b)
+        };
+        Ok(Some((rd(inp)?, rd(inp)?)))
+    };
+    for _ in 0..n {
+        let comp = pair(inp)?;
+        let n_comp = u32::from_le_bytes(inp[..4].try_into().unwrap());
+        *inp = &inp[4..];
+        let idx = pair(inp)?;
+        let n_idx_comp = u32::from_le_bytes(inp[..4].try_into().unwrap());
+        *inp = &inp[4..];
+        let host_len = u64::from_le_bytes(inp[..8].try_into().unwrap()) as usize;
+        *inp = &inp[8..];
+        out.push(Dsv4LayerCkpt { comp, n_comp, idx, n_idx_comp, host_len });
+    }
+    Ok(out)
+}
+
+impl Dsv4Rt {
+    /// Serialize per-layer runtime state (compressor lanes, counters,
+    /// indexer host mirror). The big append-only caches (SWA ring, comp
+    /// KV, indexer keys) live in State and are written by save_prefix.
+    pub(super) fn save_layers(&self, out: &mut Vec<u8>) -> Result {
+        out.extend_from_slice(&(self.layers.len() as u32).to_le_bytes());
+        for l in &self.layers {
+            put_lane(out, &l.comp)?;
+            out.extend_from_slice(&l.n_comp.to_le_bytes());
+            put_lane(out, &l.idx)?;
+            out.extend_from_slice(&l.n_idx_comp.to_le_bytes());
+            out.extend_from_slice(&(l.idx_cache_host.len() as u64).to_le_bytes());
+            out.extend_from_slice(kernels::as_bytes(&l.idx_cache_host));
+        }
+        Ok(())
+    }
+
+    pub(super) fn load_layers(&mut self, inp: &mut &[u8]) -> Result {
+        let n = u32::from_le_bytes(inp[..4].try_into().unwrap()) as usize;
+        *inp = &inp[4..];
+        if n != self.layers.len() {
+            return Err("prefix file: layer count mismatch".into());
+        }
+        for l in &mut self.layers {
+            take_lane(inp, &mut l.comp)?;
+            l.n_comp = u32::from_le_bytes(inp[..4].try_into().unwrap());
+            *inp = &inp[4..];
+            take_lane(inp, &mut l.idx)?;
+            l.n_idx_comp = u32::from_le_bytes(inp[..4].try_into().unwrap());
+            *inp = &inp[4..];
+            let hl = u64::from_le_bytes(inp[..8].try_into().unwrap()) as usize;
+            *inp = &inp[8..];
+            l.idx_cache_host.clear();
+            l.idx_cache_host.extend(
+                inp[..hl * 4].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())),
+            );
+            *inp = &inp[hl * 4..];
+            // re-mirror the host cache into the device copy (selection
+            // reads host, attention-side emits read device)
+            if hl > 0 {
+                l.idx_cache.write(0, kernels::as_bytes(&l.idx_cache_host))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// (n_comp, n_idx_comp) per layer, for sizing the State-side cache
+    /// prefixes in save_prefix.
+    pub(super) fn layer_counts(&self) -> Vec<(u32, u32)> {
+        self.layers.iter().map(|l| (l.n_comp, l.n_idx_comp)).collect()
+    }
+}
