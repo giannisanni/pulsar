@@ -146,7 +146,7 @@ fn run() -> engine::Result {
                 ("GET", "/v1/models") => {
                     let json = serde_json::json!({
                         "object": "list",
-                        "data": [{"id": model_name, "object": "model", "owned_by": "pulsar"}],
+                        "data": [{"id": model_name, "object": "model", "owned_by": "pulsar", "max_model_len": ctx}],
                     });
                     respond_json(&mut stream, 200, &json)
                 }
@@ -460,6 +460,9 @@ fn handle_chat(
         let first = serde_json::json!({
             "id": id, "object": "chat.completion.chunk", "model": model_name,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}],
+            // prompt token count up front so the UI can show live context use
+            // and prefill tok/s the moment the first decoded token lands
+            "usage": {"prompt_tokens": prompt.len()},
         });
         write!(stream, "data: {first}\n\n")?;
         stream.flush()?;
