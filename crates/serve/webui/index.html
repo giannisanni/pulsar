@@ -361,8 +361,10 @@
     align-items: center;
     justify-content: center;
     gap: 7px;
-    min-width: 74px;
+    min-width: 38px;
   }
+  .icon-only { min-width: 38px; padding: 8px 10px; }
+  .icon-only svg { display: block; }
   .theme-icon {
     width: 14px;
     font-family: var(--serif);
@@ -731,7 +733,7 @@
     box-shadow: 0 0 0 1px var(--glass-border), var(--edge-light);
     overflow: hidden;
   }
-  #cortex-canvas {
+  #cortex-canvas, #atlas-canvas {
     display: block;
     width: 100%;
     height: 100%;
@@ -995,10 +997,10 @@
   :root[data-theme="dark"] .msg .content a { text-decoration-color: #4a4d8a; }
 
   @media (max-width: 1180px) {
-    .chips .chip:nth-child(4) { display: none; }
+    .chips .chip:nth-child(5) { display: none; } /* queue */
   }
   @media (max-width: 1040px) {
-    .chips .chip:nth-child(3) { display: none; }
+    .chips .chip:nth-child(3) { display: none; } /* prefill */
   }
 
   /* sidebar collapses under ~900px; hamburger toggles it as an overlay */
@@ -1014,7 +1016,7 @@
       transition: transform .22s ease;
     }
     aside.open { transform: none; box-shadow: var(--edge-light), var(--shadow-lift); }
-    .chips .chip:nth-child(3), .chips .chip:nth-child(4) { display: none; }
+    .chips .chip:nth-child(3), .chips .chip:nth-child(5) { display: none; } /* prefill + queue */
   }
   @media (max-width: 720px) {
     header { min-height: 62px; padding: 10px 16px; gap: 10px; }
@@ -1160,18 +1162,22 @@
   <div class="chips">
     <span class="chip"><span class="chip-label">tok/s</span><span id="chip-tps">—</span></span>
     <span class="chip"><span class="chip-label">TTFT</span><span id="chip-ttft">—</span></span>
+    <span class="chip"><span class="chip-label">prefill</span><span id="chip-prefill">—</span></span>
     <span class="chip"><span class="chip-label">ctx</span><span id="chip-ctx">—</span></span>
     <span class="chip"><span class="chip-label">queue</span><span id="chip-queue">0ms</span></span>
     <span class="chip"><span class="chip-label">slot</span><span id="chip-slot">idle</span></span>
   </div>
   <span class="spacer"></span>
   <div class="header-actions">
-    <span class="status" id="status">idle</span>
-    <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Switch to dark mode" aria-pressed="false" title="Switch to dark mode">
+    <span class="status" id="status" hidden>idle</span>
+    <button id="theme-toggle" class="theme-toggle icon-only" type="button" aria-label="Switch to dark mode" aria-pressed="false" title="Switch to dark mode">
       <span class="theme-icon" aria-hidden="true">☾</span>
-      <span class="theme-label">Dark</span>
     </button>
-    <button id="clear" class="danger" title="Clear conversation">Clear</button>
+    <button id="clear" class="danger icon-only" type="button" aria-label="Clear conversation" title="Clear conversation">
+      <svg width="13" height="13" viewBox="0 0 13 13" aria-hidden="true" focusable="false">
+        <path d="M2 2 L11 11 M11 2 L2 11" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/>
+      </svg>
+    </button>
   </div>
 </header>
 
@@ -1239,10 +1245,20 @@
 </div>
 
 <div class="tab-panel" id="tab-atlas" hidden>
-  <div class="placeholder">
-    <span class="ph-kicker">Expert Atlas</span>
-    <h2>Atlas</h2>
-    <p>Expert Atlas — coming soon. A map of expert residency across tiers will land here.</p>
+  <div class="cortex">
+    <div class="cortex-head">
+      <div class="cortex-title">
+        <span class="ph-kicker">Expert Atlas</span>
+        <span class="cortex-dims" id="atlas-dims">— experts · — specialists</span>
+      </div>
+      <div class="cortex-legend">
+        <span class="cortex-legend-note">big dots = specialists · colour = dominant topic · faint cloud = generalists</span>
+      </div>
+    </div>
+    <div class="cortex-stage" id="atlas-stage">
+      <canvas id="atlas-canvas"></canvas>
+      <div class="cortex-tip" id="atlas-tip" hidden></div>
+    </div>
   </div>
 </div>
 </main>
@@ -1268,6 +1284,7 @@ let maxCtx = 8192; // context window, from /v1/models max_model_len
 let curCtx = 0; // prompt + generated tokens of the latest turn
 let lastTps = 0; // last completed turn's decode tok/s
 let lastTtft = 0; // last turn's prefill wall time (s)
+let lastPrefillTps = 0; // last turn's prefill tok/s
 let turns = 0;
 let tpsHist = []; // last ≤8 decode tok/s values
 const PROF_KEYS = ["gpu_wait", "resolve", "h2d", "cpu", "tail"];
@@ -1281,6 +1298,7 @@ const fmtCtx = (n) =>
 function setChips(slot) {
   $("chip-tps").textContent = lastTps ? lastTps.toFixed(1) : "—";
   $("chip-ttft").textContent = lastTtft ? lastTtft.toFixed(2) + "s" : "—";
+  $("chip-prefill").textContent = lastPrefillTps ? Math.round(lastPrefillTps) + "/s" : "—";
   $("chip-ctx").textContent = curCtx ? fmtCtx(curCtx) + "/" + fmtCtx(maxCtx) : "—";
   $("chip-slot").textContent = slot;
   $("stat-tps").textContent = lastTps ? lastTps.toFixed(1) : "—";
@@ -1466,6 +1484,7 @@ function applyTheme(theme, persist = true) {
 }
 
 function setStatus(text, cls) {
+  if (!statusEl) return; // pill removed; the top-bar chips carry live state now
   statusEl.textContent = text;
   statusEl.className = "status" + (cls ? " " + cls : "");
 }
@@ -1701,6 +1720,7 @@ async function streamAssistant() {
     turns += 1;
     lastTtft = t0 ? (t0 - tSend) / 1000 : 0;
     lastTps = ntok && dtNum > 0 ? ntok / dtNum : 0;
+    lastPrefillTps = prefillTps;
     curCtx = promptToks + ntok;
     if (lastTps) { tpsHist.push(lastTps); if (tpsHist.length > 8) tpsHist.shift(); }
     renderTrend();
@@ -1751,6 +1771,7 @@ clearBtn.addEventListener("click", () => {
   turns = 0;
   lastTps = 0;
   lastTtft = 0;
+  lastPrefillTps = 0;
   curCtx = 0;
   tpsHist = [];
   renderTrend();
@@ -1975,6 +1996,116 @@ applyStats = function (j) {
   _origApplyStats(j);
   if (!$("tab-brain").hidden && controller === null) refreshCortex();
 };
+
+// --- Atlas: expert topic-affinity galaxy (GET /atlas, built offline) ---
+const atlasCanvas = $("atlas-canvas");
+const atlasStage = $("atlas-stage");
+const atlasTip = $("atlas-tip");
+const atlasDims = $("atlas-dims");
+let atlasData = null; // {topics, experts:[{x,y,t,spec,heat}], anchors, n_experts, n_specialists}
+let atlasPts = null;  // drawn dots for hover: [{px,py,e}]
+
+function topicColor(i, n, dark) {
+  const hue = (i * 360 / Math.max(1, n)) % 360;
+  return "hsl(" + hue.toFixed(0) + "," + (dark ? 70 : 62) + "%," + (dark ? 62 : 46) + "%)";
+}
+
+function renderAtlas() {
+  if (!atlasData || !atlasData.experts?.length) { atlasDims.textContent = "— experts · — specialists"; return; }
+  const { experts, anchors, topics } = atlasData;
+  atlasDims.textContent = (atlasData.n_experts || experts.length) + " experts · " + (atlasData.n_specialists || 0) + " specialists";
+  const stageW = atlasStage.clientWidth, stageH = atlasStage.clientHeight;
+  if (!stageW || !stageH) return;
+  const dpr = window.devicePixelRatio || 1;
+  atlasCanvas.width = Math.round(stageW * dpr);
+  atlasCanvas.height = Math.round(stageH * dpr);
+  const ctx = atlasCanvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const dark = document.documentElement.dataset.theme === "dark";
+  const C = cortexColors();
+  ctx.fillStyle = "rgb(" + C.bg[0] + "," + C.bg[1] + "," + C.bg[2] + ")";
+  ctx.fillRect(0, 0, stageW, stageH);
+
+  const R = Math.min(stageW, stageH) / 2 - 44;
+  const cx = stageW / 2, cy = stageH / 2;
+  const mapX = (x) => cx + x * R, mapY = (y) => cy + y * R;
+  const nTop = topics.length;
+
+  atlasPts = [];
+  const pass = (wantSpec) => {
+    for (const e of experts) {
+      const isSpec = e.spec >= 0.5;
+      if (isSpec !== wantSpec) continue;
+      const px = mapX(e.x), py = mapY(e.y);
+      ctx.globalAlpha = wantSpec ? (0.5 + 0.45 * e.spec) : 0.14;
+      ctx.fillStyle = topicColor(e.t, nTop, dark);
+      ctx.beginPath();
+      ctx.arc(px, py, wantSpec ? (1.5 + 3.5 * e.spec) : 1.0, 0, 6.2832);
+      ctx.fill();
+      if (wantSpec) atlasPts.push({ px, py, e });
+    }
+  };
+  pass(false); // faint generalist cloud
+  pass(true);  // specialists on top
+  ctx.globalAlpha = 1;
+
+  ctx.font = "600 11px -apple-system, BlinkMacSystemFont, sans-serif";
+  ctx.textBaseline = "middle";
+  for (const a of anchors || []) {
+    const px = mapX(a.x), py = mapY(a.y);
+    const ti = topics.indexOf(a.label);
+    ctx.fillStyle = topicColor(ti < 0 ? 0 : ti, nTop, dark);
+    ctx.beginPath(); ctx.arc(px, py, 3, 0, 6.2832); ctx.fill();
+    ctx.textAlign = px > cx ? "left" : "right";
+    ctx.fillText(a.label, px + (px > cx ? 7 : -7), py);
+  }
+}
+
+async function refreshAtlas() {
+  try {
+    const r = await fetch("/atlas");
+    if (!r.ok) return; // 404 = no atlas built for this model
+    atlasData = await r.json();
+    renderAtlas();
+  } catch {}
+}
+
+atlasCanvas.addEventListener("mousemove", (e) => {
+  if (!atlasPts) { atlasTip.hidden = true; return; }
+  const rect = atlasCanvas.getBoundingClientRect();
+  const x = e.clientX - rect.left, y = e.clientY - rect.top;
+  let best = null, bd = 80;
+  for (const p of atlasPts) {
+    const d = (p.px - x) * (p.px - x) + (p.py - y) * (p.py - y);
+    if (d < bd) { bd = d; best = p; }
+  }
+  if (!best) { atlasTip.hidden = true; return; }
+  const ex = best.e;
+  atlasTip.textContent = "";
+  const l1 = document.createElement("div");
+  l1.appendChild(tipK("Topic"));
+  l1.appendChild(document.createTextNode(" " + (atlasData.topics[ex.t] ?? "?")));
+  const l2 = document.createElement("div");
+  l2.appendChild(tipK("Spec"));
+  l2.appendChild(document.createTextNode(" " + Math.round(ex.spec * 100) + "% · "));
+  l2.appendChild(tipK("Heat"));
+  l2.appendChild(document.createTextNode(" " + ex.heat));
+  atlasTip.appendChild(l1);
+  atlasTip.appendChild(l2);
+  atlasTip.hidden = false;
+  atlasTip.style.left = Math.min(x + 12, rect.width - atlasTip.offsetWidth - 6) + "px";
+  atlasTip.style.top = Math.max(6, y - atlasTip.offsetHeight - 8) + "px";
+});
+atlasCanvas.addEventListener("mouseleave", () => { atlasTip.hidden = true; });
+
+const _atlasApplyTheme = applyTheme;
+applyTheme = function (theme, persist) { _atlasApplyTheme(theme, persist); renderAtlas(); };
+if (window.ResizeObserver) new ResizeObserver(() => renderAtlas()).observe(atlasStage);
+else window.addEventListener("resize", renderAtlas);
+for (const btn of document.querySelectorAll(".tabs .tab")) {
+  btn.addEventListener("click", () => { if (btn.dataset.tab === "tab-atlas") refreshAtlas(); });
+}
+$("probe").addEventListener("click", () => { if (!$("tab-atlas").hidden) refreshAtlas(); });
 </script>
 </body>
 </html>
