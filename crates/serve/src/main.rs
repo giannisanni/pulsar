@@ -777,8 +777,14 @@ fn handle_chat(
                     Err(e) => e.valid_up_to(),
                 };
                 if !tool_phase.get() {
-                    // hold back a potential marker prefix split across tokens
-                    valid = valid.min(bytes.len().saturating_sub(MARK.len() - 1));
+                    // hold back ONLY a tail that is itself a prefix of the
+                    // <tool_call> marker, so ordinary text streams immediately
+                    // instead of always lagging (and stalling) 10 bytes behind
+                    let hold = (1..MARK.len().min(bytes.len() + 1))
+                        .rev()
+                        .find(|&k| bytes.ends_with(&MARK[..k]))
+                        .unwrap_or(0);
+                    valid = valid.min(bytes.len() - hold);
                 }
                 if valid > 0 && !send_err.get() {
                     let text = String::from_utf8_lossy(&bytes[..valid]).into_owned();
