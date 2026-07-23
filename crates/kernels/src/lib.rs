@@ -1000,8 +1000,9 @@ mod real {
         check(unsafe { pulsar_gqa_rope(x.ptr_mut(), n_tok, n_head, head_dim, rot_dim, pos0, theta, factors.map_or(std::ptr::null(), |b| b.ptr())) }, "gqa_rope")
     }
 
-    /// KV cache storage format: 0 = f32 (exact), 1 = fp8 e4m3 + per-row
-    /// scale (row stride head_dim+4 bytes, opt-in via PULSAR_KV=fp8).
+    /// KV cache storage format (kvq). 0 = f32 (exact), 1 = fp8 e4m3 +
+    /// per-row scale, 2 = fp16, 3 = int8 + per-row scale, 4 = q8_0,
+    /// 5 = q4_0. Opt-in via PULSAR_KV=<fmt>; row stride per format.
     #[allow(clippy::too_many_arguments)]
     pub fn gqa_kv_append(cache: &mut DeviceBuf, kv: &DeviceBuf, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, kvq: u32) -> Result {
         check(unsafe { pulsar_gqa_kv_append(cache.ptr_mut(), kv.ptr(), n_tok, n_kv_head, head_dim, cap, pos0, kvq) }, "gqa_kv_append")

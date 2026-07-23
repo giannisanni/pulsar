@@ -3513,9 +3513,12 @@ mod real {
         expert_ptrs: DeviceBuf,
         kcache: Vec<DeviceBuf>,
         vcache: Vec<DeviceBuf>,
-        /// Gqa KV storage: false = f32 (exact), true = fp8 e4m3 + per-row
-        /// scale (PULSAR_KV=fp8, lossy, opt-in)
-        kv_fp8: bool,
+        /// Gqa KV storage format (kvq). 0=f32 (exact, default), 1=fp8
+        /// e4m3 + per-row scale, 2=fp16, 3=int8 + per-row scale, 4=q8_0,
+        /// 5=q4_0. All lossy formats opt-in via PULSAR_KV=<fmt>; the
+        /// default f32 path keeps bit-exact guarantees. MLA/Dsv4 keep
+        /// their own caches as-is.
+        kvq: u32,
         logits: DeviceBuf,
         pub store: StreamingStore,
         prefetcher: Prefetcher,
@@ -4123,13 +4126,34 @@ mod real {
 
             // Gqa: kcache/vcache are per-head K/V. Mla: kcache is the
             // compact latent cache (kv_lora wide), vcache the rope tail.
-            // PULSAR_KV=fp8 stores Gqa rows as e4m3 + per-row f32 scale
-            // (stride head_dim+4, ~3.9x smaller). Lossy, so opt-in: the
-            // default f32 path keeps the bit-exact guarantees. MLA keeps
-            // its compact latent cache as-is.
-            let kv_fp8 = matches!(s.family, Family::Gqa)
-                && std::env::var("PULSAR_KV").ok().as_deref() == Some("fp8");
-            let kv_row = |hd: usize| if kv_fp8 { hd + 4 } else { hd * 4 };
+            // PULSAR_KV selects the Gqa KV storage format, opt-in and
+            // lossy (the default f32 path keeps bit-exact guarantees):
+            //   fp8  -> e4m3 + per-row f32 scale (stride head_dim+4, ~3.9x)
+            //   fp16 -> IEEE half           (stride head_dim*2,   ~2.0x)
+            //   int8 -> int8 + per-row scale(stride head_dim+4,  ~4.0x)
+            //   q8_0 -> 32-wide blocks f16 d + 32 i8 (stride head_dim/32*34)
+            //   q4_0 -> 32-wide blocks f16 d + 16 nibbles (stride head_dim/32*18)
+            // MLA keeps its compact latent cache as-is.
+            let kvq = if matches!(s.family, Family::Gqa | Family::Qwen35) {
+                match std::env::var("PULSAR_KV").ok().as_deref() {
+                    Some("fp8") => 1,
+                    Some("fp16") | Some("f16") => 2,
+                    Some("int8") | Some("i8") => 3,
+                    Some("q8_0") | Some("q8") => 4,
+                    Some("q4_0") | Some("q4") => 5,
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+            let kv_row = |hd: usize| match kvq {
+                0 => hd * 4,
+                1 | 3 => hd + 4,      // per-row f32 scale
+                2 => hd * 2,          // pure fp16
+                4 => (hd / 32) * 34,  // q8_0: 34 B / 32 elems
+                5 => (hd / 32) * 18,  // q4_0: 18 B / 32 elems
+                _ => hd * 4,
+            };
             let (k_bytes, v_bytes) = match s.family {
                 Family::Gqa => {
                     let b = s.n_head_kv as usize * ctx as usize * kv_row(s.head_dim as usize);
@@ -4147,14 +4171,26 @@ mod real {
                     (b, b)
                 }
             };
-            if kv_fp8 {
+            if kvq != 0 {
                 let full = s.n_head_kv as usize * ctx as usize * s.head_dim as usize * 4;
+                let name = match kvq {
+                    1 => "fp8", 2 => "fp16", 3 => "int8", 4 => "q8_0", _ => "q4_0",
+                };
                 eprintln!(
-                    "pulsar: fp8 KV cache on ({:.2} GB -> {:.2} GB over {} layers)",
+                    "pulsar: {name} KV cache on ({:.2} GB -> {:.2} GB over {} layers)",
                     (full * 2 * s.n_exec_layer as usize) as f64 / 1e9,
                     ((k_bytes + v_bytes) * s.n_exec_layer as usize) as f64 / 1e9,
                     s.n_exec_layer,
                 );
+                // q8_0/q4_0 kernels require 32-wide blocks; a non-multiple head_dim
+                // makes the append guard return 0 silently (cache stays uninitialized).
+                if matches!(kvq, 4 | 5) {
+                    eprintln!(
+                        "pulsar: block-KV head_dim={} ({}divisible by 32)",
+                        s.head_dim,
+                        if s.head_dim % 32 == 0 { "" } else { "NOT " }
+                    );
+                }
             }
             // batch prefill: activations sized for max_batch tokens; the
             // logits/lm-head path stays single-row (last token only)
@@ -4353,7 +4389,7 @@ mod real {
                 )?,
                 kcache,
                 vcache,
-                kv_fp8,
+                kvq,
                 logits: f32s(spec_rows * s.n_vocab)?,
                 store: StreamingStore::open(&m.shards, cache_bytes)?,
                 prefetcher: Prefetcher::spawn(&m.shards)?,
@@ -4842,7 +4878,7 @@ mod real {
                             kernels::gqa_rope(&mut st.q, n_tok, nh_q, hd, rot, pos0, theta, factors)?;
                             kernels::gqa_rope(&mut st.k, n_tok, hkv, hd, rot, pos0, theta, factors)?;
                         }
-                        let kvq = st.kv_fp8 as u32;
+                        let kvq = st.kvq;
                         kernels::gqa_kv_append(&mut st.kcache[il], &st.k, n_tok, hkv, hd, st.ctx, pos0, kvq)?;
                         kernels::gqa_kv_append(&mut st.vcache[il], &st.v, n_tok, hkv, hd, st.ctx, pos0, kvq)?;
                         // gemma scores at scale 1.0 (q is per-head normed);

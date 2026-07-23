@@ -1,39 +1,35 @@
 #!/usr/bin/env bash
-# Generic Pulsar launcher: auto-picks the best GPUs on the machine.
+# Quick PULSAR_KV sweep: tok/s + greedy-id quality diff vs f32 baseline.
 #
-# Pulsar roles (see engine ensure_device / MLA attn placement):
-#   PRIMARY (stream) — best host↔device link (PCIe gen × width proxy)
-#   ATTN             — most free VRAM among the remaining capable GPUs
+# GPU auto-selection is lifted verbatim from runpulsar.sh (denylist + PCIe
+# scoring + free-VRAM attn pick + auto CACHE_GB / ATTN_VRAM). Keep the two in
+# sync if you touch the topology logic.
 #
-# Weak / tiny cards are hidden from CUDA_VISIBLE_DEVICES so they cannot
-# become primary by accident (e.g. GTX 1060 3GB at Gen2 x1).
+# PULSAR_KV only touches GQA / Qwen35 family models. MLA (glm-dsa / GLM-5.2)
+# and Dsv4 keep their own caches and ignore it — this script warns if a format
+# fails to engage.
 #
-# Env overrides:
-#   PULSAR_MIN_VRAM_MB     min total VRAM to be a candidate (default 8192)
-#   PULSAR_GPU / PULSAR_ATTN_GPU / CUDA_VISIBLE_DEVICES
-#                          if PULSAR_GPU is pre-set with CUDA_VISIBLE_DEVICES, auto-pick is skipped
-#   PULSAR_CACHE_GB, PULSAR_ATTN_VRAM_GB (or =off), PULSAR_ATTN_TIER_RESERVE_GB
-#   PULSAR_CPU, PULSAR_CPU_STEAL
-#   MODEL, PROMPT, N
-#   MODE                   generate (default) | chat | serve
-#                          generate: one-shot -p PROMPT -n N
-#                          chat:      pulsar-cli --chat (multi-turn, KV retained;
-#                                     pass --system "..." via args)
-#                          serve:     pulsar-serve --port PORT --host HOST
-#                                     (build first: cargo build --release -p serve)
-#   PORT, HOST             serve mode endpoint (default 11435 / 127.0.0.1)
+# Usage:
+#   MODEL=/path/to/qwen3moe.gguf ./docs/examples/bench_kv.sh
+#   MODEL=... PROMPT="..." N=512 ./docs/examples/bench_kv.sh
+#   MODEL=... CUDA_VISIBLE_DEVICES=0 PULSAR_GPU=0 ./docs/examples/bench_kv.sh   # pin topology
+#   MODEL=... FMTS="f32 q4_0" ./docs/examples/bench_kv.sh                        # subset
+#
+# Env: MODEL (required) · PROMPT · N (default 512; bigger = KV effect clearer)
+#      FMTS (default "f32 fp8 fp16 int8 q8_0 q4_0")
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
-MODEL="${MODEL:-/home/cesar/models/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf}"
-PROMPT="${PROMPT:-The capital of France is}"
-N="${N:-64}"
+CLI="${PULSAR_CLI:-$ROOT/target/release/pulsar-cli}"
+[ -x "$CLI" ] || { echo "build first: cargo build --release -p engine" >&2; exit 1; }
+
+MODEL="${MODEL:?set MODEL= to a GQA/Qwen35 family gguf (NOT glm-dsa/GLM-5.2)}"
+PROMPT="${PROMPT:-List the first eight Fibonacci numbers, then explain each in one short sentence.}"
+N="${N:-512}"
+FMTS="${FMTS:-f32 fp8 fp16 int8 q8_0 q4_0}"
 MIN_VRAM_MB="${PULSAR_MIN_VRAM_MB:-8192}"
-MODE="${MODE:-generate}"
-PORT="${PORT:-11435}"
-HOST="${HOST:-127.0.0.1}"
 
 # ---- host expert cache (auto from MemAvailable) ----
 if [ -n "${PULSAR_CACHE_GB:-}" ]; then
@@ -47,23 +43,12 @@ else
   AUTO_CACHE_NOTE=" (auto: ${_AVAIL_GB}G avail - ${_HEADROOM}G headroom)"
 fi
 
-# ATTN_VRAM_GB: if user set PULSAR_ATTN_VRAM_GB, honor it; else auto after GPU pick.
 ATTN_VRAM_USER="${PULSAR_ATTN_VRAM_GB-}"
 ATTN_VRAM_GB=""
 ATTN_VRAM_NOTE=""
 CPU="${PULSAR_CPU:-1}"
 CPU_STEAL="${PULSAR_CPU_STEAL:-0}"
 
-# Auto-calc attn VRAM budget (GiB) for a dual-GPU layout.
-# Engine: only this many GiB of the MLA stack stay in VRAM on the attn card;
-# the rest is pinned host; leftover VRAM holds resident expert tiers.
-#
-# Heuristic (measured max on AISERVER: 24G free → 12G budget):
-#   budget ≈ free_gb / 2
-#   but leave at least PULSAR_ATTN_TIER_RESERVE_GB (default 8) for tiers when free is large
-#   clamp to [6, free_gb - 4]
-#
-# free_mb: free MiB on the attn GPU before load.
 calc_attn_vram_gb() {
   local free_mb="${1:-0}"
   [[ "$free_mb" =~ ^[0-9]+$ ]] || free_mb=0
@@ -75,8 +60,6 @@ calc_attn_vram_gb() {
   local by_tier=$(( free_gb - tier_reserve ))
   [ "$by_tier" -lt 0 ] && by_tier=0
 
-  # Prefer half-free (balanced stack vs tier). If free-tier_reserve is
-  # smaller, use that so we never starve the tier reserve on mid-size cards.
   local budget=$by_half
   if [ "$by_tier" -gt 0 ] && [ "$by_tier" -lt "$budget" ]; then
     budget=$by_tier
@@ -91,18 +74,10 @@ calc_attn_vram_gb() {
 }
 
 # ---- GPU auto-selection ----
-# Score stream candidate: theoretical PCIe-ish bandwidth ~ gen * width.
-# Use the link's MAX capability, not .current: idle GPUs downtrain to gen1
-# (measured: a Gen5 card reads gen1 at idle), which would randomize the
-# pick on same-width boxes. Capability is a stable ORDERING; the engine
-# still H2D-probes real bandwidth at runtime among visible devices.
-# Score attn candidate: free MiB (capacity for MLA stack + tier residual).
 command -v nvidia-smi >/dev/null || {
-  echo "ERROR: nvidia-smi not found" >&2
-  exit 1
+  echo "ERROR: nvidia-smi not found" >&2; exit 1
 }
 
-# index, name, total_mb, free_mb, pcie_gen, pcie_width
 mapfile -t GPU_ROWS < <(
   nvidia-smi --query-gpu=index,name,memory.total,memory.free,pcie.link.gen.max,pcie.link.width.max,pcie.link.gen.current,pcie.link.width.current \
     --format=csv,noheader,nounits 2>/dev/null | sed 's/, /,/g'
@@ -114,15 +89,9 @@ if [ "${#GPU_ROWS[@]}" -eq 0 ]; then
   exit 1
 fi
 
-# Arrays of candidate physical indices and metadata (parallel)
-CAND_IDX=()
-CAND_NAME=()
-CAND_TOTAL=()
-CAND_FREE=()
-CAND_PCIE=()   # gen * width (0 if unknown)
+CAND_IDX=(); CAND_NAME=(); CAND_TOTAL=(); CAND_FREE=(); CAND_PCIE=()
 
 is_denylisted() {
-  # Tiny / display-class cards often mis-rank if VRAM threshold is low.
   local u="${1^^}"
   case "$u" in
     *1030*|*1050*|*1060*|*1650\ MAX-Q*|*MX150*|*MX250*|*MX330*|*UHD*|*P600*|*P620*)
@@ -134,18 +103,10 @@ is_denylisted() {
 echo "scanning GPUs (min ${MIN_VRAM_MB} MiB total VRAM)..."
 for row in "${GPU_ROWS[@]}"; do
   IFS=',' read -r idx name total free gen width cgen cwidth <<<"$row"
-  idx="${idx// /}"
-  name="${name# }"
-  total="${total// /}"
-  free="${free// /}"
-  gen="${gen// /}"
-  width="${width// /}"
-  # nvidia-smi may print [N/A]
+  idx="${idx// /}"; name="${name# }"; total="${total// /}"; free="${free// /}"
+  gen="${gen// /}"; width="${width// /}"; cgen="${cgen// /}"; cwidth="${cwidth// /}"
   [[ "$total" =~ ^[0-9]+$ ]] || total=0
   [[ "$free" =~ ^[0-9]+$ ]] || free=0
-  cgen="${cgen// /}"
-  cwidth="${cwidth// /}"
-  # older drivers report [N/A] for max: fall back to the trained link
   [[ "$gen" =~ ^[0-9]+$ ]] || gen="$cgen"
   [[ "$width" =~ ^[0-9]+$ ]] || width="$cwidth"
   [[ "$gen" =~ ^[0-9]+$ ]] || gen=0
@@ -161,11 +122,8 @@ for row in "${GPU_ROWS[@]}"; do
     continue
   fi
   echo "  cand  GPU $idx  $name  free=${free} MiB  PCIe gen${gen} x${width} (score=${pcie})"
-  CAND_IDX+=("$idx")
-  CAND_NAME+=("$name")
-  CAND_TOTAL+=("$total")
-  CAND_FREE+=("$free")
-  CAND_PCIE+=("$pcie")
+  CAND_IDX+=("$idx"); CAND_NAME+=("$name"); CAND_TOTAL+=("$total")
+  CAND_FREE+=("$free"); CAND_PCIE+=("$pcie")
 done
 
 n_cand=${#CAND_IDX[@]}
@@ -175,7 +133,6 @@ if [ "$n_cand" -lt 1 ]; then
   exit 1
 fi
 
-# Pick stream primary: highest PCIe score, tie-break free VRAM then total VRAM
 STREAM_I=0
 for ((i = 1; i < n_cand; i++)); do
   better=0
@@ -196,10 +153,7 @@ STREAM_PHYS="${CAND_IDX[$STREAM_I]}"
 STREAM_NAME="${CAND_NAME[$STREAM_I]}"
 STREAM_FREE="${CAND_FREE[$STREAM_I]}"
 
-# Pick attn: highest free VRAM among remaining candidates
-ATTN_I=""
-ATTN_PHYS=""
-ATTN_NAME=""
+ATTN_I=""; ATTN_PHYS=""; ATTN_NAME=""
 if [ "$n_cand" -ge 2 ]; then
   for ((i = 0; i < n_cand; i++)); do
     [ "$i" -eq "$STREAM_I" ] && continue
@@ -232,7 +186,6 @@ if [ -n "${PULSAR_GPU:-}" ]; then
 else
   export CUDA_DEVICE_ORDER=PCI_BUS_ID
   if [ -n "$ATTN_PHYS" ]; then
-    # Remap: local 0 = stream primary, local 1 = attn
     export CUDA_VISIBLE_DEVICES="${STREAM_PHYS},${ATTN_PHYS}"
     export PULSAR_GPU=0
     export PULSAR_ATTN_GPU=1
@@ -245,7 +198,6 @@ fi
 
 export PULSAR_CACHE_GB="$CACHE_GB"
 
-# ---- PULSAR_ATTN_VRAM_GB: user override or auto for dual-GPU ----
 if [ -n "$ATTN_VRAM_USER" ]; then
   if [[ "$ATTN_VRAM_USER" == "off" || "$ATTN_VRAM_USER" == "0" ]]; then
     unset PULSAR_ATTN_VRAM_GB
@@ -255,15 +207,13 @@ if [ -n "$ATTN_VRAM_USER" ]; then
     ATTN_VRAM_NOTE=" (user override)"
   fi
 elif [ -z "${MANUAL:-}" ] && [ -n "${ATTN_PHYS:-}" ] && [ -n "${ATTN_FREE:-}" ]; then
-  # Dual-GPU: balance resident MLA stack vs residual expert tier on attn card.
   ATTN_VRAM_GB="$(calc_attn_vram_gb "$ATTN_FREE")"
   export PULSAR_ATTN_VRAM_GB="$ATTN_VRAM_GB"
   _free_g=$(( (ATTN_FREE + 512) / 1024 ))
-  ATTN_VRAM_NOTE=" (auto: ~${_free_g}G free on attn → budget ${ATTN_VRAM_GB}G stack, leave rest for expert tier)"
+  ATTN_VRAM_NOTE=" (auto: ~${_free_g}G free on attn → budget ${ATTN_VRAM_GB}G stack)"
 else
-  # Single GPU or manual topology: let the engine default (family-specific).
   unset PULSAR_ATTN_VRAM_GB
-  ATTN_VRAM_NOTE=" (engine default; set PULSAR_ATTN_VRAM_GB to override)"
+  ATTN_VRAM_NOTE=" (manual topology — engine default; set PULSAR_ATTN_VRAM_GB to override)"
 fi
 
 unset PULSAR_TIERS 2>/dev/null || true
@@ -294,77 +244,71 @@ echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "PULSAR_GPU=$PULSAR_GPU"
 echo "PULSAR_ATTN_GPU=${PULSAR_ATTN_GPU:-unset}"
 echo "PULSAR_CACHE_GB=$PULSAR_CACHE_GB${AUTO_CACHE_NOTE:-}"
-echo "PULSAR_DEV_CACHE_GB=${PULSAR_DEV_CACHE_GB:-solved by engine (free VRAM − staging − reserve)}"
 echo "PULSAR_ATTN_VRAM_GB=${PULSAR_ATTN_VRAM_GB:-unset}${ATTN_VRAM_NOTE}"
-echo "PULSAR_TIERS=${PULSAR_TIERS:-on (default — unset leaves engine default)}"
-echo "PULSAR_KV=${PULSAR_KV:-f32 (default; one of fp8/fp16/int8/q8_0/q4_0, lossy KV squeeze)}"
-echo "PULSAR_BATCH=${PULSAR_BATCH:-solved by engine (worst-case staging vs free VRAM)}"
-echo "PULSAR_NO_PREFETCH=${PULSAR_NO_PREFETCH:-unset (cross-layer prefetcher ON)}"
-echo "PULSAR_PROFILE=${PULSAR_PROFILE:-unset}"
-echo "PULSAR_CPU=${PULSAR_CPU:-unset (CPU expert lane OFF)}"
-echo "PULSAR_CPU_STEAL=$PULSAR_CPU_STEAL"
+echo "PULSAR_KV will cycle: $FMTS"
 echo "model: $MODEL"
-echo
-echo "run mode: $MODE"
-case "$MODE" in
-  generate)
-    echo "  pulsar-cli  -p \"$PROMPT\"  -n $N  (PULSAR_PROFILE=1 forced)"
-    ;;
-  chat)
-    echo "  pulsar-cli  --chat  (multi-turn, KV retained; PULSAR_PROFILE=1 forced)"
-    ;;
-  serve)
-    echo "  pulsar-serve  --port $PORT  --host $HOST  (PULSAR_PROFILE left to env)"
-    ;;
-esac
+echo "prompt: $PROMPT"
+echo "N=$N"
 echo
 
-echo "physical cards in use:"
-nvidia-smi -i "$CUDA_VISIBLE_DEVICES" \
-  --query-gpu=index,name,memory.total,memory.free,pcie.link.gen.current,pcie.link.width.current \
-  --format=csv
-echo
+# ---- bench ----
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
 
-# Refuse to start if primary is nearly empty (stuck context / other process)
-PRIM_FREE=$(nvidia-smi -i "$STREAM_PHYS" --query-gpu=memory.free --format=csv,noheader,nounits | tr -d ' ')
-PRIM_FREE=${PRIM_FREE%%.*}
-if [[ "${PRIM_FREE:-0}" =~ ^[0-9]+$ ]] && [ "${PRIM_FREE:-0}" -lt 4096 ]; then
-  echo "ERROR: stream GPU $STREAM_PHYS free memory is ${PRIM_FREE} MiB (< 4 GiB). Free the card first:" >&2
-  echo "  nvidia-smi" >&2
-  echo "  # sudo nvidia-smi --gpu-reset -i $STREAM_PHYS" >&2
-  exit 1
-fi
-
-case "$MODE" in
-  generate|chat)
-    CLI="${PULSAR_CLI:-$ROOT/target/release/pulsar-cli}"
-    if [ ! -x "$CLI" ]; then
-      echo "ERROR: pulsar-cli not found at $CLI (build with: cargo build --release -p engine)" >&2
-      exit 1
+# tag = tmp-file key (defaults to fmt). Lets us run f32 twice under
+# different names (baseline vs noise-floor) without clobbering files.
+run() {
+    local fmt="$1"
+    local tag="${2:-$fmt}"
+    local log="$TMP/$tag.log"
+    if [ "$fmt" = "f32" ]; then
+        env PULSAR_PROFILE=1 "$CLI" -m "$MODEL" -p "$PROMPT" -n "$N" >/dev/null 2> "$log" || true
+    else
+        env PULSAR_KV="$fmt" PULSAR_PROFILE=1 "$CLI" -m "$MODEL" -p "$PROMPT" -n "$N" >/dev/null 2> "$log" || true
+        grep -q "$fmt KV cache on" "$log" \
+            || echo "  WARN: $fmt did not activate — model is not GQA/Qwen35" >&2
     fi
-    ;;
-  serve)
-    CLI="${PULSAR_SERVE:-$ROOT/target/release/pulsar-serve}"
-    if [ ! -x "$CLI" ]; then
-      echo "ERROR: pulsar-serve not found at $CLI (build with: cargo build --release -p serve)" >&2
-      exit 1
-    fi
-    ;;
-  *)
-    echo "ERROR: MODE='$MODE' (expected: generate | chat | serve)" >&2
-    exit 1
-    ;;
-esac
+    grep -oP '\([0-9.]+ tok/s\)' "$log" | tr -d '()' | head -1 > "$TMP/$tag.tps"
+    grep '^pulsar: ids' "$log" | head -1 > "$TMP/$tag.ids"
+    grep -oP '\d+' "$TMP/$tag.ids" > "$TMP/$tag.nums"
+    printf '  %-6s %s\n' "$tag" "$(<"$TMP/$tag.tps")"
+}
 
-case "$MODE" in
-  generate)
-    exec env PULSAR_PROFILE=1 "$CLI" -m "$MODEL" -p "$PROMPT" -n "$N" "$@"
-    ;;
-  chat)
-    exec env PULSAR_PROFILE=1 "$CLI" -m "$MODEL" --chat "$@"
-    ;;
-  serve)
-    echo "serving on http://${HOST}:${PORT}/v1/chat/completions (Ctrl-C to stop)"
-    exec "$CLI" -m "$MODEL" --port "$PORT" --host "$HOST" "$@"
-    ;;
-esac
+echo "warmup (f32, loads weights into host cache)..."
+run f32 warmup
+echo
+
+echo "noise floor (f32 again — greedy ids drift from GPU nondeterminism)..."
+run f32 f32_noise
+echo
+
+echo "tok/s:"
+for fmt in $FMTS; do run "$fmt"; done
+
+echo
+echo "quality (greedy ids — FIRST divergence is the real signal;"
+echo "          total mismatches is dominated by autoregressive chaos):"
+
+# Noise floor: f32 vs f32. CUDA atomics + reduction order make even the
+# bit-exact path drift. A format whose first-divergence is near this floor
+# is indistinguishable from nondeterminism → KV quant is correct.
+# A format that diverges MUCH earlier than the floor has a real bug.
+noise=$(awk 'NR==FNR{a[NR]=$1; m=NR; next} {b[FNR]=$1}
+    END{ n=(m<FNR?m:FNR); c=0; first=0;
+         for(i=1;i<=n;i++) if(a[i]!=b[i]){ c++; if(!first) first=i }
+         printf "%d/%d differ, first at #%d", c, n, first }' \
+    "$TMP/f32.nums" "$TMP/f32_noise.nums")
+printf '  %-6s %s   ← noise floor (f32 vs f32)\n' "f32xf32" "$noise"
+
+for fmt in $FMTS; do
+    if [ "$fmt" = f32 ]; then
+        printf '  %-6s baseline (%s tokens)\n' "$fmt" "$(wc -l < "$TMP/f32.nums")"
+    else
+        result=$(awk 'NR==FNR{a[NR]=$1; m=NR; next} {b[FNR]=$1}
+            END{ n=(m<FNR?m:FNR); c=0; first=0;
+                 for(i=1;i<=n;i++) if(a[i]!=b[i]){ c++; if(!first) first=i }
+                 printf "%d/%d differ, first at #%d", c, n, first }' \
+            "$TMP/f32.nums" "$TMP/$fmt.nums")
+        printf '  %-6s %s\n' "$fmt" "$result"
+    fi
+done
