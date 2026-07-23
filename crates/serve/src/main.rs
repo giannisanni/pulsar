@@ -298,7 +298,7 @@ fn run() -> engine::Result {
                         respond_json(&mut stream, 200, &serde_json::json!({"reloading": name}))?;
                         let _ = std::io::Write::flush(&mut stream);
                         eprintln!("pulsar-serve: switching model -> {name}, re-exec");
-                        let err = reexec(&target, cpu_lane_on());
+                        let err = reexec(&target, cpu_lane_on(), None);
                         eprintln!("pulsar-serve: re-exec failed: {err}");
                         std::process::exit(1);
                     }
@@ -311,9 +311,25 @@ fn run() -> engine::Result {
                     respond_json(&mut stream, 200, &serde_json::json!({"reloading": true, "cpu_lane": enabled}))?;
                     let _ = std::io::Write::flush(&mut stream);
                     eprintln!("pulsar-serve: CPU lane -> {enabled}, re-exec");
-                    let err = reexec(std::path::Path::new(&model_path), enabled);
+                    let err = reexec(std::path::Path::new(&model_path), enabled, None);
                     eprintln!("pulsar-serve: re-exec failed: {err}");
                     std::process::exit(1);
+                }
+                // Resize the context window: re-exec the current model with a new
+                // --ctx (reallocates the KV cache, same as a model switch).
+                ("POST", "/ctx") => {
+                    let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                    let n = req["ctx"].as_u64().unwrap_or(0) as u32;
+                    if !(512..=262144).contains(&n) {
+                        respond_json(&mut stream, 400, &serde_json::json!({"error": {"message": "ctx out of range (512..262144)"}}))
+                    } else {
+                        respond_json(&mut stream, 200, &serde_json::json!({"reloading": true, "ctx": n}))?;
+                        let _ = std::io::Write::flush(&mut stream);
+                        eprintln!("pulsar-serve: ctx -> {n}, re-exec");
+                        let err = reexec(std::path::Path::new(&model_path), cpu_lane_on(), Some(n));
+                        eprintln!("pulsar-serve: re-exec failed: {err}");
+                        std::process::exit(1);
+                    }
                 }
                 ("POST", "/v1/chat/completions") => handle_chat(
                     &mut stream,
@@ -410,19 +426,31 @@ fn cpu_name() -> String {
 /// Only returns (with an error) if exec fails. The model path is validated by
 /// the caller to be a .gguf inside the current model's directory.
 #[cfg(target_os = "linux")]
-fn reexec(newmodel: &std::path::Path, cpu_lane: bool) -> std::io::Error {
+fn reexec(newmodel: &std::path::Path, cpu_lane: bool, new_ctx: Option<u32>) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     let args: Vec<String> = std::env::args().collect();
     let mut cmd = std::process::Command::new(&args[0]);
     let mut i = 1;
+    let mut saw_ctx = false;
     while i < args.len() {
         if args[i] == "-m" || args[i] == "--model" {
             cmd.arg(&args[i]).arg(newmodel);
+            i += 2;
+        } else if args[i] == "--ctx" && i + 1 < args.len() {
+            saw_ctx = true;
+            cmd.arg("--ctx");
+            match new_ctx {
+                Some(c) => { cmd.arg(c.to_string()); }
+                None => { cmd.arg(&args[i + 1]); }
+            }
             i += 2;
         } else {
             cmd.arg(&args[i]);
             i += 1;
         }
+    }
+    if let (false, Some(c)) = (saw_ctx, new_ctx) {
+        cmd.arg("--ctx").arg(c.to_string());
     }
     if cpu_lane {
         cmd.env("PULSAR_CPU", "1");

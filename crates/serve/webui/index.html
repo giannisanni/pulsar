@@ -645,6 +645,9 @@
     border-color: var(--accent);
   }
   .cpu-toggle:disabled { opacity: .5; cursor: default; }
+  .ctx-row { display: flex; gap: 8px; align-items: center; }
+  .ctx-row input { flex: 1; }
+  .ctx-row .cpu-toggle { flex: 0 0 auto; min-height: 28px; }
   /* model placement: sidebar expanded → show in sidebar, hide from top bar;
      sidebar collapsed → hide sidebar copy, show compact top-bar copy */
   @media (min-width: 901px) {
@@ -1256,6 +1259,13 @@
           <label><span class="field-label">max_tokens</span>
             <input type="number" id="max-tokens" step="32" min="1" value="1024" />
           </label>
+          <label><span class="field-label">context window <span class="hint">reloads the model</span></span>
+            <div class="ctx-row">
+              <input type="number" id="ctx-window" step="1024" min="512" max="262144" value="8192" />
+              <button id="ctx-apply" class="cpu-toggle" type="button" title="Resize the KV context window (reloads the model)">Resize</button>
+            </div>
+          </label>
+          <div class="model-switch-note" id="ctx-note" hidden></div>
         </div>
       </details>
       <span class="hint"><kbd>Enter</kbd> send · <kbd>Shift+Enter</kbd> newline</span>
@@ -1427,6 +1437,47 @@ modelSwitch.addEventListener("change", () => {
   }
 });
 
+// --- Context window resize (--ctx; re-exec, reallocates KV, same reload as a switch) ---
+const ctxWindow = $("ctx-window");
+const ctxApply = $("ctx-apply");
+const ctxNote = $("ctx-note");
+async function resizeCtx(n) {
+  ctxApply.disabled = true;
+  ctxNote.hidden = false;
+  ctxNote.textContent = "resizing to " + fmtCtx(n) + " … reloading";
+  try {
+    const r = await fetch("/ctx", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ctx: n }),
+    });
+    if (!r.ok) { ctxNote.textContent = "resize rejected (512..262144)"; ctxApply.disabled = false; return; }
+  } catch {}
+  const t0 = Date.now();
+  const poll = async () => {
+    if (Date.now() - t0 > 360000) { ctxNote.textContent = "resize timed out (larger windows may OOM)"; ctxApply.disabled = false; return; }
+    try {
+      const j = await fetchStats();
+      if (j.ctx === n) {
+        applyStats(j);
+        ctxNote.hidden = true;
+        ctxApply.disabled = false;
+        return;
+      }
+    } catch {}
+    setTimeout(poll, 3000);
+  };
+  setTimeout(poll, 5000);
+}
+ctxApply.addEventListener("click", () => {
+  const n = parseInt(ctxWindow.value, 10);
+  if (!Number.isFinite(n) || n < 512 || n > 262144) { ctxNote.hidden = false; ctxNote.textContent = "enter 512..262144"; return; }
+  if (n === maxCtx) return;
+  if (window.confirm("Resize context to " + fmtCtx(n) + "?\nThe server reloads the model and the chat clears. Larger windows use more memory and may fail to load on a tight box.")) {
+    resizeCtx(n);
+  }
+});
+
 // --- CPU expert lane toggle (PULSAR_CPU; re-exec, same reload as a switch) ---
 const cpuToggle = $("cpu-lane-toggle");
 function setCpuToggle(on) {
@@ -1529,6 +1580,7 @@ function applyStats(j) {
   if (Number.isFinite(j?.ctx) && j.ctx > 0) {
     maxCtx = j.ctx;
     if (!curCtx) $("stat-ctx").textContent = fmtCtx(maxCtx);
+    if (document.activeElement !== ctxWindow) ctxWindow.value = maxCtx;
   }
   if (typeof j?.cpu_lane === "boolean") setCpuToggle(j.cpu_lane);
   // model residency: how much of the model sits in VRAM / RAM cache / on disk
