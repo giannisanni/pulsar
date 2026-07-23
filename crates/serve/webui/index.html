@@ -606,6 +606,26 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .model-switch {
+    width: 100%;
+    margin-top: 8px;
+    padding: 6px 8px;
+    color: var(--text-warm);
+    background: var(--glass-input);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    font-family: var(--sans);
+    font-size: 11.5px;
+    cursor: pointer;
+    outline: none;
+  }
+  .model-switch:disabled { opacity: .55; cursor: default; }
+  .model-switch-note {
+    margin-top: 6px;
+    color: var(--accent);
+    font-size: 11px;
+    line-height: 1.4;
+  }
   /* model placement: sidebar expanded → show in sidebar, hide from top bar;
      sidebar collapsed → hide sidebar copy, show compact top-bar copy */
   @media (min-width: 901px) {
@@ -1080,6 +1100,8 @@
   <div class="side-section" id="model-side-section">
     <div class="side-title">Active model</div>
     <div class="model-side" id="model-side">loading…</div>
+    <select id="model-switch" class="model-switch" title="Switch model — reloads the server"></select>
+    <div class="model-switch-note" id="model-switch-note" hidden></div>
   </div>
 
   <div class="side-section">
@@ -1322,6 +1344,66 @@ async function fetchStats() {
   return r.json();
 }
 
+// --- Model switcher: list ggufs, load = server re-exec + reload ---
+const modelSwitch = $("model-switch");
+const modelSwitchNote = $("model-switch-note");
+const stem = (n) => n.replace(/\.gguf$/, "");
+async function loadModelList() {
+  try {
+    const r = await fetch("/models/list");
+    if (!r.ok) return;
+    const models = (await r.json()).models || [];
+    modelSwitch.innerHTML = "";
+    for (const m of models) {
+      const opt = document.createElement("option");
+      opt.value = m.id;
+      opt.textContent = stem(m.id) + "  (" + (m.bytes / 1073741824).toFixed(0) + "GB)";
+      if (m.current) opt.selected = true;
+      modelSwitch.appendChild(opt);
+    }
+    modelSwitch.hidden = models.length < 2;
+    modelSwitch.disabled = models.length < 2 || controller !== null;
+  } catch {}
+}
+async function switchModel(name) {
+  modelSwitch.disabled = true;
+  modelSwitchNote.hidden = false;
+  modelSwitchNote.textContent = "switching to " + stem(name) + " … reloading (~1-3 min)";
+  try {
+    const r = await fetch("/models/load", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: name }),
+    });
+    if (!r.ok) { modelSwitchNote.textContent = "switch rejected"; modelSwitch.disabled = false; return; }
+  } catch {}
+  // the server is re-execing; poll /stats until it is back on the new model
+  const t0 = Date.now();
+  const poll = async () => {
+    if (Date.now() - t0 > 360000) { modelSwitchNote.textContent = "switch timed out"; modelSwitch.disabled = false; return; }
+    try {
+      const j = await fetchStats();
+      if (j.model === stem(name)) {
+        applyStats(j);
+        await loadModelList();
+        modelSwitchNote.hidden = true;
+        modelSwitch.disabled = false;
+        return;
+      }
+    } catch {}
+    setTimeout(poll, 3000);
+  };
+  setTimeout(poll, 5000);
+}
+modelSwitch.addEventListener("change", () => {
+  const name = modelSwitch.value;
+  if (window.confirm("Switch to " + stem(name) + "?\nThe server reloads the model (~1-3 min) and the chat clears.")) {
+    switchModel(name);
+  } else {
+    loadModelList(); // revert the selection
+  }
+});
+
 // Render a segment bar + legend. segs: [{cls, label, val, pct, text}].
 function renderBar(barEl, legEl, segs) {
   barEl.innerHTML = "";
@@ -1440,6 +1522,7 @@ async function probe() {
     applyStats(await fetchStats());
     reach.className = "reach ok";
     reach.textContent = "Engine reachable";
+    loadModelList();
   } catch {
     reach.className = "reach bad";
     reach.textContent = "unreachable";

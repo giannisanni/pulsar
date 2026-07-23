@@ -250,6 +250,57 @@ fn run() -> engine::Result {
                         &serde_json::json!({"error": {"message": "no atlas built for this model"}}),
                     ),
                 },
+                // Available *.gguf models in the current model's directory.
+                ("GET", "/models/list") => {
+                    let dir = std::path::Path::new(&model_path)
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_default();
+                    let cur = std::path::Path::new(&model_path)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+                    let mut models: Vec<_> = std::fs::read_dir(&dir)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .filter_map(|e| {
+                            let name = e.file_name().to_string_lossy().into_owned();
+                            // skip non-models: MTP draft sidecars aren't standalone
+                            if !name.ends_with(".gguf") || name.contains("draft") {
+                                return None;
+                            }
+                            let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
+                            Some(serde_json::json!({"id": name, "bytes": bytes, "current": name == cur}))
+                        })
+                        .collect();
+                    models.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+                    respond_json(&mut stream, 200, &serde_json::json!({"models": models}))
+                }
+                // Switch model: validate, ack, then re-exec with the new -m.
+                ("POST", "/models/load") => {
+                    let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                    let name = req["model"].as_str().unwrap_or("");
+                    let dir = std::path::Path::new(&model_path)
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_default();
+                    let target = dir.join(name);
+                    let ok = !name.is_empty()
+                        && !name.contains('/')
+                        && name.ends_with(".gguf")
+                        && target.is_file();
+                    if !ok {
+                        respond_json(&mut stream, 400, &serde_json::json!({"error": {"message": "invalid or unknown model"}}))
+                    } else {
+                        respond_json(&mut stream, 200, &serde_json::json!({"reloading": name}))?;
+                        let _ = std::io::Write::flush(&mut stream);
+                        eprintln!("pulsar-serve: switching model -> {name}, re-exec");
+                        let err = reexec_with_model(&target);
+                        eprintln!("pulsar-serve: re-exec failed: {err}");
+                        std::process::exit(1);
+                    }
+                }
                 ("POST", "/v1/chat/completions") => handle_chat(
                     &mut stream,
                     &body,
@@ -338,6 +389,28 @@ fn cpu_name() -> String {
                 .map(|v| v.trim().to_string())
         })
         .unwrap_or_default()
+}
+
+/// Re-exec this process with a different `-m` model, keeping every other arg
+/// (host/port/ctx). Same PID/systemd unit; the new image reloads the model.
+/// Only returns (with an error) if exec fails. The model path is validated by
+/// the caller to be a .gguf inside the current model's directory.
+#[cfg(target_os = "linux")]
+fn reexec_with_model(newmodel: &std::path::Path) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    let args: Vec<String> = std::env::args().collect();
+    let mut cmd = std::process::Command::new(&args[0]);
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "-m" || args[i] == "--model" {
+            cmd.arg(&args[i]).arg(newmodel);
+            i += 2;
+        } else {
+            cmd.arg(&args[i]);
+            i += 1;
+        }
+    }
+    cmd.exec()
 }
 
 /// GPU names by device index, from nvidia-smi (empty if unavailable). VRAM
