@@ -300,7 +300,7 @@ Everything auto-configures; these override.
 |---|---|---|
 | `PULSAR_GPU` | measured | CUDA index of the expert-streaming (primary) GPU |
 | `PULSAR_ATTN_GPU` | auto (MLA) | attention GPU by CUDA index. MLA models auto-offload (`off` disables); GQA models are opt-in by index: a capacity shuffle that loses on 2 GPUs at short context, pays on 3+ GPUs or long context |
-| `PULSAR_KV` | f32 | `fp8` stores GQA K/V as e4m3 + per-row scale (~3.9x smaller KV, longer contexts in the same VRAM). Lossy, hence opt-in: the default keeps decode bit-exact. Runs on any GPU (storage format, no fp8 hardware needed). Measured: greedy ids unchanged on short-context runs |
+| `PULSAR_KV` | f32 | GQA K/V storage format. One of `fp8` (e4m3 + per-row scale, ~3.9× smaller KV), `fp16` (IEEE half, ~2.0×), `int8` (int8 + per-row scale, ~4.0×), `q8_0` (32-wide blocks, ~3.8×), `q4_0` (32-wide blocks, ~7.6×). Lossy, hence opt-in: the default f32 keeps decode bit-exact. Runs on any GPU (storage format, no special hardware needed). MLA/Dsv4 keep their own caches |
 | `PULSAR_TIERS` | on | `off` disables resident expert tiers (also the bit-exact single-device path) |
 | `PULSAR_CACHE_GB` | measured | host RAM budget for the expert LFU cache (solved from MemAvailable) |
 | `PULSAR_DEV_CACHE_GB` | solved | VRAM hot-expert pool: measured free VRAM minus staging + reserve |

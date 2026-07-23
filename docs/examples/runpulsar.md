@@ -156,7 +156,7 @@ from the engine's own defaults.
 
 | var | default | what |
 |---|---|---|
-| `PULSAR_KV` | `f32` | `fp8` = e4m3 + per-row scale (~3.9× smaller KV). Lossy, opt-in |
+| `PULSAR_KV` | `f32` | GQA K/V format: `fp8` (e4m3+scale, ~3.9×), `fp16` (~2.0×), `int8` (~4.0×), `q8_0` (~3.8×), `q4_0` (~7.6×). Lossy, opt-in |
 | `PULSAR_TIERS` | `on` | resident expert tiers on spare GPUs. `off` = bit-exact single-device path |
 | `PULSAR_NO_PREFETCH` | unset | set any value to disable the cross-layer prefetcher |
 | `PULSAR_PROFILE` | unset | per-stage wall-time profile. **Forced to `1` in generate/chat by the script** |

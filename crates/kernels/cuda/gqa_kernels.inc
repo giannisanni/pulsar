@@ -146,7 +146,115 @@ __device__ __forceinline__ static uint8_t e4m3_enc(float x) {
     return s | (uint8_t)(((e + 7) << 3) | (q - 8));
 }
 
-template <bool KV8>
+/* ---- KV storage format enum + per-format row geometry/dequant helpers ----
+ * KVF selects the decode-time KV layout. Row stride + dequant all vary:
+ * F32/F16 are packed and scale-free; FP8/INT8 carry one f32 scale at the
+ * row tail (stride = head_dim {e4m3|i8} + 4); Q8_0/Q4_0 carry a per-32-elem
+ * f16 d inside each block (stride = head_dim/32 * {34|18}). The attention
+ * kernel is templated on KVF so the per-row layout is compile-time. */
+enum class Kvf : uint32_t { F32 = 0, FP8 = 1, FP16 = 2, INT8 = 3, Q8_0 = 4, Q4_0 = 5 };
+
+__device__ __forceinline__ static uint64_t kv_row_stride(Kvf kvf, uint32_t head_dim) {
+    switch (kvf) {
+        case Kvf::FP8:
+        case Kvf::INT8: return (uint64_t)head_dim + 4u;
+        case Kvf::FP16: return (uint64_t)head_dim * 2u;
+        case Kvf::Q8_0: return ((uint64_t)head_dim / 32u) * 34u;
+        case Kvf::Q4_0: return ((uint64_t)head_dim / 32u) * 18u;
+        default:       return (uint64_t)head_dim * 4u; /* F32 */
+    }
+}
+
+/* qk dot for a single key row: dot = sum_d q[d] * dequant_k(d), then the
+ * per-row / per-block scale folds out (applied once by the caller via
+ * row_scale_out). The scale-free packed formats (f32, fp16) return 1.0. */
+template <Kvf KVF>
+__device__ __forceinline__ static float gqa_kdot(
+        const void *row_void, const float *sq, uint32_t head_dim, float *row_scale_out) {
+    float dot = 0.0f;
+    float rs = 1.0f;
+    if (KVF == Kvf::F32) {
+        const float *krow = (const float *)row_void;
+        for (uint32_t d = 0; d < head_dim; d++) dot += sq[d] * krow[d];
+    } else if (KVF == Kvf::FP16) {
+        const __half *krow = (const __half *)row_void;
+        for (uint32_t d = 0; d < head_dim; d++) dot += sq[d] * __half2float(krow[d]);
+    } else if (KVF == Kvf::FP8) {
+        const uint8_t *krow = (const uint8_t *)row_void;
+        for (uint32_t d = 0; d < head_dim; d++) dot += sq[d] * e4m3_dec_common(krow[d]);
+        memcpy(&rs, krow + head_dim, 4);
+    } else if (KVF == Kvf::INT8) {
+        const int8_t *krow = (const int8_t *)row_void;
+        for (uint32_t d = 0; d < head_dim; d++) dot += sq[d] * (float)krow[d];
+        memcpy(&rs, (const uint8_t *)krow + head_dim, 4);
+    } else if (KVF == Kvf::Q8_0) {
+        const char *blocks = (const char *)row_void;
+        const uint32_t n_blocks = head_dim / 32u;
+        for (uint32_t b = 0; b < n_blocks; b++) {
+            const char *bb = blocks + (uint64_t)b * 34u;
+            float d = __half2float(*(const __half *)bb);
+            const int8_t *qs = (const int8_t *)(bb + 2u);
+            for (uint32_t i = 0; i < 32u; i++) dot += sq[b * 32u + i] * d * (float)qs[i];
+        }
+    } else { /* Q4_0 */
+        const char *blocks = (const char *)row_void;
+        const uint32_t n_blocks = head_dim / 32u;
+        for (uint32_t b = 0; b < n_blocks; b++) {
+            const char *bb = blocks + (uint64_t)b * 18u;
+            float d = __half2float(*(const __half *)bb);
+            const uint8_t *qs = (const uint8_t *)(bb + 2u);
+            for (uint32_t i = 0; i < 16u; i++) {
+                uint8_t byte = qs[i];
+                dot += sq[b * 32u + i]      * d * ((float)(byte & 0xFu) - 8.0f);
+                dot += sq[b * 32u + i + 16u] * d * ((float)(byte >> 4)   - 8.0f);
+            }
+        }
+    }
+    *row_scale_out = rs;
+    return dot;
+}
+
+/* V accumulation against a weighted softmax output for output dim `d`:
+ * out_acc(d) += w * dequant_v(d). The fp8/int8 per-row scale folds into
+ * one packed weight `wv = w * row_scale`; q8_0/q4_0 fold their per-block d
+ * inside the call. d is the per-thread output lane. */
+template <Kvf KVF>
+__device__ __forceinline__ static float gqa_vacc_lane(
+        const void *row_void, uint32_t d, uint32_t head_dim) {
+    if (KVF == Kvf::F32)  return ((const float *)row_void)[d];
+    if (KVF == Kvf::FP16) return __half2float(((const __half *)row_void)[d]);
+    if (KVF == Kvf::FP8)  return e4m3_dec_common(((const uint8_t *)row_void)[d]);
+    if (KVF == Kvf::INT8) return (float)((const int8_t *)row_void)[d];
+    const char *blocks = (const char *)row_void;
+    if (KVF == Kvf::Q8_0) {
+        const uint32_t b = d >> 5, i = d & 31u;
+        const char *bb = blocks + (uint64_t)b * 34u;
+        float dd = __half2float(*(const __half *)bb);
+        return dd * (float)((const int8_t *)(bb + 2u))[i];
+    }
+    /* Q4_0 — append packs byte j as {elem[j] low, elem[j+16] high} (split-half,
+     * one thread owns two nibbles 16 apart); index by i&15 for the byte and
+     * (i>>4)<<2 for the nibble shift. The old i>>1 / (i&1)<<2 here assumed
+     * sequential pairs and scrambled V. */
+    const uint32_t b = d >> 5, i = d & 31u, bytei = i & 15u, sh = ((i >> 4) & 1u) << 2;
+    const char *bb = blocks + (uint64_t)b * 18u;
+    float dd = __half2float(*(const __half *)bb);
+    uint8_t q = (((const uint8_t *)(bb + 2u))[bytei] >> sh) & 0xFu;
+    return dd * ((float)q - 8.0f);
+}
+
+/* per-row V scale for the formats that carry one (fp8/int8), else 1.0. */
+template <Kvf KVF>
+__device__ __forceinline__ static float gqa_vrow_scale(const void *row_void, uint32_t head_dim) {
+    if (KVF == Kvf::FP8 || KVF == Kvf::INT8) {
+        float s;
+        memcpy(&s, (const uint8_t *)row_void + (KVF == Kvf::FP8 ? head_dim : head_dim), 4);
+        return s;
+    }
+    return 1.0f;
+}
+
+template <Kvf KVF>
 __global__ static void gqa_attention_kernel(
         float *out,
         const float *q,
@@ -173,11 +281,9 @@ __global__ static void gqa_attention_kernel(
      * rel_row[(pos0+t) - j] when the distance is inside the extent; the
      * bias rides OUTSIDE the qk scale (reference folds 1/head_dim into q) */
     const float *rel_row = rel ? rel + ((uint64_t)t * n_head + h) * rel_extent : NULL;
-    const uint64_t kv_stride = KV8 ? (uint64_t)head_dim + 4u : (uint64_t)head_dim;
-    const uint8_t *kh8 = KV8 ? (const uint8_t *)k_cache + (uint64_t)kvh * cap * kv_stride : NULL;
-    const uint8_t *vh8 = KV8 ? (const uint8_t *)v_cache + (uint64_t)kvh * cap * kv_stride : NULL;
-    const float *kh = KV8 ? NULL : (const float *)k_cache + (uint64_t)kvh * cap * head_dim;
-    const float *vh = KV8 ? NULL : (const float *)v_cache + (uint64_t)kvh * cap * head_dim;
+    const uint64_t kv_stride = kv_row_stride(KVF, head_dim);
+    const char *kbase = (const char *)k_cache + (uint64_t)kvh * cap * kv_stride;
+    const char *vbase = (const char *)v_cache + (uint64_t)kvh * cap * kv_stride;
     /* Online softmax, single pass over K and V.  128 threads: thread d owns
      * output dim d; rows are processed in chunks of 128 with each thread
      * computing one row's score, then everyone accumulates V against the
@@ -199,18 +305,10 @@ __global__ static void gqa_attention_kernel(
         /* one score per thread */
         float s = -INFINITY;
         if (tid < chunk) {
-            float dot = 0.0f;
-            if (KV8) {
-                const uint8_t *krow = kh8 + (uint64_t)(base + tid) * kv_stride;
-                for (uint32_t d = 0; d < head_dim; d++) dot += sq[d] * e4m3_dec_common(krow[d]);
-                float ks;
-                memcpy(&ks, krow + head_dim, 4);
-                dot *= ks;
-            } else {
-                const float *krow = kh + (uint64_t)(base + tid) * head_dim;
-                for (uint32_t d = 0; d < head_dim; d++) dot += sq[d] * krow[d];
-            }
-            s = dot * scale;
+            const char *krow = kbase + (uint64_t)(base + tid) * kv_stride;
+            float ks;
+            float dot = gqa_kdot<KVF>(krow, sq, head_dim, &ks);
+            s = dot * ks * scale;
             if (rel_row) {
                 const uint32_t dist = (pos0 + t) - (base + tid);
                 if (dist < rel_extent) s += rel_row[dist];
@@ -232,19 +330,10 @@ __global__ static void gqa_attention_kernel(
         for (uint32_t r = 0; r < chunk; r++) {
             float w = s_w[r];
             den += w;
-            if (KV8) {
-                const uint8_t *vrow = vh8 + (uint64_t)(base + r) * kv_stride;
-                float vs;
-                memcpy(&vs, vrow + head_dim, 4);
-                const float wv = w * vs;
-                for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++) {
-                    acc[k] += wv * e4m3_dec_common(vrow[d]);
-                }
-            } else {
-                const float *vrow = vh + (uint64_t)(base + r) * head_dim;
-                for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++) {
-                    acc[k] += w * vrow[d];
-                }
+            const char *vrow = vbase + (uint64_t)(base + r) * kv_stride;
+            float wv = w * gqa_vrow_scale<KVF>(vrow, head_dim);
+            for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++) {
+                acc[k] += wv * gqa_vacc_lane<KVF>(vrow, d, head_dim);
             }
         }
         m = m_new;
@@ -270,7 +359,7 @@ __global__ static void gqa_attention_kernel(
 #define GQA_SPLIT_ROWS     2048u
 #define GQA_SPLIT_MAX      64u
 
-template <bool KV8>
+template <Kvf KVF>
 __global__ static void gqa_attention_split_kernel(
         float *partial,      /* [n_tok][n_head][n_split][hd+2]: acc, m, den */
         const float *q,
@@ -303,11 +392,9 @@ __global__ static void gqa_attention_split_kernel(
         return;
     }
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
-    const uint64_t kv_stride = KV8 ? (uint64_t)head_dim + 4u : (uint64_t)head_dim;
-    const uint8_t *kh8 = KV8 ? (const uint8_t *)k_cache + (uint64_t)kvh * cap * kv_stride : NULL;
-    const uint8_t *vh8 = KV8 ? (const uint8_t *)v_cache + (uint64_t)kvh * cap * kv_stride : NULL;
-    const float *kh = KV8 ? NULL : (const float *)k_cache + (uint64_t)kvh * cap * head_dim;
-    const float *vh = KV8 ? NULL : (const float *)v_cache + (uint64_t)kvh * cap * head_dim;
+    const uint64_t kv_stride = kv_row_stride(KVF, head_dim);
+    const char *kbase = (const char *)k_cache + (uint64_t)kvh * cap * kv_stride;
+    const char *vbase = (const char *)v_cache + (uint64_t)kvh * cap * kv_stride;
     __shared__ float sq[512];
     __shared__ float s_w[128];
     __shared__ float red[128];
@@ -321,18 +408,10 @@ __global__ static void gqa_attention_split_kernel(
         uint32_t chunk = hi - base < 128u ? hi - base : 128u;
         float s = -INFINITY;
         if (tid < chunk) {
-            float dot = 0.0f;
-            if (KV8) {
-                const uint8_t *krow = kh8 + (uint64_t)(base + tid) * kv_stride;
-                for (uint32_t d = 0; d < head_dim; d++) dot += sq[d] * e4m3_dec_common(krow[d]);
-                float ks;
-                memcpy(&ks, krow + head_dim, 4);
-                dot *= ks;
-            } else {
-                const float *krow = kh + (uint64_t)(base + tid) * head_dim;
-                for (uint32_t d = 0; d < head_dim; d++) dot += sq[d] * krow[d];
-            }
-            s = dot * scale;
+            const char *krow = kbase + (uint64_t)(base + tid) * kv_stride;
+            float ks;
+            float dot = gqa_kdot<KVF>(krow, sq, head_dim, &ks);
+            s = dot * ks * scale;
         }
         red[tid] = s;
         __syncthreads();
@@ -350,19 +429,10 @@ __global__ static void gqa_attention_split_kernel(
         for (uint32_t r = 0; r < chunk; r++) {
             float w = s_w[r];
             den += w;
-            if (KV8) {
-                const uint8_t *vrow = vh8 + (uint64_t)(base + r) * kv_stride;
-                float vs;
-                memcpy(&vs, vrow + head_dim, 4);
-                const float wv = w * vs;
-                for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++) {
-                    acc[k] += wv * e4m3_dec_common(vrow[d]);
-                }
-            } else {
-                const float *vrow = vh + (uint64_t)(base + r) * head_dim;
-                for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++) {
-                    acc[k] += w * vrow[d];
-                }
+            const char *vrow = vbase + (uint64_t)(base + r) * kv_stride;
+            float wv = w * gqa_vrow_scale<KVF>(vrow, head_dim);
+            for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++) {
+                acc[k] += wv * gqa_vacc_lane<KVF>(vrow, d, head_dim);
             }
         }
         m = m_new;
@@ -420,7 +490,7 @@ static void *gqa_split_scratch(uint64_t bytes) {
     return g_gqa_split_scratch[dev];
 }
 
-template <bool KV8>
+template <Kvf KVF>
 static int gqa_attention_dispatch(
         float *out, const float *q, const void *kc, const void *vc,
         uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
@@ -437,7 +507,7 @@ static int gqa_attention_dispatch(
             float *partial = (float *)gqa_split_scratch(bytes);
             if (partial) { /* alloc failure falls through to the plain kernel */
                 dim3 g1(n_tok, n_head, n_split);
-                gqa_attention_split_kernel<KV8><<<g1, 128>>>(
+                gqa_attention_split_kernel<KVF><<<g1, 128>>>(
                         partial, q, kc, vc, n_tok, n_head, n_kv_head,
                         head_dim, cap, pos0, scale, window, n_split);
                 if (!cuda_ok(cudaGetLastError(), "gqa split launch")) return 0;
@@ -448,7 +518,7 @@ static int gqa_attention_dispatch(
         }
     }
     dim3 grid(n_tok, n_head, 1);
-    gqa_attention_kernel<KV8><<<grid, 128>>>(
+    gqa_attention_kernel<KVF><<<grid, 128>>>(
             out, q, kc, vc, n_tok, n_head, n_kv_head, head_dim, cap, pos0,
             scale, window, rel, rel_extent);
     return cuda_ok(cudaGetLastError(), "gqa attention launch");
@@ -503,7 +573,7 @@ extern "C" int ds4_gpu_gqa_attention(
         (rel && rel_extent == 0)) {
         return 0;
     }
-    return gqa_attention_dispatch<false>(
+    return gqa_attention_dispatch<Kvf::F32>(
             (float *)out->ptr, (const float *)q->ptr,
             k_cache->ptr, v_cache->ptr,
             n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window,
@@ -550,6 +620,189 @@ extern "C" int ds4_gpu_gqa_kv_cache_append_fp8(
     return cuda_ok(cudaGetLastError(), "gqa kv append fp8 launch");
 }
 
+/* ---- fp16 (IEEE half) KV cache, PULSAR_KV=fp16 -------------------------
+ * Storage: head_dim __half per row, stride head_dim*2. No per-row scale:
+ * fp16 range (±65504) covers K/V post-rope amplitudes losslessly enough
+ * for attention, and rounding is the only loss. ~2x smaller than f32. */
+__global__ static void gqa_kv_append_fp16_kernel(
+        __half *cache, const float *kv, uint32_t n_tok, uint32_t n_kv_head,
+        uint32_t head_dim, uint32_t cap, uint32_t pos0) {
+    const uint32_t t = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
+    if (t >= n_tok || h >= n_kv_head) return;
+    const float *src = kv + ((uint64_t)t * n_kv_head + h) * head_dim;
+    __half *dst = cache + ((uint64_t)h * cap + pos0 + t) * head_dim;
+    for (uint32_t d = tid; d < head_dim; d += 128u) dst[d] = __float2half(src[d]);
+}
+
+extern "C" int ds4_gpu_gqa_kv_cache_append_fp16(
+        ds4_gpu_tensor *cache, const ds4_gpu_tensor *kv,
+        uint32_t n_tok, uint32_t n_kv_head, uint32_t head_dim,
+        uint32_t cap, uint32_t pos0) {
+    if (!cache || !kv || n_tok == 0 || n_kv_head == 0 || head_dim == 0 ||
+        head_dim % 2u != 0 || pos0 + n_tok > cap) {
+        return 0;
+    }
+    dim3 grid(n_tok, n_kv_head, 1);
+    gqa_kv_append_fp16_kernel<<<grid, 128>>>(
+            (__half *)cache->ptr, (const float *)kv->ptr,
+            n_tok, n_kv_head, head_dim, cap, pos0);
+    return cuda_ok(cudaGetLastError(), "gqa kv append fp16 launch");
+}
+
+/* ---- int8 + per-row scale KV cache, PULSAR_KV=int8 ----------------------
+ * Same layout/story as fp8 but signed int8 symmetric: row = head_dim
+ * int8 + one f32 scale (amax/127) at the row tail, stride head_dim+4.
+ * ~4x smaller than f32; per-row scale keeps the resolution the bit-exact
+ * f32 path has via dot rescaling. */
+__global__ static void gqa_kv_append_int8_kernel(
+        int8_t *cache, const float *kv, uint32_t n_tok, uint32_t n_kv_head,
+        uint32_t head_dim, uint32_t cap, uint32_t pos0) {
+    const uint32_t t = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
+    if (t >= n_tok || h >= n_kv_head) return;
+    const float *src = kv + ((uint64_t)t * n_kv_head + h) * head_dim;
+    int8_t *dst = cache + ((uint64_t)h * cap + pos0 + t) * ((uint64_t)head_dim + 4u);
+    __shared__ float red[128];
+    float amax = 0.0f;
+    for (uint32_t d = tid; d < head_dim; d += 128u) amax = fmaxf(amax, fabsf(src[d]));
+    red[tid] = amax;
+    __syncthreads();
+    for (uint32_t st = 64u; st != 0; st >>= 1u) {
+        if (tid < st) red[tid] = fmaxf(red[tid], red[tid + st]);
+        __syncthreads();
+    }
+    const float rmax = red[0];
+    const float scale = rmax / 127.0f;
+    const float inv = rmax > 0.0f ? 127.0f / rmax : 0.0f;
+    for (uint32_t d = tid; d < head_dim; d += 128u) {
+        float q = src[d] * inv;
+        int qi = __float2int_rn(q);
+        if (qi > 127) qi = 127;
+        if (qi < -128) qi = -128;
+        dst[d] = (int8_t)qi;
+    }
+    if (tid == 0) memcpy(dst + head_dim, &scale, 4);
+}
+
+extern "C" int ds4_gpu_gqa_kv_cache_append_int8(
+        ds4_gpu_tensor *cache, const ds4_gpu_tensor *kv,
+        uint32_t n_tok, uint32_t n_kv_head, uint32_t head_dim,
+        uint32_t cap, uint32_t pos0) {
+    if (!cache || !kv || n_tok == 0 || n_kv_head == 0 || head_dim == 0 ||
+        head_dim % 4u != 0 || pos0 + n_tok > cap) {
+        return 0;
+    }
+    dim3 grid(n_tok, n_kv_head, 1);
+    gqa_kv_append_int8_kernel<<<grid, 128>>>(
+            (int8_t *)cache->ptr, (const float *)kv->ptr,
+            n_tok, n_kv_head, head_dim, cap, pos0);
+    return cuda_ok(cudaGetLastError(), "gqa kv append int8 launch");
+}
+
+/* ---- q8_0 KV cache, PULSAR_KV=q8_0 -------------------------------------
+ * 32-wide blocks: f16 d (2B) + 32 int8 (32B) = 34B/block. Row stride
+ * head_dim/32*34. d = block amax/127; value = d * q[i]. Matches the ggml
+ * block layout used elsewhere in pulsar (mla q8 dot). One CUDA block per
+ * (t,h) row, sequential over the (<=16) 32-wide blocks; 32 threads/block
+ * do the amax reduce then quantize. */
+__global__ static void gqa_kv_append_q8_0_kernel(
+        char *cache, const float *kv, uint32_t n_tok, uint32_t n_kv_head,
+        uint32_t head_dim, uint32_t cap, uint32_t pos0) {
+    const uint32_t t = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
+    if (t >= n_tok || h >= n_kv_head || tid >= 32u) return;
+    const uint32_t n_blocks = head_dim / 32u;
+    const float *src = kv + ((uint64_t)t * n_kv_head + h) * head_dim;
+    char *dst = cache + ((uint64_t)h * cap + pos0 + t) * ((uint64_t)n_blocks * 34u);
+    __shared__ float red[32];
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        const float *blk = src + b * 32u;
+        char *bb = dst + (uint64_t)b * 34u;
+        float amax = fabsf(blk[tid]);
+        red[tid] = amax;
+        __syncthreads();
+        for (uint32_t st = 16u; st != 0; st >>= 1u)
+            if (tid < st) red[tid] = fmaxf(red[tid], red[tid + st]);
+        __syncthreads();
+        const float rmax = red[0];
+        const float d = rmax / 127.0f;
+        const float inv = rmax > 0.0f ? 127.0f / rmax : 0.0f;
+        if (tid == 0) *(__half *)bb = __float2half(d);
+        float q = blk[tid] * inv;
+        int qi = __float2int_rn(q);
+        if (qi > 127) qi = 127;
+        if (qi < -128) qi = -128;
+        bb[2u + tid] = (int8_t)qi;
+    }
+}
+
+extern "C" int ds4_gpu_gqa_kv_cache_append_q8_0(
+        ds4_gpu_tensor *cache, const ds4_gpu_tensor *kv,
+        uint32_t n_tok, uint32_t n_kv_head, uint32_t head_dim,
+        uint32_t cap, uint32_t pos0) {
+    if (!cache || !kv || n_tok == 0 || n_kv_head == 0 || head_dim == 0 ||
+        head_dim % 32u != 0 || pos0 + n_tok > cap) {
+        return 0;
+    }
+    dim3 grid(n_tok, n_kv_head, 1);
+    gqa_kv_append_q8_0_kernel<<<grid, 32>>>(
+            (char *)cache->ptr, (const float *)kv->ptr,
+            n_tok, n_kv_head, head_dim, cap, pos0);
+    return cuda_ok(cudaGetLastError(), "gqa kv append q8_0 launch");
+}
+
+/* ---- q4_0 KV cache, PULSAR_KV=q4_0 -------------------------------------
+ * 32-wide blocks: f16 d (2B) + 16 bytes (4-bit quants, two elems/byte) =
+ * 18B/block. Row stride head_dim/32*18. value = d * (q - 8); q in [0,15].
+ * The tightest format here; inner-loop dequant unpacks two nibbles/byte.
+ * 32 threads/block: first 16 own a byte each (two low/high nibbles). */
+__global__ static void gqa_kv_append_q4_0_kernel(
+        char *cache, const float *kv, uint32_t n_tok, uint32_t n_kv_head,
+        uint32_t head_dim, uint32_t cap, uint32_t pos0) {
+    const uint32_t t = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
+    if (t >= n_tok || h >= n_kv_head || tid >= 32u) return;
+    const uint32_t n_blocks = head_dim / 32u;
+    const float *src = kv + ((uint64_t)t * n_kv_head + h) * head_dim;
+    char *dst = cache + ((uint64_t)h * cap + pos0 + t) * ((uint64_t)n_blocks * 18u);
+    __shared__ float red[32];
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        const float *blk = src + b * 32u;
+        char *bb = dst + (uint64_t)b * 18u;
+        float amax = fabsf(blk[tid]);
+        red[tid] = amax;
+        __syncthreads();
+        for (uint32_t st = 16u; st != 0; st >>= 1u)
+            if (tid < st) red[tid] = fmaxf(red[tid], red[tid + st]);
+        __syncthreads();
+        const float rmax = red[0];
+        /* q4_0: value = d*(q-8), q in [0,15]; symmetric around 0 via -8.
+         * Map amax to the 8..15 swing (8.5 keeps midpoint resolution). */
+        const float d = rmax / 8.5f;
+        const float inv = rmax > 0.0f ? 8.5f / rmax : 0.0f;
+        if (tid == 0) *(__half *)bb = __float2half(d);
+        if (tid < 16u) {
+            int q0 = __float2int_rn(blk[tid] * inv) + 8;
+            int q1 = __float2int_rn(blk[tid + 16u] * inv) + 8;
+            if (q0 > 15) q0 = 15; if (q0 < 0) q0 = 0;
+            if (q1 > 15) q1 = 15; if (q1 < 0) q1 = 0;
+            bb[2u + tid] = (uint8_t)(q0 | (q1 << 4));
+        }
+    }
+}
+
+extern "C" int ds4_gpu_gqa_kv_cache_append_q4_0(
+        ds4_gpu_tensor *cache, const ds4_gpu_tensor *kv,
+        uint32_t n_tok, uint32_t n_kv_head, uint32_t head_dim,
+        uint32_t cap, uint32_t pos0) {
+    if (!cache || !kv || n_tok == 0 || n_kv_head == 0 || head_dim == 0 ||
+        head_dim % 32u != 0 || pos0 + n_tok > cap) {
+        return 0;
+    }
+    dim3 grid(n_tok, n_kv_head, 1);
+    gqa_kv_append_q4_0_kernel<<<grid, 32>>>(
+            (char *)cache->ptr, (const float *)kv->ptr,
+            n_tok, n_kv_head, head_dim, cap, pos0);
+    return cuda_ok(cudaGetLastError(), "gqa kv append q4_0 launch");
+}
+
 extern "C" int ds4_gpu_gqa_attention_fp8(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
@@ -563,7 +816,87 @@ extern "C" int ds4_gpu_gqa_attention_fp8(
         pos0 + n_tok > cap || (rel && rel_extent == 0)) {
         return 0;
     }
-    return gqa_attention_dispatch<true>(
+    return gqa_attention_dispatch<Kvf::FP8>(
+            (float *)out->ptr, (const float *)q->ptr,
+            k_cache->ptr, v_cache->ptr,
+            n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window,
+            rel ? (const float *)rel->ptr : NULL, rel_extent);
+}
+
+extern "C" int ds4_gpu_gqa_attention_fp16(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
+        uint32_t head_dim, uint32_t cap, uint32_t pos0,
+        float scale, uint32_t window,
+        const ds4_gpu_tensor *rel, uint32_t rel_extent) {
+    if (!out || !q || !k_cache || !v_cache ||
+        n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
+        head_dim == 0 || head_dim > 512u || head_dim % 2u != 0 ||
+        pos0 + n_tok > cap || (rel && rel_extent == 0)) {
+        return 0;
+    }
+    return gqa_attention_dispatch<Kvf::FP16>(
+            (float *)out->ptr, (const float *)q->ptr,
+            k_cache->ptr, v_cache->ptr,
+            n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window,
+            rel ? (const float *)rel->ptr : NULL, rel_extent);
+}
+
+extern "C" int ds4_gpu_gqa_attention_int8(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
+        uint32_t head_dim, uint32_t cap, uint32_t pos0,
+        float scale, uint32_t window,
+        const ds4_gpu_tensor *rel, uint32_t rel_extent) {
+    if (!out || !q || !k_cache || !v_cache ||
+        n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
+        head_dim == 0 || head_dim > 512u || head_dim % 4u != 0 ||
+        pos0 + n_tok > cap || (rel && rel_extent == 0)) {
+        return 0;
+    }
+    return gqa_attention_dispatch<Kvf::INT8>(
+            (float *)out->ptr, (const float *)q->ptr,
+            k_cache->ptr, v_cache->ptr,
+            n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window,
+            rel ? (const float *)rel->ptr : NULL, rel_extent);
+}
+
+extern "C" int ds4_gpu_gqa_attention_q8_0(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
+        uint32_t head_dim, uint32_t cap, uint32_t pos0,
+        float scale, uint32_t window,
+        const ds4_gpu_tensor *rel, uint32_t rel_extent) {
+    if (!out || !q || !k_cache || !v_cache ||
+        n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
+        head_dim == 0 || head_dim > 512u || head_dim % 32u != 0 ||
+        pos0 + n_tok > cap || (rel && rel_extent == 0)) {
+        return 0;
+    }
+    return gqa_attention_dispatch<Kvf::Q8_0>(
+            (float *)out->ptr, (const float *)q->ptr,
+            k_cache->ptr, v_cache->ptr,
+            n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window,
+            rel ? (const float *)rel->ptr : NULL, rel_extent);
+}
+
+extern "C" int ds4_gpu_gqa_attention_q4_0(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
+        uint32_t head_dim, uint32_t cap, uint32_t pos0,
+        float scale, uint32_t window,
+        const ds4_gpu_tensor *rel, uint32_t rel_extent) {
+    if (!out || !q || !k_cache || !v_cache ||
+        n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
+        head_dim == 0 || head_dim > 512u || head_dim % 32u != 0 ||
+        pos0 + n_tok > cap || (rel && rel_extent == 0)) {
+        return 0;
+    }
+    return gqa_attention_dispatch<Kvf::Q4_0>(
             (float *)out->ptr, (const float *)q->ptr,
             k_cache->ptr, v_cache->ptr,
             n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window,

@@ -4523,11 +4523,26 @@ extern "C" int pulsar_gqa_kv_append(
         void *cache, const void *kv, uint32_t n_tok, uint32_t n_kv_head,
         uint32_t head_dim, uint32_t cap, uint32_t pos0, uint32_t kvq) {
     ds4_gpu_tensor ct = shim(cache), kt = shim(kv);
-    if (kvq == 1)
-        return ds4_gpu_gqa_kv_cache_append_fp8(&ct, &kt, n_tok, n_kv_head,
+    switch (kvq) {
+        case 1:
+            return ds4_gpu_gqa_kv_cache_append_fp8(&ct, &kt, n_tok, n_kv_head,
+                                                   head_dim, cap, pos0);
+        case 2:
+            return ds4_gpu_gqa_kv_cache_append_fp16(&ct, &kt, n_tok, n_kv_head,
+                                                    head_dim, cap, pos0);
+        case 3:
+            return ds4_gpu_gqa_kv_cache_append_int8(&ct, &kt, n_tok, n_kv_head,
+                                                    head_dim, cap, pos0);
+        case 4:
+            return ds4_gpu_gqa_kv_cache_append_q8_0(&ct, &kt, n_tok, n_kv_head,
+                                                    head_dim, cap, pos0);
+        case 5:
+            return ds4_gpu_gqa_kv_cache_append_q4_0(&ct, &kt, n_tok, n_kv_head,
+                                                    head_dim, cap, pos0);
+        default:
+            return ds4_gpu_gqa_kv_cache_append(&ct, &kt, n_tok, n_kv_head,
                                                head_dim, cap, pos0);
-    return ds4_gpu_gqa_kv_cache_append(&ct, &kt, n_tok, n_kv_head, head_dim,
-                                       cap, pos0);
+    }
 }
 
 extern "C" int pulsar_gqa_attention(
@@ -4539,13 +4554,33 @@ extern "C" int pulsar_gqa_attention(
     ds4_gpu_tensor ot = shim(out), qt = shim(q), kt = shim(k_cache),
                    vt = shim(v_cache);
     ds4_gpu_tensor rt = shim(rel);
-    if (kvq == 1)
-        return ds4_gpu_gqa_attention_fp8(&ot, &qt, &kt, &vt, n_tok, n_head,
+    const ds4_gpu_tensor *rpt = rel ? &rt : NULL;
+    switch (kvq) {
+        case 1:
+            return ds4_gpu_gqa_attention_fp8(&ot, &qt, &kt, &vt, n_tok, n_head,
+                                             n_kv_head, head_dim, cap, pos0,
+                                             scale, window, rpt, rel_extent);
+        case 2:
+            return ds4_gpu_gqa_attention_fp16(&ot, &qt, &kt, &vt, n_tok, n_head,
+                                              n_kv_head, head_dim, cap, pos0,
+                                              scale, window, rpt, rel_extent);
+        case 3:
+            return ds4_gpu_gqa_attention_int8(&ot, &qt, &kt, &vt, n_tok, n_head,
+                                              n_kv_head, head_dim, cap, pos0,
+                                              scale, window, rpt, rel_extent);
+        case 4:
+            return ds4_gpu_gqa_attention_q8_0(&ot, &qt, &kt, &vt, n_tok, n_head,
+                                              n_kv_head, head_dim, cap, pos0,
+                                              scale, window, rpt, rel_extent);
+        case 5:
+            return ds4_gpu_gqa_attention_q4_0(&ot, &qt, &kt, &vt, n_tok, n_head,
+                                              n_kv_head, head_dim, cap, pos0,
+                                              scale, window, rpt, rel_extent);
+        default:
+            return ds4_gpu_gqa_attention(&ot, &qt, &kt, &vt, n_tok, n_head,
                                          n_kv_head, head_dim, cap, pos0, scale,
-                                         window, rel ? &rt : NULL, rel_extent);
-    return ds4_gpu_gqa_attention(&ot, &qt, &kt, &vt, n_tok, n_head,
-                                 n_kv_head, head_dim, cap, pos0, scale, window,
-                                 rel ? &rt : NULL, rel_extent);
+                                         window, rpt, rel_extent);
+    }
 }
 
 extern "C" int pulsar_gqa_selftest(void) { return ds4_gpu_gqa_selftest(); }
