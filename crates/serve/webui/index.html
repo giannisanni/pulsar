@@ -41,6 +41,11 @@
     --button-hover: #dcddec;
     --selection-bg: #d6dbf7;
     --whisper: rgba(18, 18, 28, .05);
+    /* segment slots (dataviz-validated, see legend swatches) */
+    --seg1: #2f7fd0;
+    --seg2: #7d5cc0;
+    --seg3: #4a4fbc;
+    --seg4: #4fa3a8;
     /* liquid glass */
     --glass-hi: rgba(255, 255, 255, .55);
     --glass-border: rgba(255, 255, 255, .5);
@@ -85,6 +90,10 @@
     --button-hover: #2b2b3a;
     --selection-bg: #313a75;
     --whisper: rgba(0, 0, 0, .3);
+    --seg1: #6ea8ff;
+    --seg2: #b673d6;
+    --seg3: #7f82ee;
+    --seg4: #58b8bc;
     /* liquid glass, dark */
     --glass-hi: rgba(180, 190, 255, .12);
     --glass-border: rgba(150, 160, 230, .16);
@@ -124,8 +133,6 @@
     font-family: var(--sans);
     font-size: 16px;
     line-height: 1.6;
-    display: flex;
-    flex-direction: column;
     overflow: hidden;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
@@ -134,18 +141,34 @@
     color: var(--text);
     background: var(--selection-bg);
   }
+  /* ---- dashboard shell: sidebar + main ---- */
+  #shell { display: flex; height: 100dvh; }
+  main {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-width: 0;
+  }
   header {
     display: flex;
     align-items: center;
-    gap: 18px;
-    min-height: 68px;
-    padding: 12px 24px;
+    gap: 14px;
+    min-height: 56px;
+    padding: 10px 20px;
     border-bottom: 1px solid var(--glass-border);
     background: var(--glass-chrome);
     -webkit-backdrop-filter: var(--blur);
     backdrop-filter: var(--blur);
     box-shadow: var(--edge-light), 0 8px 24px var(--whisper);
     flex-shrink: 0;
+  }
+  #hamburger {
+    display: none;
+    min-width: 38px;
+    min-height: 38px;
+    padding: 8px 10px;
+    font-size: 16px;
+    line-height: 1;
   }
   .brand {
     display: flex;
@@ -155,8 +178,8 @@
   }
   .brand-copy {
     display: flex;
-    align-items: baseline;
-    gap: 10px;
+    flex-direction: column;
+    gap: 2px;
     min-width: 0;
   }
   /* pixelated pulsar: white-hot core, blue jet, violet accretion (matches the
@@ -171,7 +194,7 @@
     box-shadow: 0 0 0 1px var(--glass-border), 0 3px 12px rgba(109, 112, 238, .35);
     flex-shrink: 0;
   }
-  header .title {
+  .title {
     font-family: var(--serif);
     font-size: 19px;
     font-weight: 500;
@@ -182,19 +205,70 @@
     background-clip: text;
     color: transparent;
   }
-  :root[data-theme="dark"] header .title {
+  :root[data-theme="dark"] .title {
     background: linear-gradient(180deg, #eef0ff, #a7abca);
     -webkit-background-clip: text;
     background-clip: text;
   }
-  header .model {
-    max-width: min(38vw, 430px);
+  .tagline {
     color: var(--text-tertiary);
+    font-size: 8px;
+    font-weight: 600;
+    letter-spacing: 1.3px;
+    line-height: 1.4;
+  }
+  header .model {
+    max-width: min(26vw, 300px);
+    color: var(--text-secondary);
     font-size: 12px;
+    font-weight: 500;
     line-height: 1.4;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* tabs */
+  .tabs { display: flex; gap: 2px; }
+  .tab {
+    min-height: 32px;
+    padding: 6px 13px;
+    border-radius: 999px;
+    background: transparent;
+    box-shadow: none;
+    font-size: 12.5px;
+  }
+  .tab::after { display: none; }
+  .tab:hover { background: var(--glass-input); transform: none; }
+  .tab.active {
+    color: var(--text);
+    background: var(--glass-input);
+    box-shadow: 0 0 0 1px var(--glass-border), var(--edge-light);
+  }
+  /* live metric chips */
+  .chips { display: flex; gap: 6px; margin-left: auto; }
+  .chip {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1px;
+    min-width: 64px;
+    padding: 4px 9px;
+    border-radius: var(--radius-sm);
+    background: var(--glass-assistant);
+    box-shadow: 0 0 0 1px var(--glass-border), var(--edge-light);
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.35;
+    color: var(--text-warm);
+    white-space: nowrap;
+  }
+  .chip .chip-label {
+    color: var(--text-tertiary);
+    font-family: var(--sans);
+    font-size: 8.5px;
+    font-weight: 600;
+    letter-spacing: .8px;
+    text-transform: uppercase;
   }
   header .spacer { flex: 1; }
   .header-actions {
@@ -297,6 +371,310 @@
     line-height: 1;
   }
 
+  /* ---- sidebar ---- */
+  aside {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    width: 300px;
+    padding: 18px 16px 20px;
+    overflow-y: auto;
+    border-right: 1px solid var(--glass-border);
+    background: var(--glass-chrome);
+    -webkit-backdrop-filter: var(--blur);
+    backdrop-filter: var(--blur);
+    box-shadow: var(--edge-light);
+    flex-shrink: 0;
+    scrollbar-width: thin;
+    transition: width .22s ease, padding .22s ease, border-color .22s ease;
+  }
+  #sidebar-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 32px;
+    min-height: 32px;
+    padding: 5px 8px;
+    font-size: 14px;
+    line-height: 1;
+  }
+  #sidebar-toggle svg { transition: transform .22s ease; }
+  #sidebar-toggle[aria-pressed="true"] svg { transform: scaleX(-1); }
+  /* desktop collapse (mobile uses the overlay instead) */
+  @media (min-width: 901px) {
+    aside.collapsed {
+      width: 0;
+      padding-left: 0;
+      padding-right: 0;
+      border-right-color: transparent;
+      overflow: hidden;
+    }
+  }
+  aside .brand { padding: 2px 4px 6px; }
+  .side-section {
+    padding: 12px 13px;
+    border-radius: var(--radius-md);
+    background: var(--glass-assistant);
+    box-shadow: 0 0 0 1px var(--glass-border), var(--edge-light);
+  }
+  .side-title {
+    margin-bottom: 9px;
+    color: var(--text-tertiary);
+    font-size: 9.5px;
+    font-weight: 600;
+    letter-spacing: 1.1px;
+    text-transform: uppercase;
+  }
+  .endpoint {
+    padding: 5px 8px;
+    border-radius: 6px;
+    background: var(--glass-input);
+    box-shadow: 0 0 0 1px var(--glass-border);
+    color: var(--text-secondary);
+    font-family: var(--mono);
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .probe-row {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    margin-top: 9px;
+  }
+  .probe-row button { min-height: 30px; padding: 6px 11px; font-size: 11.5px; }
+  .reach {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-tertiary);
+    font-size: 11px;
+    line-height: 1.3;
+  }
+  .reach::before {
+    content: "";
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--ring-deep);
+    flex-shrink: 0;
+  }
+  .reach.ok { color: var(--text-warm); }
+  .reach.ok::before { background: #4fae6e; }
+  .reach.bad { color: var(--danger); }
+  .reach.bad::before { background: var(--danger); }
+  .kv {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 2.5px 0;
+    font-size: 12px;
+    line-height: 1.45;
+  }
+  .kv .k { color: var(--text-tertiary); }
+  .kv .v { color: var(--text-warm); font-family: var(--mono); font-size: 11.5px; text-align: right; }
+  .stat-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 7px;
+  }
+  .stat {
+    padding: 7px 8px 6px;
+    border-radius: var(--radius-sm);
+    background: var(--glass-input);
+    box-shadow: 0 0 0 1px var(--glass-border);
+    min-width: 0;
+  }
+  .stat .stat-v {
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.3;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .stat .stat-k {
+    color: var(--text-tertiary);
+    font-size: 8px;
+    font-weight: 600;
+    letter-spacing: .6px;
+    text-transform: uppercase;
+  }
+  /* segment bars: 2px surface gaps, 4px rounded ends, legend text in ink */
+  .bar {
+    display: flex;
+    gap: 2px;
+    height: 10px;
+    border-radius: 6px;
+    background: var(--whisper);
+    box-shadow: 0 0 0 1px var(--glass-border);
+    overflow: hidden;
+  }
+  .bar > div { height: 100%; min-width: 0; }
+  .bar > div:first-child { border-radius: 4px 0 0 4px; }
+  .bar > div:last-child { border-radius: 0 4px 4px 0; }
+  .bar > div:only-child { border-radius: 4px; }
+  .seg-a { background: var(--seg1); }
+  .seg-b { background: var(--seg2); }
+  .seg-c { background: var(--seg3); }
+  .seg-d { background: var(--seg4); }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    margin-top: 7px;
+    color: var(--text-secondary);
+    font-size: 10.5px;
+    line-height: 1.4;
+  }
+  .legend i {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    margin-right: 5px;
+    border-radius: 2px;
+  }
+  .legend .lv { color: var(--text-tertiary); font-family: var(--mono); font-size: 10px; }
+  .bar-total {
+    margin-top: 6px;
+    color: var(--text-tertiary);
+    font-size: 10.5px;
+    font-family: var(--mono);
+  }
+  /* tok/s trend: tiny columns, accent + gray emphasis */
+  .trend {
+    display: flex;
+    align-items: flex-end;
+    gap: 3px;
+    height: 38px;
+    margin-top: 2px;
+  }
+  .trend div {
+    flex: 1;
+    min-height: 2px;
+    border-radius: 3px 3px 0 0;
+    background: var(--ring);
+  }
+  .trend div:last-child { background: var(--accent); }
+
+  .side-title-note {
+    margin-left: 6px;
+    color: var(--text-tertiary);
+    font-size: 9px;
+    font-weight: 500;
+    letter-spacing: .3px;
+    text-transform: none;
+  }
+  .stat-grid-4 { grid-template-columns: 1fr 1fr; }
+  .api-key {
+    width: 100%;
+    margin-top: 7px;
+    padding: 6px 8px;
+    color: var(--text);
+    background: var(--glass-input);
+    border: 1px solid var(--glass-border);
+    border-radius: 6px;
+    outline: none;
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+  .api-key:focus { border-color: var(--focus); box-shadow: 0 0 0 1px var(--focus); }
+  .model-block {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+  .model-kicker {
+    color: var(--text-tertiary);
+    font-size: 8px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    line-height: 1.2;
+  }
+  .model-side {
+    color: var(--text-warm);
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.45;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* model placement: sidebar expanded → show in sidebar, hide from top bar;
+     sidebar collapsed → hide sidebar copy, show compact top-bar copy */
+  @media (min-width: 901px) {
+    #shell:not(:has(aside.collapsed)) .model-block { display: none; }
+    #shell:has(aside.collapsed) #model-side-section { display: none; }
+  }
+  /* mobile (<900px): sidebar is an overlay, so always show the top-bar model */
+  @media (max-width: 900px) {
+    #model-side-section { display: none; }
+  }
+  .gpu-bars {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .gpu-bar-row {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-secondary);
+  }
+  .gpu-bar-row .gpu-label { width: 22px; color: var(--text-tertiary); font-weight: 600; }
+  .gpu-bar-row .gpu-track {
+    flex: 1;
+    height: 5px;
+    border-radius: 3px;
+    background: var(--whisper);
+    box-shadow: 0 0 0 1px var(--glass-border);
+    overflow: hidden;
+  }
+  .gpu-bar-row .gpu-fill {
+    height: 100%;
+    background: var(--seg1);
+    border-radius: 3px;
+    transition: width .3s ease;
+  }
+  .gpu-bar-row .gpu-val { min-width: 38px; text-align: right; color: var(--text-warm); }
+  .tab-panel {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .tab-panel[hidden] { display: none; }
+  .placeholder {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 24px;
+    color: var(--text-secondary);
+    text-align: center;
+  }
+  .placeholder h2 {
+    margin: 0;
+    color: var(--text);
+    font-family: var(--serif);
+    font-size: 30px;
+    font-weight: 500;
+  }
+  .placeholder .ph-kicker {
+    color: var(--accent);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+  }
+  .placeholder p { max-width: 380px; margin: 0; font-size: 13px; line-height: 1.6; }
   #messages {
     flex: 1;
     overflow-y: auto;
@@ -309,61 +687,21 @@
   #messages::-webkit-scrollbar-thumb { background: var(--ring); border: 3px solid var(--parchment); border-radius: 99px; }
   .msg {
     display: flex;
-    gap: 14px;
     max-width: 860px;
     margin: 0 auto 30px;
   }
-  .msg .avatar {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 34px;
-    height: 34px;
-    margin-top: 1px;
-    border-radius: var(--radius-sm);
-    flex-shrink: 0;
-    font-size: 10px;
-    font-weight: 600;
-    letter-spacing: .16px;
-  }
-  .msg.user .avatar { color: var(--text-warm); background: var(--sand); box-shadow: 0 0 0 1px var(--ring); }
-  .msg.assistant .avatar {
-    position: relative;
-    overflow: hidden;
-    color: var(--accent);
-    background: var(--ivory);
-    box-shadow: 0 0 0 1px rgba(109, 112, 238, .4);
-    font-family: var(--serif);
-    font-size: 16px;
-    font-weight: 400;
-  }
-  .msg .bubble { flex: 1; min-width: 0; padding-top: 1px; }
+  .msg.user { justify-content: flex-end; }
+  .msg .bubble { min-width: 0; }
   .msg.user .bubble {
-    padding: 16px 18px;
+    max-width: 72%;
+    padding: 12px 16px;
     border-radius: var(--radius-lg);
     background: var(--glass-user);
     -webkit-backdrop-filter: var(--blur);
     backdrop-filter: var(--blur);
     box-shadow: 0 0 0 1px var(--glass-border), var(--edge-light), 0 4px 16px var(--whisper);
   }
-  .msg.assistant .bubble {
-    padding: 16px 18px;
-    border-radius: var(--radius-lg);
-    background: var(--glass-assistant);
-    -webkit-backdrop-filter: var(--blur);
-    backdrop-filter: var(--blur);
-    box-shadow: 0 0 0 1px var(--glass-border), var(--edge-light);
-  }
-  .msg .role {
-    margin-bottom: 6px;
-    color: var(--text-tertiary);
-    font-size: 11px;
-    font-weight: 500;
-    letter-spacing: .48px;
-    line-height: 1.4;
-    text-transform: uppercase;
-  }
-  .msg.assistant .role { color: var(--accent); }
+  .msg.assistant .bubble { flex: 1; padding-top: 1px; }
   .msg .content {
     overflow-wrap: break-word;
     word-break: break-word;
@@ -576,11 +914,33 @@
   :root[data-theme="dark"] button::after { background: linear-gradient(180deg, rgba(255, 255, 255, .09), transparent 46%); }
   :root[data-theme="dark"] .msg .content a { text-decoration-color: #4a4d8a; }
 
+  @media (max-width: 1180px) {
+    .chips .chip:nth-child(4) { display: none; }
+  }
+  @media (max-width: 1040px) {
+    .chips .chip:nth-child(3) { display: none; }
+  }
+
+  /* sidebar collapses under ~900px; hamburger toggles it as an overlay */
+  @media (max-width: 900px) {
+    #hamburger { display: inline-flex; align-items: center; justify-content: center; }
+    aside {
+      position: fixed;
+      top: 0;
+      bottom: 0;
+      left: 0;
+      z-index: 40;
+      transform: translateX(-100%);
+      transition: transform .22s ease;
+    }
+    aside.open { transform: none; box-shadow: var(--edge-light), var(--shadow-lift); }
+    .chips .chip:nth-child(3), .chips .chip:nth-child(4) { display: none; }
+  }
   @media (max-width: 720px) {
     header { min-height: 62px; padding: 10px 16px; gap: 10px; }
-    .brand-copy { display: block; }
-    header .title { display: block; font-size: 18px; }
-    header .model { display: block; max-width: 34vw; font-size: 10px; }
+    header .title { font-size: 18px; }
+    header .model { max-width: 34vw; font-size: 10px; }
+    .chips { display: none; }
     .header-actions { gap: 7px; }
     .status { max-width: 145px; min-height: 28px; padding: 4px 8px; }
     #messages { padding: 30px 16px 38px; }
@@ -593,6 +953,7 @@
   @media (max-width: 479px) {
     header { padding-inline: 12px; }
     header .model { display: none; }
+    .tabs .tab { padding: 6px 9px; font-size: 12px; }
     .logo { width: 25px; height: 25px; }
     .status { max-width: 104px; }
     .theme-toggle { min-width: 34px; width: 34px; padding-inline: 0; }
@@ -623,13 +984,105 @@
 </style>
 </head>
 <body>
-<header>
+<div id="shell">
+<aside id="sidebar">
   <div class="brand">
     <div class="logo" aria-hidden="true"></div>
     <div class="brand-copy">
-      <span class="title">Pulsar</span>
-      <span class="model" id="model">loading…</span>
+      <span class="title">pulsar</span>
+      <span class="tagline">LOCAL GIANT, TINY FOOTPRINT</span>
     </div>
+  </div>
+
+  <div class="side-section" id="model-side-section">
+    <div class="side-title">Active model</div>
+    <div class="model-side" id="model-side">loading…</div>
+  </div>
+
+  <div class="side-section">
+    <div class="side-title">Connection</div>
+    <div class="endpoint" id="endpoint" title="API endpoint"></div>
+    <input type="password" id="api-key" class="api-key" placeholder="API key (optional, in-memory)" autocomplete="off" />
+    <div class="probe-row">
+      <button id="probe" type="button">Probe server</button>
+      <span class="reach" id="reach">not probed</span>
+    </div>
+  </div>
+
+  <div class="side-section">
+    <div class="side-title">Runtime</div>
+    <div class="kv"><span class="k">GPU</span><span class="v" id="hw-gpu">—</span></div>
+    <div class="kv"><span class="k">RAM</span><span class="v" id="hw-ram">—</span></div>
+    <div class="kv"><span class="k">Cores</span><span class="v" id="hw-cores">—</span></div>
+  </div>
+
+  <div class="stat-grid stat-grid-4">
+    <div class="stat"><div class="stat-v" id="stat-active">0</div><div class="stat-k">active</div></div>
+    <div class="stat"><div class="stat-v" id="stat-queued">0</div><div class="stat-k">queued</div></div>
+    <div class="stat"><div class="stat-v" id="stat-completed">0</div><div class="stat-k">completed</div></div>
+    <div class="stat"><div class="stat-v" id="stat-failures">0</div><div class="stat-k">failures</div></div>
+  </div>
+
+  <div class="stat-grid">
+    <div class="stat"><div class="stat-v" id="stat-tps">—</div><div class="stat-k">tok/s</div></div>
+    <div class="stat"><div class="stat-v" id="stat-ctx">—</div><div class="stat-k">context</div></div>
+    <div class="stat"><div class="stat-v" id="stat-turns">0</div><div class="stat-k">turns</div></div>
+  </div>
+
+  <div class="side-section">
+    <div class="side-title">Resident tiers</div>
+    <div class="bar" id="tiers-bar"></div>
+    <div class="legend" id="tiers-legend"></div>
+  </div>
+
+  <div class="side-section">
+    <div class="side-title">Routing source · last turn</div>
+    <div class="bar" id="routing-bar"></div>
+    <div class="legend" id="routing-legend"></div>
+  </div>
+
+  <div class="side-section">
+    <div class="side-title">Last turn</div>
+    <div class="bar" id="turn-bar"></div>
+    <div class="legend" id="turn-legend"></div>
+    <div class="bar-total" id="turn-total"></div>
+  </div>
+
+  <div class="side-section">
+    <div class="side-title">tok/s trend <span class="side-title-note" id="trend-note"></span></div>
+    <div class="trend" id="trend"></div>
+  </div>
+
+  <div class="side-section" id="gpu-bars-section" hidden>
+    <div class="side-title">Per-GPU</div>
+    <div class="gpu-bars" id="gpu-bars"></div>
+  </div>
+</aside>
+
+<main>
+<header>
+  <button id="hamburger" type="button" aria-label="Toggle sidebar" title="Toggle sidebar">☰</button>
+  <button id="sidebar-toggle" type="button" aria-label="Collapse sidebar" aria-pressed="false" title="Collapse sidebar">
+    <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true" focusable="false">
+      <rect x="1" y="2" width="12" height="10" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.2"/>
+      <rect x="1" y="2" width="5" height="10" rx="1.5" fill="currentColor"/>
+    </svg>
+  </button>
+  <div class="model-block">
+    <span class="model-kicker">ACTIVE MODEL</span>
+    <span class="model" id="model">loading…</span>
+  </div>
+  <nav class="tabs" aria-label="Views">
+    <button class="tab active" id="tabbtn-chat" type="button" data-tab="tab-chat">Chat</button>
+    <button class="tab" id="tabbtn-brain" type="button" data-tab="tab-brain">Brain</button>
+    <button class="tab" id="tabbtn-atlas" type="button" data-tab="tab-atlas">Atlas</button>
+  </nav>
+  <div class="chips">
+    <span class="chip"><span class="chip-label">tok/s</span><span id="chip-tps">—</span></span>
+    <span class="chip"><span class="chip-label">TTFT</span><span id="chip-ttft">—</span></span>
+    <span class="chip"><span class="chip-label">ctx</span><span id="chip-ctx">—</span></span>
+    <span class="chip"><span class="chip-label">queue</span><span id="chip-queue">0ms</span></span>
+    <span class="chip"><span class="chip-label">slot</span><span id="chip-slot">idle</span></span>
   </div>
   <span class="spacer"></span>
   <div class="header-actions">
@@ -642,45 +1095,65 @@
   </div>
 </header>
 
-<div id="messages">
-  <div class="empty" id="empty">
-    <div class="logo" aria-hidden="true"></div>
-    <span class="empty-kicker">Local inference</span>
-    <h2>Ready</h2>
-    <p>Begin a conversation with the model running on this machine. <kbd>Enter</kbd> sends, <kbd>Shift+Enter</kbd> adds a new line.</p>
+<div class="tab-panel" id="tab-chat">
+  <div id="messages">
+    <div class="empty" id="empty">
+      <div class="logo" aria-hidden="true"></div>
+      <span class="empty-kicker">Local inference</span>
+      <h2>Ready</h2>
+      <p>Begin a conversation with the model running on this machine. <kbd>Enter</kbd> sends, <kbd>Shift+Enter</kbd> adds a new line.</p>
+    </div>
+  </div>
+
+  <footer>
+    <div class="toolbar">
+      <details>
+        <summary>Settings</summary>
+        <div class="panel">
+          <div class="panel-title">Generation settings</div>
+          <label><span class="field-label">System prompt</span>
+            <textarea id="system" placeholder="You are a helpful assistant."></textarea>
+          </label>
+          <label><span class="field-label">Temperature <span class="hint" id="temp-hint">0.8</span></span>
+            <input type="number" id="temp" step="0.05" min="0" max="2" value="0.8" />
+          </label>
+          <label><span class="field-label">top_p</span>
+            <input type="number" id="top-p" step="0.05" min="0" max="1" value="0.95" />
+          </label>
+          <label><span class="field-label">max_tokens</span>
+            <input type="number" id="max-tokens" step="32" min="1" value="1024" />
+          </label>
+        </div>
+      </details>
+      <span class="hint"><kbd>Enter</kbd> send · <kbd>Shift+Enter</kbd> newline</span>
+    </div>
+    <div class="compose">
+      <div class="compose-row">
+        <textarea id="input" rows="1" placeholder="Send a message…" autofocus></textarea>
+        <button id="send" class="primary">Send</button>
+        <button id="stop" class="danger" disabled>Stop</button>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<div class="tab-panel" id="tab-brain" hidden>
+  <div class="placeholder">
+    <span class="ph-kicker">Expert Cortex</span>
+    <h2>Brain</h2>
+    <p>Expert Cortex — coming soon. Live expert-routing and layer telemetry will land here.</p>
   </div>
 </div>
 
-<footer>
-  <div class="toolbar">
-    <details>
-      <summary>Settings</summary>
-      <div class="panel">
-        <div class="panel-title">Generation settings</div>
-        <label><span class="field-label">System prompt</span>
-          <textarea id="system" placeholder="You are a helpful assistant."></textarea>
-        </label>
-        <label><span class="field-label">Temperature <span class="hint" id="temp-hint">0.8</span></span>
-          <input type="number" id="temp" step="0.05" min="0" max="2" value="0.8" />
-        </label>
-        <label><span class="field-label">top_p</span>
-          <input type="number" id="top-p" step="0.05" min="0" max="1" value="0.95" />
-        </label>
-        <label><span class="field-label">max_tokens</span>
-          <input type="number" id="max-tokens" step="32" min="1" value="1024" />
-        </label>
-      </div>
-    </details>
-    <span class="hint"><kbd>Enter</kbd> send · <kbd>Shift+Enter</kbd> newline</span>
+<div class="tab-panel" id="tab-atlas" hidden>
+  <div class="placeholder">
+    <span class="ph-kicker">Expert Atlas</span>
+    <h2>Atlas</h2>
+    <p>Expert Atlas — coming soon. A map of expert residency across tiers will land here.</p>
   </div>
-  <div class="compose">
-    <div class="compose-row">
-      <textarea id="input" rows="1" placeholder="Send a message…" autofocus></textarea>
-      <button id="send" class="primary">Send</button>
-      <button id="stop" class="danger" disabled>Stop</button>
-    </div>
-  </div>
-</footer>
+</div>
+</main>
+</div>
 
 <script>
 "use strict";
@@ -692,12 +1165,198 @@ const stopBtn = $("stop");
 const clearBtn = $("clear");
 const statusEl = $("status");
 const modelEl = $("model");
+const modelSideEl = $("model-side");
 const themeBtn = $("theme-toggle");
 const themeMeta = document.querySelector('meta[name="theme-color"]');
 
 let conversation = []; // {role, content}
 let controller = null;
 let maxCtx = 8192; // context window, from /v1/models max_model_len
+let curCtx = 0; // prompt + generated tokens of the latest turn
+let lastTps = 0; // last completed turn's decode tok/s
+let lastTtft = 0; // last turn's prefill wall time (s)
+let turns = 0;
+let tpsHist = []; // last ≤8 decode tok/s values
+const PROF_KEYS = ["gpu_wait", "resolve", "h2d", "cpu", "tail"];
+
+// 45230 → "45k", 8230 → "8.2k", 512 → "512"
+const fmtCtx = (n) =>
+  n >= 10000 ? Math.round(n / 1000) + "k"
+  : n >= 1000 ? (n / 1000).toFixed(1) + "k"
+  : String(n);
+
+function setChips(slot) {
+  $("chip-tps").textContent = lastTps ? lastTps.toFixed(1) : "—";
+  $("chip-ttft").textContent = lastTtft ? lastTtft.toFixed(2) + "s" : "—";
+  $("chip-ctx").textContent = curCtx ? fmtCtx(curCtx) + "/" + fmtCtx(maxCtx) : "—";
+  $("chip-slot").textContent = slot;
+  $("stat-tps").textContent = lastTps ? lastTps.toFixed(1) : "—";
+  $("stat-ctx").textContent = curCtx ? fmtCtx(curCtx) + "/" + fmtCtx(maxCtx) : "—";
+  $("stat-turns").textContent = String(turns);
+  $("stat-active").textContent = controller ? "1" : "0";
+  $("stat-queued").textContent = "0";
+  $("stat-completed").textContent = String(turns);
+  $("stat-failures").textContent = "0";
+  $("chip-queue").textContent = "0ms";
+  $("trend-note").textContent = tpsHist.length
+    ? "last " + tpsHist.length + " turns · now " + (lastTps ? lastTps.toFixed(1) : "—")
+    : "";
+}
+
+async function fetchStats() {
+  const r = await fetch("/stats");
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+
+// Render a segment bar + legend. segs: [{cls, label, val, pct, text}].
+function renderBar(barEl, legEl, segs) {
+  barEl.innerHTML = "";
+  legEl.innerHTML = "";
+  for (const s of segs) {
+    if (s.pct <= 0) continue;
+    const d = document.createElement("div");
+    d.className = s.cls;
+    d.style.width = s.pct + "%";
+    d.title = s.label + " " + s.text;
+    barEl.appendChild(d);
+  }
+  if (!barEl.children.length) {
+    const d = document.createElement("div");
+    d.style.width = "100%";
+    barEl.appendChild(d);
+  }
+  for (const s of segs) {
+    if (s.pct <= 0) continue;
+    const span = document.createElement("span");
+    const i = document.createElement("i");
+    i.className = s.cls;
+    span.appendChild(i);
+    span.appendChild(document.createTextNode(s.label + " "));
+    const v = document.createElement("span");
+    v.className = "lv";
+    v.textContent = s.text;
+    span.appendChild(v);
+    legEl.appendChild(span);
+  }
+}
+
+// Static runtime/hardware/tier rendering from a /stats snapshot.
+function applyStats(j) {
+  const hw = j?.hardware || {};
+  $("hw-gpu").textContent = Number.isFinite(hw.gpu_count) ? hw.gpu_count + "× GPU" : "—";
+  const gb = (kb) => (kb / 1048576).toFixed(0);
+  $("hw-ram").textContent = Number.isFinite(hw.ram_total_kb)
+    ? gb(hw.ram_total_kb) + " GB (" + gb(hw.ram_available_kb || 0) + " free)"
+    : "—";
+  $("hw-cores").textContent = Number.isFinite(hw.cores) ? String(hw.cores) : "—";
+  if (j?.model && modelEl.textContent !== j.model) {
+    modelEl.textContent = j.model;
+    modelSideEl.textContent = j.model;
+  }
+  if (Number.isFinite(j?.ctx) && j.ctx > 0) maxCtx = j.ctx;
+  const tiers = Array.isArray(j?.tiers) ? j.tiers : [];
+  const totB = tiers.reduce((a, t) => a + (t.bytes || 0), 0);
+  renderBar($("tiers-bar"), $("tiers-legend"), tiers.map((t, i) => ({
+    cls: "seg-" + "abcd"[i % 4],
+    label: "gpu" + (t.dev ?? i),
+    pct: totB > 0 ? ((t.bytes || 0) / totB) * 100 : 0,
+    text: ((t.bytes || 0) / 1e9).toFixed(1) + " GB",
+  })));
+  renderGpuBars(tiers, totB);
+  setChips(controller ? "busy" : "idle");
+}
+
+// Per-GPU bars at bottom of sidebar: one row per tier with share of resident bytes.
+function renderGpuBars(tiers, totB) {
+  const section = $("gpu-bars-section");
+  const el = $("gpu-bars");
+  el.textContent = "";
+  if (!tiers.length) { section.hidden = true; return; }
+  section.hidden = false;
+  tiers.forEach((t, i) => {
+    const pct = totB > 0 ? ((t.bytes || 0) / totB) * 100 : 0;
+    const row = document.createElement("div");
+    row.className = "gpu-bar-row";
+    const label = document.createElement("span");
+    label.className = "gpu-label";
+    label.textContent = "G" + (t.dev ?? i);
+    const track = document.createElement("span");
+    track.className = "gpu-track";
+    const fill = document.createElement("span");
+    fill.className = "gpu-fill";
+    fill.style.width = pct.toFixed(1) + "%";
+    track.appendChild(fill);
+    const val = document.createElement("span");
+    val.className = "gpu-val";
+    val.textContent = ((t.bytes || 0) / 1e9).toFixed(1) + " GB";
+    row.appendChild(label);
+    row.appendChild(track);
+    row.appendChild(val);
+    el.appendChild(row);
+  });
+}
+
+// Probe button: GET /stats and flip the reachability indicator.
+async function probe() {
+  const reach = $("reach");
+  reach.className = "reach";
+  reach.textContent = "probing…";
+  try {
+    applyStats(await fetchStats());
+    reach.className = "reach ok";
+    reach.textContent = "Engine reachable";
+  } catch {
+    reach.className = "reach bad";
+    reach.textContent = "unreachable";
+  }
+}
+
+// Per-turn rendering from pre/post /stats deltas.
+function applyTurnDelta(pre, post) {
+  const preT = Array.isArray(pre?.tiers) ? pre.tiers : [];
+  const postT = Array.isArray(post?.tiers) ? post.tiers : [];
+  const n = Math.max(preT.length, postT.length);
+  let vram = 0;
+  for (let i = 0; i < n; i++) vram += Math.max(0, (postT[i]?.hits || 0) - (preT[i]?.hits || 0));
+  const cpu = Math.max(0, (post?.cpu_hits || 0) - (pre?.cpu_hits || 0));
+  const cache = Math.max(0, (post?.cache_hits || 0) - (pre?.cache_hits || 0));
+  const tot = vram + cpu + cache;
+  const mk = (cls, label, v) => ({
+    cls, label, pct: tot > 0 ? (v / tot) * 100 : 0,
+    text: tot > 0 ? Math.round((v / tot) * 100) + "%" : "—",
+  });
+  renderBar($("routing-bar"), $("routing-legend"), [
+    mk("seg-a", "vram", vram), mk("seg-b", "cpu", cpu), mk("seg-c", "cache", cache),
+  ]);
+  const d = {};
+  let sum = 0;
+  for (const k of PROF_KEYS) {
+    d[k] = Math.max(0, (post?.prof?.[k] || 0) - (pre?.prof?.[k] || 0));
+    sum += d[k];
+  }
+  const other = d.resolve + d.tail;
+  const sm = (cls, label, v) => ({
+    cls, label, pct: sum > 0 ? (v / sum) * 100 : 0, text: v.toFixed(2) + "s",
+  });
+  renderBar($("turn-bar"), $("turn-legend"), [
+    sm("seg-a", "gpu_wait", d.gpu_wait), sm("seg-b", "h2d", d.h2d),
+    sm("seg-c", "cpu", d.cpu), sm("seg-d", "other", other),
+  ]);
+  $("turn-total").textContent = sum > 0 ? "total " + sum.toFixed(2) + "s" : "";
+}
+
+function renderTrend() {
+  const el = $("trend");
+  el.innerHTML = "";
+  const max = Math.max(...tpsHist, 1);
+  for (const v of tpsHist) {
+    const d = document.createElement("div");
+    d.style.height = Math.max(5, (v / max) * 100) + "%";
+    d.title = v.toFixed(1) + " tok/s";
+    el.appendChild(d);
+  }
+}
 
 function applyTheme(theme, persist = true) {
   const dark = theme === "dark";
@@ -723,12 +1382,14 @@ async function loadModel() {
     const r = await fetch("/v1/models");
     const j = await r.json();
     const id = j?.data?.[0]?.id;
-    if (id) modelEl.textContent = id;
-    else modelEl.textContent = "(no model)";
+    const label = id || "(no model)";
+    modelEl.textContent = label;
+    modelSideEl.textContent = label;
     const ml = j?.data?.[0]?.max_model_len;
     if (Number.isFinite(ml) && ml > 0) maxCtx = ml;
   } catch {
     modelEl.textContent = "(error)";
+    modelSideEl.textContent = "(error)";
   }
 }
 
@@ -789,14 +1450,8 @@ function addMessage(role, content) {
   $("empty")?.remove();
   const wrap = document.createElement("div");
   wrap.className = "msg " + role;
-  const avatar = document.createElement("div");
-  avatar.className = "avatar";
-  avatar.textContent = role === "user" ? "you" : "✦";
   const bubble = document.createElement("div");
   bubble.className = "bubble";
-  const roleEl = document.createElement("div");
-  roleEl.className = "role";
-  roleEl.textContent = role === "user" ? "you" : "assistant";
   const body = document.createElement("div");
   body.className = "content";
   if (role === "user") {
@@ -804,9 +1459,7 @@ function addMessage(role, content) {
   } else {
     body.innerHTML = content ? renderMarkdown(content) : '<span class="cursor"></span>';
   }
-  bubble.appendChild(roleEl);
   bubble.appendChild(body);
-  wrap.appendChild(avatar);
   wrap.appendChild(bubble);
   messagesEl.appendChild(wrap);
   scrollDown();
@@ -850,17 +1503,9 @@ async function streamAssistant() {
   $("empty")?.remove();
   const wrap = document.createElement("div");
   wrap.className = "msg assistant";
-  const avatar = document.createElement("div");
-  avatar.className = "avatar";
-  avatar.textContent = "✦";
   const bubble = document.createElement("div");
   bubble.className = "bubble";
-  const roleEl = document.createElement("div");
-  roleEl.className = "role";
-  roleEl.textContent = "assistant";
-  bubble.appendChild(roleEl);
   bubble.appendChild(body);
-  wrap.appendChild(avatar);
   wrap.appendChild(bubble);
   messagesEl.appendChild(wrap);
   scrollDown();
@@ -871,11 +1516,7 @@ async function streamAssistant() {
   const tSend = performance.now();
   let promptToks = 0; // prefill tokens, from the first chunk's usage
   let prefillTps = 0;
-  // 45230 → "45k", 8230 → "8.2k", 512 → "512"
-  const fmtCtx = (n) =>
-    n >= 10000 ? Math.round(n / 1000) + "k"
-    : n >= 1000 ? (n / 1000).toFixed(1) + "k"
-    : String(n);
+  const statsPre = await fetchStats().catch(() => null); // pre-send /stats for per-turn deltas
   // Repaint throttle: rebuilding innerHTML per token is O(n²) and pins the
   // main thread, so the ReadableStream reader stops draining, TCP backpressure
   // fills the kernel send buffer, and the server's per-token write blocks —
@@ -900,12 +1541,18 @@ async function streamAssistant() {
         if (dt > 0) parts.push((ntok / dt).toFixed(1) + " tok/s");
         parts.push(fmtCtx(promptToks + ntok) + "/" + fmtCtx(maxCtx));
         setStatus(parts.join(" · "), "busy");
+        if (dt > 0) {
+          lastTps = ntok / dt;
+          curCtx = promptToks + ntok;
+          setChips("busy");
+        }
       }
     });
   };
   const cancelRender = () => { rafGen++; rafPending = false; };
 
   try {
+    setChips("busy");
     const resp = await fetch("/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -958,6 +1605,17 @@ async function streamAssistant() {
     if (prefillTps) summary += ` · prefill ${Math.round(prefillTps)} tok/s`;
     summary += ` · ${fmtCtx(promptToks + ntok)}/${fmtCtx(maxCtx)}`;
     setStatus(summary, "");
+    turns += 1;
+    lastTtft = t0 ? (t0 - tSend) / 1000 : 0;
+    lastTps = ntok && dtNum > 0 ? ntok / dtNum : 0;
+    curCtx = promptToks + ntok;
+    if (lastTps) { tpsHist.push(lastTps); if (tpsHist.length > 8) tpsHist.shift(); }
+    renderTrend();
+    setChips("idle");
+    fetchStats().then((post) => { // post-turn /stats: refresh panels + per-turn deltas
+      applyStats(post);
+      if (statsPre) applyTurnDelta(statsPre, post);
+    }).catch(() => {});
   } catch (err) {
     if (err.name === "AbortError") {
       cancelRender();
@@ -997,6 +1655,13 @@ clearBtn.addEventListener("click", () => {
     '<p>Begin a conversation with the model running on this machine. <kbd>Enter</kbd> sends, ' +
     '<kbd>Shift+Enter</kbd> adds a new line.</p></div>';
   setStatus("idle");
+  turns = 0;
+  lastTps = 0;
+  lastTtft = 0;
+  curCtx = 0;
+  tpsHist = [];
+  renderTrend();
+  setChips("idle");
 });
 themeBtn.addEventListener("click", () => {
   applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
@@ -1004,8 +1669,40 @@ themeBtn.addEventListener("click", () => {
 
 $("temp").addEventListener("input", (e) => ($("temp-hint").textContent = e.target.value));
 
+// sidebar + tabs + probe
+const sidebarEl = $("sidebar");
+const sidebarToggle = $("sidebar-toggle");
+function applySidebarCollapsed(collapsed, persist = true) {
+  sidebarEl.classList.toggle("collapsed", collapsed);
+  sidebarToggle.setAttribute("aria-pressed", String(collapsed));
+  sidebarToggle.setAttribute("aria-label", collapsed ? "Expand sidebar" : "Collapse sidebar");
+  sidebarToggle.title = collapsed ? "Expand sidebar" : "Collapse sidebar";
+  if (persist) {
+    try { localStorage.setItem("pulsar-sidebar", collapsed ? "collapsed" : "expanded"); } catch {}
+  }
+}
+sidebarToggle.addEventListener("click", () => {
+  applySidebarCollapsed(!sidebarEl.classList.contains("collapsed"));
+});
+$("hamburger").addEventListener("click", () => sidebarEl.classList.toggle("open"));
+messagesEl.addEventListener("click", () => sidebarEl.classList.remove("open"));
+for (const btn of document.querySelectorAll(".tabs .tab")) {
+  btn.addEventListener("click", () => {
+    for (const b of document.querySelectorAll(".tabs .tab")) b.classList.toggle("active", b === btn);
+    for (const p of document.querySelectorAll(".tab-panel")) p.hidden = p.id !== btn.dataset.tab;
+    sidebarEl.classList.remove("open");
+  });
+}
+$("probe").addEventListener("click", probe);
+$("endpoint").textContent = location.origin + "/v1";
+
 applyTheme(document.documentElement.dataset.theme || "light", false);
+let savedSidebar = "expanded";
+try { savedSidebar = localStorage.getItem("pulsar-sidebar") || "expanded"; } catch {}
+applySidebarCollapsed(savedSidebar === "collapsed", false);
 loadModel();
+probe(); // initial /stats: reachability + runtime + tiers
+setChips("idle");
 autoGrow();
 </script>
 </body>
