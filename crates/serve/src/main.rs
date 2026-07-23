@@ -218,6 +218,16 @@ fn run() -> engine::Result {
                     let json = serde_json::json!({"n_expert": n_expert, "layers": layers});
                     respond_json(&mut stream, 200, &json)
                 }
+                // Expert topic-affinity atlas, built offline into a per-model
+                // sidecar (<model>.atlas.json) by scripts/atlas_build.py.
+                ("GET", "/atlas") => match std::fs::read(format!("{model_path}.atlas.json")) {
+                    Ok(bytes) => respond_bytes(&mut stream, 200, "application/json", &bytes),
+                    Err(_) => respond_json(
+                        &mut stream,
+                        404,
+                        &serde_json::json!({"error": {"message": "no atlas built for this model"}}),
+                    ),
+                },
                 ("POST", "/v1/chat/completions") => handle_chat(
                     &mut stream,
                     &body,
