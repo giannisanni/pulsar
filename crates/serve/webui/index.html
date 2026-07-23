@@ -675,6 +675,86 @@
     text-transform: uppercase;
   }
   .placeholder p { max-width: 380px; margin: 0; font-size: 13px; line-height: 1.6; }
+
+  /* Brain: Expert Cortex */
+  .cortex {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    padding: 14px 18px 18px;
+    gap: 10px;
+  }
+  .cortex-head {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 18px;
+    flex-wrap: wrap;
+  }
+  .cortex-title { display: flex; flex-direction: column; gap: 3px; }
+  .cortex-dims {
+    color: var(--text);
+    font-family: var(--serif);
+    font-size: 18px;
+    font-weight: 500;
+    letter-spacing: .4px;
+  }
+  .cortex-legend {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    color: var(--text-secondary);
+    font-size: 11px;
+    flex-wrap: wrap;
+  }
+  .cortex-legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .cortex-swatch {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
+    box-shadow: 0 0 0 1px var(--glass-border);
+  }
+  .sw-vram { background: var(--accent); }
+  .sw-ram { background: #5e6a8c; }
+  .sw-disk { background: var(--dark-surface); }
+  :root[data-theme="dark"] .sw-ram { background: #46527a; }
+  :root[data-theme="dark"] .sw-disk { background: #0a0a14; }
+  .cortex-legend-note { color: var(--text-tertiary); font-style: italic; }
+  .cortex-stage {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    border-radius: var(--radius-md);
+    background: var(--glass-assistant);
+    box-shadow: 0 0 0 1px var(--glass-border), var(--edge-light);
+    overflow: hidden;
+  }
+  #cortex-canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    cursor: crosshair;
+  }
+  .cortex-tip {
+    position: absolute;
+    pointer-events: none;
+    padding: 7px 10px;
+    border-radius: 7px;
+    background: var(--glass-panel);
+    -webkit-backdrop-filter: var(--blur);
+    backdrop-filter: var(--blur);
+    box-shadow: 0 0 0 1px var(--glass-border), var(--edge-light), var(--shadow-lift);
+    color: var(--text-warm);
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.5;
+    white-space: nowrap;
+    z-index: 5;
+  }
+  .cortex-tip .tip-k { color: var(--text-tertiary); }
+
   #messages {
     flex: 1;
     overflow-y: auto;
@@ -1138,10 +1218,23 @@
 </div>
 
 <div class="tab-panel" id="tab-brain" hidden>
-  <div class="placeholder">
-    <span class="ph-kicker">Expert Cortex</span>
-    <h2>Brain</h2>
-    <p>Expert Cortex — coming soon. Live expert-routing and layer telemetry will land here.</p>
+  <div class="cortex">
+    <div class="cortex-head">
+      <div class="cortex-title">
+        <span class="ph-kicker">Expert Cortex</span>
+        <span class="cortex-dims" id="cortex-dims">— LAYERS × — EXPERTS</span>
+      </div>
+      <div class="cortex-legend">
+        <span><i class="cortex-swatch sw-vram"></i>VRAM</span>
+        <span><i class="cortex-swatch sw-ram"></i>RAM</span>
+        <span><i class="cortex-swatch sw-disk"></i>disk</span>
+        <span class="cortex-legend-note">brightness = routing heat</span>
+      </div>
+    </div>
+    <div class="cortex-stage" id="cortex-stage">
+      <canvas id="cortex-canvas"></canvas>
+      <div class="cortex-tip" id="cortex-tip" hidden></div>
+    </div>
   </div>
 </div>
 
@@ -1704,6 +1797,184 @@ loadModel();
 probe(); // initial /stats: reachability + runtime + tiers
 setChips("idle");
 autoGrow();
+
+// ---- Brain: Expert Cortex ----
+const cortexCanvas = $("cortex-canvas");
+const cortexStage = $("cortex-stage");
+const cortexTip = $("cortex-tip");
+const cortexDims = $("cortex-dims");
+let cortexData = null; // {n_expert, layers:[{layer, tier[], heat[]}]}
+let cortexGeom = null; // {cellW, cellH, padL, padT, cols, rows}
+
+async function fetchExperts() {
+  const r = await fetch("/experts");
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+
+function cortexColors() {
+  const dark = document.documentElement.dataset.theme === "dark";
+  // [r,g,b] base colors per tier; brightness scales by normalized heat
+  return dark
+    ? { vram: [109, 112, 238], ram: [70, 82, 122], disk: [10, 10, 20], bg: [13, 13, 22] }
+    : { vram: [84, 87, 216], ram: [94, 106, 140], disk: [228, 229, 241], bg: [248, 249, 255] };
+}
+
+function tierKey(code) {
+  return code === 3 ? "vram" : code === 2 ? "ram" : "disk";
+}
+
+function renderCortex() {
+  if (!cortexData || !cortexData.layers?.length) {
+    cortexDims.textContent = "— LAYERS × — EXPERTS";
+    return;
+  }
+  const layers = cortexData.layers;
+  const nExp = cortexData.n_expert || layers[0]?.tier?.length || 0;
+  if (!nExp) return;
+  cortexDims.textContent = layers.length + " LAYERS × " + nExp + " EXPERTS";
+
+  const stageW = cortexStage.clientWidth;
+  const stageH = cortexStage.clientHeight;
+  if (!stageW || !stageH) return;
+
+  const padL = 34; // layer labels
+  const padT = 6;
+  const padR = 6;
+  const padB = 6;
+  const cols = nExp;
+  const rows = layers.length;
+  const cellW = Math.max(1, (stageW - padL - padR) / cols);
+  const cellH = Math.max(1, (stageH - padT - padB) / rows);
+  cortexGeom = { cellW, cellH, padL, padT, cols, rows };
+
+  const dpr = window.devicePixelRatio || 1;
+  cortexCanvas.width = Math.round(stageW * dpr);
+  cortexCanvas.height = Math.round(stageH * dpr);
+  const ctx = cortexCanvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  const C = cortexColors();
+  ctx.fillStyle = "rgb(" + C.bg[0] + "," + C.bg[1] + "," + C.bg[2] + ")";
+  ctx.fillRect(0, 0, stageW, stageH);
+
+  // max heat for normalization
+  let maxHeat = 1;
+  for (const L of layers) {
+    for (let i = 0; i < nExp; i++) {
+      const h = L.heat?.[i] || 0;
+      if (h > maxHeat) maxHeat = h;
+    }
+  }
+
+  // layer labels
+  ctx.fillStyle = "rgba(140, 145, 175, 0.85)";
+  ctx.font = "9px -apple-system, BlinkMacSystemFont, sans-serif";
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  for (let r = 0; r < rows; r++) {
+    if (cellH < 8 && r % Math.ceil(8 / cellH) !== 0) continue; // skip labels when cramped
+    const y = padT + r * cellH + cellH / 2;
+    ctx.fillText("L" + layers[r].layer, padL - 5, y);
+  }
+
+  // cells: brightness = 0.18 + 0.82 * normalized heat, so cold experts are dim but visible
+  for (let r = 0; r < rows; r++) {
+    const L = layers[r];
+    for (let c = 0; c < cols; c++) {
+      const t = tierKey(L.tier?.[c]);
+      const h = L.heat?.[c] || 0;
+      const norm = h / maxHeat;
+      const b = 0.18 + 0.82 * norm;
+      const col = C[t];
+      const rr = Math.round(col[0] * b);
+      const gg = Math.round(col[1] * b);
+      const bb = Math.round(col[2] * b);
+      ctx.fillStyle = "rgb(" + rr + "," + gg + "," + bb + ")";
+      const x = padL + c * cellW;
+      const y = padT + r * cellH;
+      ctx.fillRect(x, y, Math.max(1, cellW - 0.5), Math.max(1, cellH - 0.5));
+    }
+  }
+}
+
+async function refreshCortex() {
+  try {
+    cortexData = await fetchExperts();
+    renderCortex();
+  } catch {
+    // keep prior data on failure
+  }
+}
+
+function tipK(text) {
+  const s = document.createElement("span");
+  s.className = "tip-k";
+  s.textContent = text;
+  return s;
+}
+
+cortexCanvas.addEventListener("mousemove", (e) => {
+  if (!cortexGeom || !cortexData) { cortexTip.hidden = true; return; }
+  const rect = cortexCanvas.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+  const { cellW, cellH, padL, padT, cols, rows } = cortexGeom;
+  const c = Math.floor((x - padL) / cellW);
+  const r = Math.floor((y - padT) / cellH);
+  if (c < 0 || c >= cols || r < 0 || r >= rows) { cortexTip.hidden = true; return; }
+  const L = cortexData.layers[r];
+  const t = L.tier?.[c];
+  const h = L.heat?.[c] || 0;
+  const tierName = t === 3 ? "VRAM" : t === 2 ? "RAM" : "disk";
+  cortexTip.textContent = "";
+  const line1 = document.createElement("div");
+  line1.appendChild(tipK("Layer"));
+  line1.appendChild(document.createTextNode(" " + L.layer + " · "));
+  line1.appendChild(tipK("Expert"));
+  line1.appendChild(document.createTextNode(" " + c));
+  const line2 = document.createElement("div");
+  line2.appendChild(tipK("Tier"));
+  line2.appendChild(document.createTextNode(" " + tierName + " · "));
+  line2.appendChild(tipK("Heat"));
+  line2.appendChild(document.createTextNode(" " + h));
+  cortexTip.appendChild(line1);
+  cortexTip.appendChild(line2);
+  cortexTip.hidden = false;
+  const tipX = Math.min(x + 12, rect.width - cortexTip.offsetWidth - 6);
+  const tipY = Math.max(6, y - cortexTip.offsetHeight - 8);
+  cortexTip.style.left = tipX + "px";
+  cortexTip.style.top = tipY + "px";
+});
+cortexCanvas.addEventListener("mouseleave", () => { cortexTip.hidden = true; });
+
+// re-render on theme change and on stage resize
+const origApplyTheme = applyTheme;
+applyTheme = function (theme, persist) {
+  origApplyTheme(theme, persist);
+  renderCortex();
+};
+if (window.ResizeObserver) {
+  new ResizeObserver(() => renderCortex()).observe(cortexStage);
+} else {
+  window.addEventListener("resize", renderCortex);
+}
+
+// poll: when Brain tab opens, on Probe, after each turn
+for (const btn of document.querySelectorAll(".tabs .tab")) {
+  btn.addEventListener("click", () => {
+    if (btn.dataset.tab === "tab-brain") refreshCortex();
+  });
+}
+$("probe").addEventListener("click", () => {
+  if (!$("tab-brain").hidden) refreshCortex();
+});
+// post-turn: piggyback a cortex refresh on the existing /stats post-turn call
+const _origApplyStats = applyStats;
+applyStats = function (j) {
+  _origApplyStats(j);
+  if (!$("tab-brain").hidden && controller === null) refreshCortex();
+};
 </script>
 </body>
 </html>
