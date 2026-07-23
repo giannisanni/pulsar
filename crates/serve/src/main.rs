@@ -266,8 +266,13 @@ fn run() -> engine::Result {
                         .flatten()
                         .filter_map(|e| {
                             let name = e.file_name().to_string_lossy().into_owned();
-                            // skip non-models: MTP draft sidecars aren't standalone
-                            if !name.ends_with(".gguf") || name.contains("draft") {
+                            // skip non-servable: MTP draft sidecars, and F16/BF16
+                            // source checkpoints (too large to serve as a chat model)
+                            if !name.ends_with(".gguf")
+                                || name.contains("draft")
+                                || name.contains("F16")
+                                || name.contains("BF16")
+                            {
                                 return None;
                             }
                             let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
