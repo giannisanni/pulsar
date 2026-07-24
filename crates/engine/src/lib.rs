@@ -865,8 +865,10 @@ mod real {
         pub resolve_d2h: std::time::Duration,
         /// distinct/offsets/wants/tier placement list building
         pub resolve_lists: std::time::Duration,
-        /// host LFU ensure_with wall minus nested h2d (disk wait + cache hits)
+        /// host-side lookup + LFU eviction (ensure_with wall minus h2d and disk)
         pub resolve_host: std::time::Duration,
+        /// pure io_uring disk-fetch wait for cache misses (was hidden in host)
+        pub resolve_fetch: std::time::Duration,
         pub h2d: std::time::Duration,
         /// CPU expert lane wall time after the stage-A overlap (mid
         /// quantize + down-proj fan-out + join)
@@ -878,15 +880,17 @@ mod real {
     impl Prof {
         pub fn report(&self) -> String {
             let s = |d: std::time::Duration| d.as_secs_f64();
-            let accounted = self.resolve_d2h + self.resolve_lists + self.resolve_host + self.h2d;
+            let accounted = self.resolve_d2h + self.resolve_lists + self.resolve_host
+                + self.resolve_fetch + self.h2d;
             let other = self.resolve.saturating_sub(accounted);
             format!(
-                "gpu-wait {:.2}s, resolve {:.2}s (d2h {:.2}s, lists {:.2}s, host {:.2}s, h2d {:.2}s, other {:.2}s), cpu-lane {:.2}s, logits-tail {:.2}s over {} layer steps",
+                "gpu-wait {:.2}s, resolve {:.2}s (d2h {:.2}s, lists {:.2}s, host {:.2}s, disk {:.2}s, h2d {:.2}s, other {:.2}s), cpu-lane {:.2}s, logits-tail {:.2}s over {} layer steps",
                 s(self.sync),
                 s(self.resolve),
                 s(self.resolve_d2h),
                 s(self.resolve_lists),
                 s(self.resolve_host),
+                s(self.resolve_fetch),
                 s(self.h2d),
                 s(other),
                 s(self.cpu),
@@ -931,6 +935,7 @@ mod real {
         pub prof_gpu_wait: f64,
         pub prof_resolve: f64,
         pub prof_h2d: f64,
+        pub prof_fetch: f64,
         pub prof_cpu: f64,
         pub prof_tail: f64,
         pub prof_calls: u64,
@@ -1365,11 +1370,14 @@ mod real {
         /// immediately, disk misses as each io_uring completion lands - so
         /// the caller's H2D uploads overlap the remaining reads. Fetched
         /// slabs enter the LFU cache afterwards.
+        /// Returns the pure io_uring disk-fetch wait (excludes the caller's
+        /// place/h2d copies) so the profiler can bucket disk separately from
+        /// host-side lookup/eviction. Zero when everything hit the cache.
         fn ensure_with(
             &mut self,
             wants: &[stream::Read],
             mut place: impl FnMut(u64, &[u8]) -> Result,
-        ) -> Result {
+        ) -> Result<std::time::Duration> {
             self.tick += 1;
             let mut missing = Vec::new();
             for r in wants {
@@ -1384,7 +1392,7 @@ mod real {
                 }
             }
             if missing.is_empty() {
-                return Ok(());
+                return Ok(std::time::Duration::ZERO);
             }
             // Evict lowest (freq, tick) among a strided SAMPLE of eligible
             // entries. Full min scans over ~40k host slabs burned seconds
@@ -1412,24 +1420,33 @@ mod real {
                     self.used -= e.slab.bytes();
                 }
             }
-            let Self { fetcher, cache, used, tick, .. } = self;
-            let mut place_err = None;
-            fetcher.fetch_each(&missing, |i, slab| {
-                if place_err.is_none() {
-                    if let Err(e) = place(missing[i].offset, slab.payload()) {
-                        place_err = Some(e);
+            let t_fe = std::time::Instant::now();
+            let mut fetch_place = std::time::Duration::ZERO;
+            let place_err = {
+                let Self { fetcher, cache, used, tick, .. } = self;
+                let mut place_err = None;
+                fetcher.fetch_each(&missing, |i, slab| {
+                    if place_err.is_none() {
+                        let tp = std::time::Instant::now();
+                        if let Err(e) = place(missing[i].offset, slab.payload()) {
+                            place_err = Some(e);
+                        }
+                        fetch_place += tp.elapsed();
                     }
-                }
-                *used += slab.bytes();
-                cache.insert(
-                    missing[i].offset,
-                    CacheEntry { slab, freq: 1, tick: *tick },
-                );
-                Ok(())
-            })?;
+                    *used += slab.bytes();
+                    cache.insert(
+                        missing[i].offset,
+                        CacheEntry { slab, freq: 1, tick: *tick },
+                    );
+                    Ok(())
+                })?;
+                place_err
+            };
+            // pure disk wait = fetch_each wall minus the h2d copies nested in it
+            let fetch = t_fe.elapsed().saturating_sub(fetch_place);
             match place_err {
                 Some(e) => Err(e),
-                None => Ok(()),
+                None => Ok(fetch),
             }
         }
 
@@ -3870,6 +3887,7 @@ mod real {
                 prof_gpu_wait: s(self.prof.sync),
                 prof_resolve: s(self.prof.resolve),
                 prof_h2d: s(self.prof.h2d),
+                prof_fetch: s(self.prof.resolve_fetch),
                 prof_cpu: s(self.prof.cpu),
                 prof_tail: s(self.prof.tail),
                 prof_calls: self.prof.calls,
@@ -5530,13 +5548,14 @@ mod real {
                         let unified = st.unified;
                         let async_h2d = st.async_expert_h2d;
                         let mut h2d = std::time::Duration::ZERO;
+                        let mut fetch_wait = std::time::Duration::ZERO;
                         let mut async_queued = false;
                         let t_host = std::time::Instant::now();
                         {
                             let dev_cache = &mut st.dev_cache;
                             let staging = &mut st.staging;
                             let expert_h2d = &st.expert_h2d;
-                            st.store.ensure_with(&wants, |off, payload| {
+                            fetch_wait = st.store.ensure_with(&wants, |off, payload| {
                                 if unified {
                                     resolved.insert(
                                         off,
@@ -5569,8 +5588,12 @@ mod real {
                             })?;
                         }
                         let ensure_elapsed = t_host.elapsed();
-                        // host bucket = ensure wall minus nested h2d copies
-                        st.prof.resolve_host += ensure_elapsed.saturating_sub(h2d);
+                        // disk-fetch (pure io_uring wait) split into its own bucket;
+                        // host = ensure wall minus h2d copies and the disk wait,
+                        // leaving host-side lookup + LFU eviction
+                        st.prof.resolve_fetch += fetch_wait;
+                        st.prof.resolve_host +=
+                            ensure_elapsed.saturating_sub(h2d).saturating_sub(fetch_wait);
                         if async_queued {
                             let t = std::time::Instant::now();
                             st.expert_h2d.record()?;

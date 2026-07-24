@@ -209,6 +209,7 @@ fn run() -> engine::Result {
                             "gpu_wait": s.prof_gpu_wait,
                             "resolve": s.prof_resolve,
                             "h2d": s.prof_h2d,
+                            "fetch": s.prof_fetch,
                             "cpu": s.prof_cpu,
                             "tail": s.prof_tail,
                             "calls": s.prof_calls,

@@ -46,6 +46,7 @@
     --seg2: #7d5cc0;
     --seg3: #4a4fbc;
     --seg4: #4fa3a8;
+    --seg5: #d98a3d;
     /* liquid glass */
     --glass-hi: rgba(255, 255, 255, .55);
     --glass-border: rgba(255, 255, 255, .5);
@@ -94,6 +95,7 @@
     --seg2: #b673d6;
     --seg3: #7f82ee;
     --seg4: #58b8bc;
+    --seg5: #e0a458;
     /* liquid glass, dark */
     --glass-hi: rgba(180, 190, 255, .12);
     --glass-border: rgba(150, 160, 230, .16);
@@ -523,6 +525,7 @@
   .seg-b { background: var(--seg2); }
   .seg-c { background: var(--seg3); }
   .seg-d { background: var(--seg4); }
+  .seg-e { background: var(--seg5); }
   .legend {
     display: flex;
     flex-wrap: wrap;
@@ -1361,7 +1364,7 @@ let lastTtft = 0; // last turn's prefill wall time (s)
 let lastPrefillTps = 0; // last turn's prefill tok/s
 let turns = 0;
 let tpsHist = []; // last ≤8 decode tok/s values
-const PROF_KEYS = ["gpu_wait", "resolve", "h2d", "cpu", "tail"];
+const PROF_KEYS = ["gpu_wait", "resolve", "h2d", "fetch", "cpu", "tail"];
 
 // 45230 → "45k", 8230 → "8.2k", 512 → "512"
 const fmtCtx = (n) =>
@@ -1676,20 +1679,22 @@ function applyTurnDelta(pre, post) {
     mk("seg-a", "vram", vram), mk("seg-b", "cpu", cpu), mk("seg-c", "cache", cache),
   ]);
   const d = {};
-  let sum = 0;
   for (const k of PROF_KEYS) {
     d[k] = Math.max(0, (post?.prof?.[k] || 0) - (pre?.prof?.[k] || 0));
-    sum += d[k];
   }
-  const other = d.resolve + d.tail;
+  // resolve already includes h2d + fetch; total = gpu_wait + resolve + cpu + tail.
+  // "other" = the remaining resolve overhead (d2h/lists/host) + tail.
+  const total = d.gpu_wait + d.resolve + d.cpu + d.tail;
+  const other = Math.max(0, d.resolve + d.tail - d.fetch - d.h2d);
   const sm = (cls, label, v) => ({
-    cls, label, pct: sum > 0 ? (v / sum) * 100 : 0, text: v.toFixed(2) + "s",
+    cls, label, pct: total > 0 ? (v / total) * 100 : 0, text: v.toFixed(2) + "s",
   });
   renderBar($("turn-bar"), $("turn-legend"), [
-    sm("seg-a", "gpu_wait", d.gpu_wait), sm("seg-b", "h2d", d.h2d),
-    sm("seg-c", "cpu", d.cpu), sm("seg-d", "other", other),
+    sm("seg-a", "gpu_wait", d.gpu_wait), sm("seg-e", "disk", d.fetch),
+    sm("seg-b", "h2d", d.h2d), sm("seg-c", "cpu", d.cpu),
+    sm("seg-d", "other", other),
   ]);
-  $("turn-total").textContent = sum > 0 ? "total " + sum.toFixed(2) + "s" : "";
+  $("turn-total").textContent = total > 0 ? "total " + total.toFixed(2) + "s" : "";
 }
 
 function renderTrend() {
