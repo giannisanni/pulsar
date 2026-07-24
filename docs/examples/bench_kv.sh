@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Quick PULSAR_KV sweep: tok/s + greedy-id quality diff vs f32 baseline.
 #
-# GPU auto-selection is lifted verbatim from runpulsar.sh (denylist + PCIe
-# scoring + free-VRAM attn pick + auto CACHE_GB / ATTN_VRAM). Keep the two in
-# sync if you touch the topology logic.
+# GPU auto-selection is lifted verbatim from runpulsar.sh (denylist + compute-cap
+# + PCIe scoring + free-VRAM attn pick + auto CACHE_GB / ATTN_VRAM). Keep the
+# two in sync if you touch the topology logic.
 #
 # PULSAR_KV only touches GQA / Qwen35 family models. MLA (glm-dsa / GLM-5.2)
 # and Dsv4 keep their own caches and ignore it — this script warns if a format
@@ -79,7 +79,7 @@ command -v nvidia-smi >/dev/null || {
 }
 
 mapfile -t GPU_ROWS < <(
-  nvidia-smi --query-gpu=index,name,memory.total,memory.free,pcie.link.gen.max,pcie.link.width.max,pcie.link.gen.current,pcie.link.width.current \
+  nvidia-smi --query-gpu=index,name,memory.total,memory.free,pcie.link.gen.max,pcie.link.width.max,pcie.link.gen.current,pcie.link.width.current,compute_cap \
     --format=csv,noheader,nounits 2>/dev/null | sed 's/, /,/g'
 )
 
@@ -89,7 +89,7 @@ if [ "${#GPU_ROWS[@]}" -eq 0 ]; then
   exit 1
 fi
 
-CAND_IDX=(); CAND_NAME=(); CAND_TOTAL=(); CAND_FREE=(); CAND_PCIE=()
+CAND_IDX=(); CAND_NAME=(); CAND_TOTAL=(); CAND_FREE=(); CAND_PCIE=(); CAND_CC=()  # cc major*10+minor (6.0=>60..10.0=>100); 0 if N/A
 
 is_denylisted() {
   local u="${1^^}"
@@ -102,7 +102,7 @@ is_denylisted() {
 
 echo "scanning GPUs (min ${MIN_VRAM_MB} MiB total VRAM)..."
 for row in "${GPU_ROWS[@]}"; do
-  IFS=',' read -r idx name total free gen width cgen cwidth <<<"$row"
+  IFS=',' read -r idx name total free gen width cgen cwidth cc_raw <<<"$row"
   idx="${idx// /}"; name="${name# }"; total="${total// /}"; free="${free// /}"
   gen="${gen// /}"; width="${width// /}"; cgen="${cgen// /}"; cwidth="${cwidth// /}"
   [[ "$total" =~ ^[0-9]+$ ]] || total=0
@@ -113,6 +113,23 @@ for row in "${GPU_ROWS[@]}"; do
   [[ "$width" =~ ^[0-9]+$ ]] || width=0
   pcie=$(( gen * width ))
 
+  # Compute capability, encoded major*10+minor so integer compare preserves SM
+  # order across the full range (6.0 -> 60, 7.0 -> 70, 8.6 -> 86, 10.0 -> 100).
+  # Higher SM wins the stream primary — tensor-core expert kernels want sm_80+
+  # (Ampere INT8/INT4 mma), but every SM from 6.0 up ranks correctly, so the
+  # best-capable card is always picked, never excluded by a hard threshold.
+  cc_raw="${cc_raw// /}"
+  if [[ "$cc_raw" == *.* ]]; then
+    cc_major="${cc_raw%%.*}"
+    cc_minor="${cc_raw#*.}"
+  else
+    cc_major="$cc_raw"
+    cc_minor=0
+  fi
+  [[ "$cc_major" =~ ^[0-9]+$ ]] || cc_major=0
+  [[ "$cc_minor" =~ ^[0-9]+$ ]] || cc_minor=0
+  cc=$(( cc_major * 10 + cc_minor ))
+
   if is_denylisted "$name"; then
     echo "  hide  GPU $idx  $name  (${total} MiB) — denylist"
     continue
@@ -121,9 +138,9 @@ for row in "${GPU_ROWS[@]}"; do
     echo "  hide  GPU $idx  $name  (${total} MiB < ${MIN_VRAM_MB} MiB min)"
     continue
   fi
-  echo "  cand  GPU $idx  $name  free=${free} MiB  PCIe gen${gen} x${width} (score=${pcie})"
+  echo "  cand  GPU $idx  $name  free=${free} MiB  PCIe gen${gen} x${width}  sm_${cc_raw:-?} (score=${pcie})"
   CAND_IDX+=("$idx"); CAND_NAME+=("$name"); CAND_TOTAL+=("$total")
-  CAND_FREE+=("$free"); CAND_PCIE+=("$pcie")
+  CAND_FREE+=("$free"); CAND_PCIE+=("$pcie"); CAND_CC+=("$cc")
 done
 
 n_cand=${#CAND_IDX[@]}
@@ -136,14 +153,18 @@ fi
 STREAM_I=0
 for ((i = 1; i < n_cand; i++)); do
   better=0
-  if [ "${CAND_PCIE[$i]}" -gt "${CAND_PCIE[$STREAM_I]}" ]; then
+  if [ "${CAND_CC[$i]}" -gt "${CAND_CC[$STREAM_I]}" ]; then
     better=1
-  elif [ "${CAND_PCIE[$i]}" -eq "${CAND_PCIE[$STREAM_I]}" ]; then
-    if [ "${CAND_FREE[$i]}" -gt "${CAND_FREE[$STREAM_I]}" ]; then
+  elif [ "${CAND_CC[$i]}" -eq "${CAND_CC[$STREAM_I]}" ]; then
+    if [ "${CAND_PCIE[$i]}" -gt "${CAND_PCIE[$STREAM_I]}" ]; then
       better=1
-    elif [ "${CAND_FREE[$i]}" -eq "${CAND_FREE[$STREAM_I]}" ] \
-      && [ "${CAND_TOTAL[$i]}" -gt "${CAND_TOTAL[$STREAM_I]}" ]; then
-      better=1
+    elif [ "${CAND_PCIE[$i]}" -eq "${CAND_PCIE[$STREAM_I]}" ]; then
+      if [ "${CAND_FREE[$i]}" -gt "${CAND_FREE[$STREAM_I]}" ]; then
+        better=1
+      elif [ "${CAND_FREE[$i]}" -eq "${CAND_FREE[$STREAM_I]}" ] \
+        && [ "${CAND_TOTAL[$i]}" -gt "${CAND_TOTAL[$STREAM_I]}" ]; then
+        better=1
+      fi
     fi
   fi
   [ "$better" -eq 1 ] && STREAM_I=$i
@@ -232,7 +253,7 @@ if [ -n "${MANUAL:-}" ]; then
   echo "  PULSAR_GPU=$PULSAR_GPU (stream)   PULSAR_ATTN_GPU=${PULSAR_ATTN_GPU:-unset} (attn)"
 else
   echo "selected topology:"
-  echo "  STREAM primary  physical GPU $STREAM_PHYS  $STREAM_NAME  (free ${STREAM_FREE} MiB, PCIe score ${CAND_PCIE[$STREAM_I]})"
+  echo "  STREAM primary  physical GPU $STREAM_PHYS  $STREAM_NAME  (free ${STREAM_FREE} MiB, cc ${CAND_CC[$STREAM_I]}, PCIe score ${CAND_PCIE[$STREAM_I]})"
   if [ -n "${ATTN_PHYS:-}" ]; then
     echo "  ATTN secondary  physical GPU $ATTN_PHYS  $ATTN_NAME  (free ${ATTN_FREE} MiB)"
   else

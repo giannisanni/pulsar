@@ -1214,6 +1214,144 @@ extern "C" int ds4_gpu_gqa_selftest(void) {
         ds4_gpu_tensor_free(g_out); ds4_gpu_tensor_free(g_kc8); ds4_gpu_tensor_free(g_vc8);
     }
 
+    /* Phase 6b/6c (q8_0 / q4_0 block KV): same shape as phase 6 but the
+     * per-32-elem block layout (f16 d + 32 int8, or f16 d + 16 nibble
+     * bytes). The GPU cache bytes are read back and host-decoded into f32
+     * caches with an INDEPENDENT reference formula (the f16 bit-twiddle
+     * below shares no code with the kernel's __half2float read path), then
+     * gqa_ref_attention runs on the decoded values. A sub-tol diff proves
+     * both that append wrote spec-correct block bytes and the attention
+     * read path dequants them correctly. These formats previously shipped
+     * without selftest coverage. */
+    for (int blk_fmt = 0; blk_fmt < 2; blk_fmt++) {
+        const int is_q8 = blk_fmt == 0;
+        const uint32_t row_bytes = (hd / 32u) * (is_q8 ? 34u : 18u);
+        const uint32_t n_tok = 48, pos0 = 9, window = 0;
+        const float scale = 1.0f / sqrtf((float)hd);
+        const uint64_t cache_b = (uint64_t)n_kv_head * cap * row_bytes;
+        uint64_t q_elems = (uint64_t)n_tok * n_head * hd;
+        uint64_t kv_elems = (uint64_t)n_tok * n_kv_head * hd;
+        float *q = (float *)malloc(q_elems * sizeof(float));
+        float *k = (float *)malloc(kv_elems * sizeof(float));
+        float *v = (float *)malloc(kv_elems * sizeof(float));
+        for (uint64_t i = 0; i < q_elems; i++) q[i] = gqa_test_randf();
+        /* x3 like phase 6 so amax is non-trivial; block d = amax/{127,8.5}. */
+        for (uint64_t i = 0; i < kv_elems; i++) { k[i] = gqa_test_randf() * 3.0f; v[i] = gqa_test_randf() * 3.0f; }
+
+        ds4_gpu_tensor *g_q = ds4_gpu_tensor_alloc(q_elems * sizeof(float));
+        ds4_gpu_tensor *g_k = ds4_gpu_tensor_alloc(kv_elems * sizeof(float));
+        ds4_gpu_tensor *g_v = ds4_gpu_tensor_alloc(kv_elems * sizeof(float));
+        ds4_gpu_tensor *g_out = ds4_gpu_tensor_alloc(q_elems * sizeof(float));
+        ds4_gpu_tensor *g_kcb = ds4_gpu_tensor_alloc(cache_b);
+        ds4_gpu_tensor *g_vcb = ds4_gpu_tensor_alloc(cache_b);
+        ds4_gpu_tensor_write(g_q, 0, q, q_elems * sizeof(float));
+        ds4_gpu_tensor_write(g_k, 0, k, kv_elems * sizeof(float));
+        ds4_gpu_tensor_write(g_v, 0, v, kv_elems * sizeof(float));
+        { uint8_t *z = (uint8_t *)calloc(cache_b, 1);
+          ds4_gpu_tensor_write(g_kcb, 0, z, cache_b);
+          ds4_gpu_tensor_write(g_vcb, 0, z, cache_b);
+          free(z); }
+
+        int ok = (is_q8
+                  ? (ds4_gpu_gqa_kv_cache_append_q8_0(g_kcb, g_k, n_tok, n_kv_head, hd, cap, pos0) &&
+                     ds4_gpu_gqa_kv_cache_append_q8_0(g_vcb, g_v, n_tok, n_kv_head, hd, cap, pos0) &&
+                     ds4_gpu_gqa_attention_q8_0(g_out, g_q, g_kcb, g_vcb, n_tok, n_head, n_kv_head, hd,
+                                               cap, pos0, scale, window, NULL, 0u))
+                  : (ds4_gpu_gqa_kv_cache_append_q4_0(g_kcb, g_k, n_tok, n_kv_head, hd, cap, pos0) &&
+                     ds4_gpu_gqa_kv_cache_append_q4_0(g_vcb, g_v, n_tok, n_kv_head, hd, cap, pos0) &&
+                     ds4_gpu_gqa_attention_q4_0(g_out, g_q, g_kcb, g_vcb, n_tok, n_head, n_kv_head, hd,
+                                               cap, pos0, scale, window, NULL, 0u))) &&
+                 cuda_ok(cudaDeviceSynchronize(), "gqa block selftest sync");
+
+        /* host-decode the GPU cache with a spec-reference formula (not the
+         * kernel's own dequant) so a PASS is independent confirmation. */
+        uint8_t *kcb = (uint8_t *)malloc(cache_b);
+        uint8_t *vcb = (uint8_t *)malloc(cache_b);
+        if (ok) ok = ds4_gpu_tensor_read(g_kcb, 0, kcb, cache_b) != 0 &&
+                     ds4_gpu_tensor_read(g_vcb, 0, vcb, cache_b) != 0;
+        /* IEEE-754 binary16 -> f32, pure host bit-twiddle. Independence
+         * from __half2float is the point: a PASS/FAIL does not share code
+         * with the kernel's read path. */
+        auto f16_ref = [](uint16_t h) -> float {
+            uint32_t sign = (uint32_t)(h >> 15) & 1u;
+            uint32_t exp = (uint32_t)(h >> 10) & 0x1Fu;
+            uint32_t mant = (uint32_t)h & 0x3FFu;
+            uint32_t bits;
+            if (exp == 0u) {
+                if (mant == 0u) {
+                    bits = sign << 31;
+                } else {
+                    uint32_t e = 0u;
+                    while ((mant & 0x400u) == 0u) { mant <<= 1; e++; }
+                    mant &= 0x3FFu;
+                    bits = (sign << 31) | ((127u - 14u - e) << 23) | (mant << 13);
+                }
+            } else if (exp == 31u) {
+                bits = (sign << 31) | (0xFFu << 23) | (mant << 13);
+            } else {
+                bits = (sign << 31) | ((exp + 112u) << 23) | (mant << 13);
+            }
+            float f; memcpy(&f, &bits, 4); return f;
+        };
+        if (ok) {
+            memset(ref_kc, 0, kcache_elems * sizeof(float));
+            memset(ref_vc, 0, kcache_elems * sizeof(float));
+            for (uint32_t h2 = 0; h2 < n_kv_head; h2++)
+            for (uint32_t t2 = 0; t2 < n_tok; t2++) {
+                const uint8_t *kr = kcb + ((uint64_t)h2 * cap + pos0 + t2) * row_bytes;
+                const uint8_t *vr = vcb + ((uint64_t)h2 * cap + pos0 + t2) * row_bytes;
+                const uint32_t nblk = hd / 32u;
+                for (uint32_t b = 0; b < nblk; b++) {
+                    uint16_t kbits = (uint16_t)kr[b * (is_q8 ? 34u : 18u)]
+                                   | ((uint16_t)kr[b * (is_q8 ? 34u : 18u) + 1u] << 8);
+                    uint16_t vbits = (uint16_t)vr[b * (is_q8 ? 34u : 18u)]
+                                   | ((uint16_t)vr[b * (is_q8 ? 34u : 18u) + 1u] << 8);
+                    float kd = f16_ref(kbits);
+                    float vd = f16_ref(vbits);
+                    for (uint32_t i = 0; i < 32u; i++) {
+                        float kv, vv;
+                        if (is_q8) {
+                            kv = kd * (float)((int8_t)kr[b * 34u + 2u + i]);
+                            vv = vd * (float)((int8_t)vr[b * 34u + 2u + i]);
+                        } else {
+                            uint32_t j = i & 15u;
+                            uint8_t kb = kr[b * 18u + 2u + j];
+                            uint8_t vb = vr[b * 18u + 2u + j];
+                            int kq = (int)((kb >> (((i >> 4) & 1u) << 2)) & 0xFu) - 8;
+                            int vq = (int)((vb >> (((i >> 4) & 1u) << 2)) & 0xFu) - 8;
+                            kv = kd * (float)kq;
+                            vv = vd * (float)vq;
+                        }
+                        uint32_t di = b * 32u + i;
+                        ref_kc[((uint64_t)h2 * cap + pos0 + t2) * hd + di] = kv;
+                        ref_vc[((uint64_t)h2 * cap + pos0 + t2) * hd + di] = vv;
+                    }
+                }
+            }
+        }
+        float *ref_out = (float *)malloc(q_elems * sizeof(float));
+        gqa_ref_attention(ref_out, q, ref_kc, ref_vc, n_tok, n_head, n_kv_head, hd, cap, pos0,
+                          scale, window, NULL, 0u);
+        float *gpu_out = (float *)malloc(q_elems * sizeof(float));
+        if (ok) ok = ds4_gpu_tensor_read(g_out, 0, gpu_out, q_elems * sizeof(float)) != 0;
+        float diff = ok ? gqa_max_abs_diff(ref_out, gpu_out, q_elems) : INFINITY;
+        /* End-to-end gate: the host decode above shares no code with the
+         * kernel's dequant, so a sub-tol diff proves both append (wrote
+         * spec-correct block bytes) and the attention read path. Residual
+         * is honest block-quant error (q8_0 step ~d/127, q4_0 ~d/8.5),
+         * which the 1/sqrt(hd) qk scale leaves well under tol. */
+        float tol = is_q8 ? 2e-2f : 0.5f;
+        int pass = ok && diff < tol;
+        fprintf(stderr, "gqa-selftest phase 6%c %s-kv (n_tok=%u pos0=%u): %s (max diff %.2e)\n",
+                is_q8 ? 'b' : 'c', is_q8 ? "q8_0" : "q4_0",
+                n_tok, pos0, pass ? "PASS" : "FAIL", diff);
+        if (!pass) all_ok = 0;
+
+        free(q); free(k); free(v); free(kcb); free(vcb); free(ref_out); free(gpu_out);
+        ds4_gpu_tensor_free(g_q); ds4_gpu_tensor_free(g_k); ds4_gpu_tensor_free(g_v);
+        ds4_gpu_tensor_free(g_out); ds4_gpu_tensor_free(g_kcb); ds4_gpu_tensor_free(g_vcb);
+    }
+
     /* Phase 7 (split-K decode): a 7000-row cache forces the split path
      * (rows >= 4096, n_tok <= 4). Three sub-cases: f32 full-causal, f32
      * with a 5000-row sliding window (split ranges start at row0 > 0),

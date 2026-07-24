@@ -57,12 +57,12 @@ command -v nvidia-smi >/dev/null || { echo "ERROR: nvidia-smi not found" >&2; ex
 command -v python3 >/dev/null || { echo "ERROR: python3 not found (logit comparison needs it)" >&2; exit 1; }
 
 mapfile -t GPU_ROWS < <(
-  nvidia-smi --query-gpu=index,name,memory.total,memory.free,pcie.link.gen.max,pcie.link.width.max,pcie.link.gen.current,pcie.link.width.current \
+  nvidia-smi --query-gpu=index,name,memory.total,memory.free,pcie.link.gen.max,pcie.link.width.max,pcie.link.gen.current,pcie.link.width.current,compute_cap \
     --format=csv,noheader,nounits 2>/dev/null | sed 's/, /,/g'
 )
 [ "${#GPU_ROWS[@]}" -gt 0 ] || { echo "ERROR: no GPUs reported by nvidia-smi" >&2; exit 1; }
 
-CAND_IDX=(); CAND_NAME=(); CAND_TOTAL=(); CAND_FREE=(); CAND_PCIE=()
+CAND_IDX=(); CAND_NAME=(); CAND_TOTAL=(); CAND_FREE=(); CAND_PCIE=(); CAND_CC=()  # cc major*10+minor (6.0=>60..10.0=>100); 0 if N/A
 is_denylisted() {
   local u="${1^^}"
   case "$u" in
@@ -73,7 +73,7 @@ is_denylisted() {
 
 echo "scanning GPUs (min ${MIN_VRAM_MB} MiB total VRAM)..."
 for row in "${GPU_ROWS[@]}"; do
-  IFS=',' read -r idx name total free gen width cgen cwidth <<<"$row"
+  IFS=',' read -r idx name total free gen width cgen cwidth cc_raw <<<"$row"
   idx="${idx// /}"; name="${name# }"; total="${total// /}"; free="${free// /}"
   gen="${gen// /}"; width="${width// /}"; cgen="${cgen// /}"; cwidth="${cwidth// /}"
   [[ "$total" =~ ^[0-9]+$ ]] || total=0
@@ -83,11 +83,19 @@ for row in "${GPU_ROWS[@]}"; do
   [[ "$gen" =~ ^[0-9]+$ ]] || gen=0
   [[ "$width" =~ ^[0-9]+$ ]] || width=0
   pcie=$(( gen * width ))
+  # compute capability major*10+minor (6.0->60, 8.6->86, 10.0->100); higher SM
+  # wins the stream primary — tensor-core expert kernels want sm_80+. Ranks
+  # every SM from 6.0 up; 0 if nvidia-smi reports [N/A].
+  cc_raw="${cc_raw// /}"
+  if [[ "$cc_raw" == *.* ]]; then cc_major="${cc_raw%%.*}"; cc_minor="${cc_raw#*.}"; else cc_major="$cc_raw"; cc_minor=0; fi
+  [[ "$cc_major" =~ ^[0-9]+$ ]] || cc_major=0
+  [[ "$cc_minor" =~ ^[0-9]+$ ]] || cc_minor=0
+  cc=$(( cc_major * 10 + cc_minor ))
   if is_denylisted "$name"; then echo "  hide  GPU $idx  $name — denylist"; continue; fi
   if [ "$total" -lt "$MIN_VRAM_MB" ]; then echo "  hide  GPU $idx  $name  (${total} < ${MIN_VRAM_MB} MiB)"; continue; fi
-  echo "  cand  GPU $idx  $name  free=${free} MiB  gen${gen} x${width} (score=${pcie})"
+  echo "  cand  GPU $idx  $name  free=${free} MiB  gen${gen} x${width}  sm_${cc_raw:-?} (score=${pcie})"
   CAND_IDX+=("$idx"); CAND_NAME+=("$name"); CAND_TOTAL+=("$total")
-  CAND_FREE+=("$free"); CAND_PCIE+=("$pcie")
+  CAND_FREE+=("$free"); CAND_PCIE+=("$pcie"); CAND_CC+=("$cc")
 done
 n_cand=${#CAND_IDX[@]}
 [ "$n_cand" -ge 1 ] || { echo "ERROR: no capable GPUs" >&2; exit 1; }
@@ -95,10 +103,13 @@ n_cand=${#CAND_IDX[@]}
 STREAM_I=0
 for ((i = 1; i < n_cand; i++)); do
   better=0
-  if [ "${CAND_PCIE[$i]}" -gt "${CAND_PCIE[$STREAM_I]}" ]; then better=1
-  elif [ "${CAND_PCIE[$i]}" -eq "${CAND_PCIE[$STREAM_I]}" ]; then
-    if [ "${CAND_FREE[$i]}" -gt "${CAND_FREE[$STREAM_I]}" ]; then better=1
-    elif [ "${CAND_FREE[$i]}" -eq "${CAND_FREE[$STREAM_I]}" ] && [ "${CAND_TOTAL[$i]}" -gt "${CAND_TOTAL[$STREAM_I]}" ]; then better=1; fi
+  if [ "${CAND_CC[$i]}" -gt "${CAND_CC[$STREAM_I]}" ]; then better=1
+  elif [ "${CAND_CC[$i]}" -eq "${CAND_CC[$STREAM_I]}" ]; then
+    if [ "${CAND_PCIE[$i]}" -gt "${CAND_PCIE[$STREAM_I]}" ]; then better=1
+    elif [ "${CAND_PCIE[$i]}" -eq "${CAND_PCIE[$STREAM_I]}" ]; then
+      if [ "${CAND_FREE[$i]}" -gt "${CAND_FREE[$STREAM_I]}" ]; then better=1
+      elif [ "${CAND_FREE[$i]}" -eq "${CAND_FREE[$STREAM_I]}" ] && [ "${CAND_TOTAL[$i]}" -gt "${CAND_TOTAL[$STREAM_I]}" ]; then better=1; fi
+    fi
   fi
   [ "$better" -eq 1 ] && STREAM_I=$i
 done
