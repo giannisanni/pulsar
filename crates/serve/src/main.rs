@@ -182,13 +182,23 @@ fn run() -> engine::Result {
                     // model residency: VRAM (resident tiers + slab cache), RAM (host
                     // cache), disk (the streamed remainder of the gguf on disk)
                     let model_bytes = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
-                    let vram = s.vram_resident as u64;
                     let ram = s.host_used as u64;
-                    let disk = model_bytes.saturating_sub(vram + ram);
+                    // Dense models (no MoE experts) are placed via per-layer card
+                    // ownership - fully resident in VRAM, but not counted by the
+                    // MoE tier residency counter, which made the whole model show
+                    // as "disk". Attribute their weight to VRAM (they never stream).
+                    let dense = find_u(".expert_count").unwrap_or(0) == 0;
+                    let vram = if dense {
+                        model_bytes.saturating_sub(ram)
+                    } else {
+                        s.vram_resident as u64
+                    };
+                    let disk = if dense { 0 } else { model_bytes.saturating_sub(vram + ram) };
                     let json = serde_json::json!({
                         "model": model_name,
                         "ctx": s.ctx,
                         "cpu_lane": cpu_lane_on(),
+                        "mtp": mtp_on(),
                         "n_layer": find_u(".block_count").unwrap_or(0),
                         "n_expert": find_u(".expert_count").unwrap_or(0),
                         "n_expert_used": find_u(".expert_used_count").unwrap_or(0),
@@ -305,7 +315,7 @@ fn run() -> engine::Result {
                         respond_json(&mut stream, 200, &serde_json::json!({"reloading": name}))?;
                         let _ = std::io::Write::flush(&mut stream);
                         eprintln!("pulsar-serve: switching model -> {name}, re-exec");
-                        let err = reexec(&target, cpu_lane_on(), None);
+                        let err = reexec(&target, cpu_lane_on(), None, mtp_on());
                         eprintln!("pulsar-serve: re-exec failed: {err}");
                         std::process::exit(1);
                     }
@@ -318,7 +328,19 @@ fn run() -> engine::Result {
                     respond_json(&mut stream, 200, &serde_json::json!({"reloading": true, "cpu_lane": enabled}))?;
                     let _ = std::io::Write::flush(&mut stream);
                     eprintln!("pulsar-serve: CPU lane -> {enabled}, re-exec");
-                    let err = reexec(std::path::Path::new(&model_path), enabled, None);
+                    let err = reexec(std::path::Path::new(&model_path), enabled, None, mtp_on());
+                    eprintln!("pulsar-serve: re-exec failed: {err}");
+                    std::process::exit(1);
+                }
+                // Toggle MTP speculative decode: re-exec with PULSAR_MTP set/unset.
+                // Models with no nextn/MTP block ignore it (engine logs a warning).
+                ("POST", "/mtp") => {
+                    let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                    let enabled = req["enabled"].as_bool().unwrap_or(false);
+                    respond_json(&mut stream, 200, &serde_json::json!({"reloading": true, "mtp": enabled}))?;
+                    let _ = std::io::Write::flush(&mut stream);
+                    eprintln!("pulsar-serve: MTP -> {enabled}, re-exec");
+                    let err = reexec(std::path::Path::new(&model_path), cpu_lane_on(), None, enabled);
                     eprintln!("pulsar-serve: re-exec failed: {err}");
                     std::process::exit(1);
                 }
@@ -333,7 +355,7 @@ fn run() -> engine::Result {
                         respond_json(&mut stream, 200, &serde_json::json!({"reloading": true, "ctx": n}))?;
                         let _ = std::io::Write::flush(&mut stream);
                         eprintln!("pulsar-serve: ctx -> {n}, re-exec");
-                        let err = reexec(std::path::Path::new(&model_path), cpu_lane_on(), Some(n));
+                        let err = reexec(std::path::Path::new(&model_path), cpu_lane_on(), Some(n), mtp_on());
                         eprintln!("pulsar-serve: re-exec failed: {err}");
                         std::process::exit(1);
                     }
@@ -433,7 +455,7 @@ fn cpu_name() -> String {
 /// Only returns (with an error) if exec fails. The model path is validated by
 /// the caller to be a .gguf inside the current model's directory.
 #[cfg(target_os = "linux")]
-fn reexec(newmodel: &std::path::Path, cpu_lane: bool, new_ctx: Option<u32>) -> std::io::Error {
+fn reexec(newmodel: &std::path::Path, cpu_lane: bool, new_ctx: Option<u32>, mtp: bool) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     let args: Vec<String> = std::env::args().collect();
     let mut cmd = std::process::Command::new(&args[0]);
@@ -464,12 +486,22 @@ fn reexec(newmodel: &std::path::Path, cpu_lane: bool, new_ctx: Option<u32>) -> s
     } else {
         cmd.env_remove("PULSAR_CPU");
     }
+    if mtp {
+        cmd.env("PULSAR_MTP", "1");
+    } else {
+        cmd.env_remove("PULSAR_MTP");
+    }
     cmd.exec()
 }
 
 /// Whether the AVX2 CPU expert lane is enabled in this process.
 fn cpu_lane_on() -> bool {
     std::env::var_os("PULSAR_CPU").is_some_and(|v| v != "0" && !v.is_empty())
+}
+
+/// Whether MTP speculative decode is enabled in this process.
+fn mtp_on() -> bool {
+    std::env::var_os("PULSAR_MTP").is_some_and(|v| v != "0" && !v.is_empty())
 }
 
 /// Per-GPU (name, vram_total_bytes, vram_used_bytes) for EVERY card, from one

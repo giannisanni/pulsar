@@ -1167,6 +1167,7 @@
     <div class="kv"><span class="k">RAM</span><span class="v" id="hw-ram">—</span></div>
     <div class="kv"><span class="k">Cores</span><span class="v" id="hw-cores">—</span></div>
     <div class="kv"><span class="k">CPU lane</span><button id="cpu-lane-toggle" class="cpu-toggle" type="button" title="Toggle the AVX2 CPU expert lane (reloads the model; ~30% faster decode)">—</button></div>
+    <div class="kv"><span class="k">MTP</span><button id="mtp-toggle" class="cpu-toggle" type="button" title="Toggle MTP speculative decode (reloads the model; faster decode on models with a draft/nextn head, ignored on others)">—</button></div>
   </div>
 
   <div class="stat-grid stat-grid-4">
@@ -1531,6 +1532,38 @@ async function toggleCpuLane() {
 }
 cpuToggle.addEventListener("click", toggleCpuLane);
 
+const mtpToggle = $("mtp-toggle");
+function setMtpToggle(on) {
+  mtpToggle.textContent = on ? "on" : "off";
+  mtpToggle.classList.toggle("on", !!on);
+  mtpToggle.dataset.on = on ? "1" : "0";
+}
+async function toggleMtp() {
+  const want = mtpToggle.dataset.on !== "1";
+  mtpToggle.disabled = true;
+  modelSwitchNote.hidden = false;
+  modelSwitchNote.textContent = (want ? "enabling" : "disabling") + " MTP … reloading (~1-3 min)";
+  try {
+    await fetch("/mtp", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: want }) });
+  } catch {}
+  const t0 = Date.now();
+  const poll = async () => {
+    if (Date.now() - t0 > 360000) { modelSwitchNote.textContent = "MTP switch timed out"; mtpToggle.disabled = false; return; }
+    try {
+      const j = await fetchStats();
+      if (typeof j.mtp === "boolean" && j.mtp === want) {
+        applyStats(j);
+        modelSwitchNote.hidden = true;
+        mtpToggle.disabled = false;
+        return;
+      }
+    } catch {}
+    setTimeout(poll, 3000);
+  };
+  setTimeout(poll, 5000);
+}
+mtpToggle.addEventListener("click", toggleMtp);
+
 // Render a segment bar + legend. segs: [{cls, label, val, pct, text}].
 function renderBar(barEl, legEl, segs) {
   barEl.innerHTML = "";
@@ -1603,6 +1636,7 @@ function applyStats(j) {
     if (document.activeElement !== ctxWindow) ctxWindow.value = maxCtx;
   }
   if (typeof j?.cpu_lane === "boolean") setCpuToggle(j.cpu_lane);
+  if (typeof j?.mtp === "boolean") setMtpToggle(j.mtp);
   // model residency: how much of the model sits in VRAM / RAM cache / on disk
   const rz = j?.residency || {};
   const rTot = (rz.vram || 0) + (rz.ram || 0) + (rz.disk || 0);
