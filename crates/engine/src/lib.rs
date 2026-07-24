@@ -4156,8 +4156,16 @@ mod real {
             //   q8_0 -> 32-wide blocks f16 d + 32 i8 (stride head_dim/32*34)
             //   q4_0 -> 32-wide blocks f16 d + 16 nibbles (stride head_dim/32*18)
             // MLA keeps its compact latent cache as-is.
-            let kvq = if matches!(s.family, Family::Gqa | Family::Qwen35) {
-                match std::env::var("PULSAR_KV").ok().as_deref() {
+            // qwen35-dense (n_expert==1) runs the dense-split path, which does
+            // not support the quantized KV layout - applying it deadlocked the
+            // forward (GPUs idle, no output). Keep dense on f32, and warn loudly
+            // if PULSAR_KV was requested but the arch can't honor it (never
+            // silently apply-and-hang; a stale env carries over on model switch).
+            let kv_req = std::env::var("PULSAR_KV").ok();
+            let kv_dense = s.family == Family::Qwen35 && s.n_expert == 1;
+            let kv_ok = matches!(s.family, Family::Gqa | Family::Qwen35) && !kv_dense;
+            let kvq = if kv_ok {
+                match kv_req.as_deref() {
                     Some("fp8") => 1,
                     Some("fp16") | Some("f16") => 2,
                     Some("int8") | Some("i8") => 3,
@@ -4166,6 +4174,12 @@ mod real {
                     _ => 0,
                 }
             } else {
+                if kv_req.as_deref().is_some_and(|v| !v.is_empty() && v != "f32") {
+                    eprintln!(
+                        "pulsar: PULSAR_KV={} ignored - this arch keeps its f32 KV cache (quantized KV unsupported here)",
+                        kv_req.as_deref().unwrap_or("")
+                    );
+                }
                 0
             };
             let kv_row = |hd: usize| match kvq {
