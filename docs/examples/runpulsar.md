@@ -140,7 +140,7 @@ them — beats PCIe on the reference box for iq2/q2_K/q3_K/q4_K tensors.
 
 | var | default | what |
 |---|---|---|
-| `PULSAR_CPU` | `1` | `1` = CPU lane on. `off` or `0` = off |
+| `PULSAR_CPU` | `off` | `off` or `0` = CPU lane off. `1` = on |
 | `PULSAR_CPU_STEAL` | `0` | CPU steal factor (0 = none) |
 
 ```sh

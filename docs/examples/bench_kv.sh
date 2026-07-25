@@ -46,7 +46,7 @@ fi
 ATTN_VRAM_USER="${PULSAR_ATTN_VRAM_GB-}"
 ATTN_VRAM_GB=""
 ATTN_VRAM_NOTE=""
-CPU="${PULSAR_CPU:-1}"
+CPU="${PULSAR_CPU:-off}"
 CPU_STEAL="${PULSAR_CPU_STEAL:-0}"
 
 calc_attn_vram_gb() {
