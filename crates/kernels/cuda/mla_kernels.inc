@@ -417,6 +417,11 @@ __global__ static void mla_attention_kernel(
     float *red = mla_attn_sm;
     float *scores = mla_attn_sm + 256u;
     float *lora_sum = scores + n_selected;
+    /* q's low-rank row, staged once instead of re-read per score, and the
+     * rope frequency per pair - powf depends only on r, so hoisting it out
+     * of the score loop turns n_selected*qk_rope/2 calls into qk_rope/2. */
+    float *low_s = lora_sum + kv_lora_dim;
+    float *ropef = low_s + kv_lora_dim;
 
     const float *qh = q + ((uint64_t)token * n_head + head) * qk_dim;
     const float *low = qk_low + ((uint64_t)token * n_head + head) * kv_lora_dim;
@@ -428,21 +433,39 @@ __global__ static void mla_attention_kernel(
                            beta_fast, beta_slow, &corr0, &corr1);
     }
 
-    float local_max = -INFINITY;
     const float inv_ndims = -1.0f / (float)qk_rope;
-    for (uint32_t s = tid; s < n_selected; s += nth) {
+    const uint32_t n_pair = qk_rope >> 1;
+    for (uint32_t j = tid; j < kv_lora_dim; j += nth) low_s[j] = low[j];
+    for (uint32_t p = tid; p < n_pair; p += nth) {
+        ropef[p] = powf(freq_base, inv_ndims * (float)(p << 1));
+    }
+    __syncthreads();
+
+    /* One WARP per score, not one thread: the 32 lanes split kv_lora_dim so
+     * consecutive lanes read consecutive floats of the SAME cache row and
+     * coalesce. Thread-per-score had each lane walking a different row, 32
+     * rows 2KB apart per instruction - ~8x the memory traffic on a kernel
+     * that is memory bound. Same serial work per thread, far fewer
+     * transactions. The shuffle reduction reorders the sum, so results move
+     * in the last bits (the documented drift class, not a correctness
+     * change); MLA is outside check.sh's bit-exact gate. */
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5;
+    const uint32_t n_warp = nth >> 5;
+    float local_max = -INFINITY;
+    for (uint32_t s = warp; s < n_selected; s += n_warp) {
         const uint32_t row = token_selected[s];
         float score = -INFINITY;
         if (row < cache_cap) {
             float dotv = 0.0f;
             const uint64_t lora_base = (uint64_t)row * kv_lora_dim;
-            for (uint32_t j = 0; j < kv_lora_dim; j++) {
-                dotv += low[j] * kv_lora_cache[lora_base + j];
+            for (uint32_t j = lane; j < kv_lora_dim; j += 32u) {
+                dotv += low_s[j] * kv_lora_cache[lora_base + j];
             }
             const uint64_t rope_base = (uint64_t)row * qk_rope;
-            for (uint32_t r = 0; r < qk_rope; r += 2u) {
-                const float theta = (float)row *
-                    powf(freq_base, inv_ndims * (float)r);
+            for (uint32_t p = lane; p < n_pair; p += 32u) {
+                const uint32_t r = p << 1;
+                const float theta = (float)row * ropef[p];
                 float c, sn;
                 mla_rope_yarn(theta, freq_scale, corr0, corr1, (int)r,
                               ext_factor, attn_factor, &c, &sn);
@@ -452,11 +475,16 @@ __global__ static void mla_attention_kernel(
                 const float y1 = x0 * sn + x1 * c;
                 dotv += qh[qk_nope + r] * y0 + qh[qk_nope + r + 1u] * y1;
             }
+            #pragma unroll
+            for (uint32_t m = 16u; m > 0u; m >>= 1u) {
+                dotv += __shfl_xor_sync(0xffffffffu, dotv, m);
+            }
             score = dotv * scale;
         }
-        scores[s] = score;
+        if (lane == 0u) scores[s] = score;
         local_max = fmaxf(local_max, score);
     }
+    __syncthreads();
     red[tid] = local_max;
     __syncthreads();
     for (uint32_t step = nth >> 1; step > 0; step >>= 1) {
@@ -534,7 +562,8 @@ extern "C" int pulsar_mla_attention(
         return 0;
     }
     const uint64_t smem =
-        (256u + (uint64_t)n_selected + kv_lora_dim) * sizeof(float);
+        (256u + (uint64_t)n_selected + 2u * (uint64_t)kv_lora_dim
+         + (uint64_t)(qk_rope >> 1)) * sizeof(float);
     if (!mla_smem_ok((const void *)mla_attention_kernel, smem,
                      "mla attention smem opt-in")) {
         return 0;

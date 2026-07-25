@@ -1182,7 +1182,7 @@ impl Model {
                 if let (Some(&g), Some(&u), Some(&d)) =
                     (t.map.get(&g_off), t.map.get(&u_off), t.map.get(&d_off))
                 {
-                    tier_map.insert(e, (ti, kernels::ExpertPtrs { gate: g, up: u, down: d }));
+                    tier_map.insert(e, (ti, kernels::ExpertPtrs { gate: g, up: u, down: d, ..kernels::ExpertPtrs::NULL }));
                     break;
                 }
             }
@@ -1344,6 +1344,7 @@ impl Model {
                 gate: resolved[&(gate_exps.abs_offset + e as u64 * gate_exps.expert_bytes)],
                 up: resolved[&(up_exps.abs_offset + e as u64 * up_exps.expert_bytes)],
                 down: resolved[&(down_exps.abs_offset + e as u64 * down_exps.expert_bytes)],
+                ..kernels::ExpertPtrs::NULL
             });
         }
         st.expert_ptrs.write(0, kernels::as_bytes(&ptrs))?;

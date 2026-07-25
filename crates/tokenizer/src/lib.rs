@@ -102,8 +102,15 @@ enum ChatStyle {
     /// ... (poolside Laguna; paired open/close role tags, GLM-style thinking
     /// off via an empty <think></think> block)
     Laguna,
+    /// <|start|>role<|message|>text<|end|> ... (OpenAI harmony, gpt-oss).
+    /// Roles are plain text between real marker tokens. The assistant
+    /// answers on channels: it opens with <|channel|>analysis for its
+    /// reasoning and <|channel|>final for the reply, and stops on
+    /// <|return|>. History keeps only the final channel.
+    Harmony,
 }
 
+#[derive(Clone)]
 pub struct ChatMarkers {
     style: ChatStyle,
     /// None on ChatML models (qwen: add_bos_token=false, no bos id).
@@ -117,6 +124,13 @@ pub struct ChatMarkers {
     aux1: u32,
     /// Full dynamic end-of-generation set from the tokenizer.
     stops: Vec<u32>,
+    /// Reasoning models whose template can suppress it (GLM) default to
+    /// OFF, because a chat UI that shows raw think tokens looks broken.
+    /// Callers that route reasoning somewhere sensible turn it on.
+    think: bool,
+    /// gpt-oss grades its reasoning in the harmony system block rather
+    /// than switching it: low | medium | high.
+    reasoning: &'static str,
 }
 
 impl ChatMarkers {
@@ -133,6 +147,8 @@ impl ChatMarkers {
                 aux0: find("<|im_middle|>")?,
                 aux1: find("<|im_system|>")?,
                 stops: t.stop_ids.clone(),
+                think: false,
+                reasoning: "medium",
             });
         }
         if t.find_token("<start_of_turn>").is_some() {
@@ -146,6 +162,8 @@ impl ChatMarkers {
                 aux0: find("<end_of_turn>")?,
                 aux1: find("<end_of_turn>")?,
                 stops: t.stop_ids.clone(),
+                think: false,
+                reasoning: "medium",
             });
         }
         if t.find_token("<|message_user|>").is_some() {
@@ -161,6 +179,8 @@ impl ChatMarkers {
                 aux0: find("<|end_message|>")?,
                 aux1: find("<|content_text|>")?,
                 stops: t.stop_ids.clone(),
+                think: false,
+                reasoning: "medium",
             });
         }
         if t.find_token("]~b]").is_some() {
@@ -181,6 +201,8 @@ impl ChatMarkers {
                 aux0: find("[e~[")?,
                 aux1: find("<mm:think>")?,
                 stops: t.stop_ids.clone(),
+                think: false,
+                reasoning: "medium",
             });
         }
         if t.find_token("<｜User｜>").is_some() {
@@ -197,6 +219,8 @@ impl ChatMarkers {
                 aux0: find("<think>")?,
                 aux1: find("</think>")?,
                 stops: t.stop_ids.clone(),
+                think: false,
+                reasoning: "medium",
             });
         }
         if t.find_token("<sop>").is_some() && t.find_token("<|user|>").is_some() {
@@ -212,6 +236,12 @@ impl ChatMarkers {
                 aux0: find("<|system|>")?,
                 aux1: find("<sop>")?,
                 stops: t.stop_ids.clone(),
+                // GLM's own template defaults thinking ON at effort Max:
+                //   <|assistant|>{{ '<think></think>' if (enable_thinking is
+                //     defined and not enable_thinking) else '<think>' }}
+                // pulsar used to force it off, which is a different model.
+                think: true,
+                reasoning: "max",
             });
         }
         if t.find_token("<|im_start|>").is_some() {
@@ -226,6 +256,8 @@ impl ChatMarkers {
                 aux0: find("<|im_end|>")?,
                 aux1: find("<|im_end|>")?,
                 stops: t.stop_ids.clone(),
+                think: false,
+                reasoning: "medium",
             });
         }
         if t.find_token("<assistant>").is_some() && t.find_token("</assistant>").is_some() {
@@ -249,6 +281,49 @@ impl ChatMarkers {
                 aux0: find("<think>")?,
                 aux1: find("</think>")?,
                 stops,
+                think: false,
+                reasoning: "medium",
+            });
+        }
+        if let (Some(start), Some(msg), Some(end)) = (
+            t.find_token("<|start|>"),
+            t.find_token("<|message|>"),
+            t.find_token("<|end|>"),
+        ) {
+            // gpt-oss harmony. `assistant` carries <|channel|> because the
+            // role itself is text, not a token, and history needs the
+            // channel marker; open/close roles ride in user/aux1.
+            let mut stops = t.stop_ids.clone();
+            for name in ["<|return|>", "<|call|>"] {
+                if let Some(id) = t.find_token(name) {
+                    if !stops.contains(&id) {
+                        stops.push(id);
+                    }
+                }
+            }
+            // <|end|> closes a MESSAGE, not the turn: the assistant runs
+            // analysis<|end|><|start|>assistant<|channel|>final... and only
+            // <|return|>/<|call|> end generation. The generic EOG text list
+            // puts <|end|> in stop_ids for other archs' sake - drop it here
+            // or generation dies at the end of the analysis channel.
+            stops.retain(|&x| x != end);
+            stops.sort_unstable();
+            return Ok(ChatMarkers {
+                style: ChatStyle::Harmony,
+                // no bos: the harmony template opens on <|start|>system and
+                // the reference tokenizes it without one. Prepending bos
+                // shifts every position by one and the model rambles instead
+                // of answering.
+                bos: None,
+                eos: t.eos_id.ok_or(Error::MissingKey("eos_token_id"))?,
+                eot: t.find_token("<|return|>"),
+                user: start,
+                assistant: t.find_token("<|channel|>").unwrap_or(start),
+                aux0: msg,
+                aux1: end,
+                stops,
+                think: false,
+                reasoning: "medium",
             });
         }
         Ok(ChatMarkers {
@@ -261,7 +336,67 @@ impl ChatMarkers {
             aux0: find("<think:opensource>")?,
             aux1: find("</think:opensource>")?,
             stops: t.stop_ids.clone(),
+                think: false,
+                reasoning: "medium",
         })
+    }
+
+    /// Preamble a style needs even when the caller supplies no system
+    /// prompt. Harmony is the only one so far, and it is not optional
+    /// there: gpt-oss routes output over named channels, and the shape of
+    /// this block decides whether it does so correctly. Without the channel
+    /// list it never closes `analysis`; without the date line it stops
+    /// emitting <|message|> after the channel name. Both were measured, and
+    /// the text mirrors the model's own template for that reason.
+    pub fn default_system(&self) -> Option<String> {
+        match self.style {
+            ChatStyle::Harmony => Some(format!(
+                "You are ChatGPT, a large language model trained by OpenAI.\n\
+                 Knowledge cutoff: 2024-06\n\
+                 Current date: {}\n\n\
+                 Reasoning: {}\n\n\
+                 # Valid channels: analysis, commentary, final. Channel must \
+                 be included for every message.",
+                today_ymd(),
+                self.reasoning
+            )),
+            _ => None,
+        }
+    }
+
+    /// Ask a reasoning model to think. GLM switches its template block;
+    /// gpt-oss grades effort as low|medium|high in the system preamble and
+    /// ignores anything else. Styles without a reasoning mode ignore both.
+    pub fn set_think(&mut self, on: bool) {
+        self.think = on;
+    }
+
+    /// Effort vocabularies differ by model, so clamp to the one the
+    /// template actually understands: GLM grades high|max (default max),
+    /// harmony low|medium|high (default medium). An unknown value falls
+    /// back to that style's default rather than reaching the prompt.
+    pub fn set_reasoning(&mut self, level: &str) {
+        self.reasoning = match (self.style, level) {
+            (ChatStyle::Glm, "high") => "high",
+            (ChatStyle::Glm, _) => "max",
+            (_, "low") => "low",
+            (_, "high") => "high",
+            (_, _) => "medium",
+        };
+    }
+
+    /// True when the assistant opener leaves a reasoning block OPEN, so
+    /// generation starts inside it and the first `</think>` closes it.
+    /// GLM with thinking on is the only such style: `<think>` is the last
+    /// PROMPT token, never a generated one, so a consumer that waits for an
+    /// opening tag would route the whole reply to reasoning.
+    pub fn opens_thinking(&self) -> bool {
+        self.style == ChatStyle::Glm && self.think
+    }
+
+    /// Whether this style has a reasoning mode a caller can steer.
+    pub fn reasoning_capable(&self) -> bool {
+        matches!(self.style, ChatStyle::Glm | ChatStyle::Harmony)
     }
 
     /// Conversation prologue: bos for most styles, [gMASK]<sop> for GLM.
@@ -273,9 +408,31 @@ impl ChatMarkers {
         v
     }
 
+    /// GLM states its reasoning budget in a system block right after the
+    /// prologue and before tools, capitalized, and only when thinking is
+    /// on - matching `<|system|>Reasoning Effort: {{ effort | capitalize }}`
+    /// in the shipped template. Empty for every other style.
+    pub fn prologue_effort(&self, t: &Tokenizer) -> Vec<u32> {
+        if self.style != ChatStyle::Glm || !self.think {
+            return Vec::new();
+        }
+        let mut v = vec![self.aux0];
+        let label = if self.reasoning == "high" { "High" } else { "Max" };
+        v.extend(t.encode(&format!("Reasoning Effort: {label}")));
+        v
+    }
+
     /// System text ids for the first turn (Hy3: bare text after bos).
     pub fn render_system(&self, t: &Tokenizer, text: &str) -> Vec<u32> {
         match self.style {
+            ChatStyle::Harmony => {
+                let mut v = vec![self.user];
+                v.extend(t.encode("system"));
+                v.push(self.aux0);
+                v.extend(t.encode(text));
+                v.push(self.aux1);
+                v
+            }
             ChatStyle::Hy3 | ChatStyle::Deepseek => t.encode(text),
             ChatStyle::ChatMl => {
                 let mut v = vec![self.user];
@@ -329,6 +486,14 @@ impl ChatMarkers {
     /// A user message (no assistant opener).
     pub fn render_user(&self, t: &Tokenizer, text: &str) -> Vec<u32> {
         match self.style {
+            ChatStyle::Harmony => {
+                let mut v = vec![self.user];
+                v.extend(t.encode("user"));
+                v.push(self.aux0);
+                v.extend(t.encode(text));
+                v.push(self.aux1);
+                v
+            }
             ChatStyle::Hy3 | ChatStyle::Deepseek => {
                 let mut v = vec![self.user];
                 v.extend(t.encode(text));
@@ -374,6 +539,14 @@ impl ChatMarkers {
     /// The assistant opener; generation starts right after this.
     pub fn open_assistant(&self, t: &Tokenizer) -> Vec<u32> {
         match self.style {
+            ChatStyle::Harmony => {
+                // stop at the role: the model emits its own <|channel|>
+                // analysis/final, and forcing one here would cut off the
+                // reasoning it is trained to produce
+                let mut v = vec![self.user];
+                v.extend(t.encode("assistant"));
+                v
+            }
             ChatStyle::Hy3 => vec![self.assistant, self.aux0, self.aux1],
             // <U+FF5C>Assistant<U+FF5C> then </think>: thinking off
             ChatStyle::Deepseek => vec![self.assistant, self.aux1],
@@ -415,12 +588,20 @@ impl ChatMarkers {
             ChatStyle::Glm => {
                 let mut v = vec![self.assistant];
                 v.extend(t.encode("\n"));
-                // thinking off when the vocab carries think tokens
+                // A CLOSED, EMPTY <think></think> is GLM's documented way to
+                // suppress reasoning: the model sees thinking as already done
+                // and goes straight to the answer. Opening the block without
+                // closing it is what asks for reasoning, so `think` picks
+                // between the two rather than adding or removing a marker.
                 if let (Some(ts), Some(te)) =
                     (t.find_token("<think>"), t.find_token("</think>"))
                 {
-                    v.extend([ts, te]);
-                    v.extend(t.encode("\n"));
+                    if self.think {
+                        v.push(ts);
+                    } else {
+                        v.extend([ts, te]);
+                        v.extend(t.encode("\n"));
+                    }
                 }
                 v
             }
@@ -439,6 +620,18 @@ impl ChatMarkers {
             let mut v = vec![self.assistant, self.aux1];
             v.extend(t.encode(text));
             v.push(self.aux0);
+            return v;
+        }
+        if self.style == ChatStyle::Harmony {
+            // prior turns carry the final channel only; the analysis
+            // channel is not replayed back to the model
+            let mut v = vec![self.user];
+            v.extend(t.encode("assistant"));
+            v.push(self.assistant);
+            v.extend(t.encode("final"));
+            v.push(self.aux0);
+            v.extend(t.encode(text));
+            v.push(self.aux1);
             return v;
         }
         let mut v = self.open_assistant(t);
@@ -463,6 +656,31 @@ impl ChatMarkers {
     pub fn is_stop(&self, id: u32) -> bool {
         id == self.eos || Some(id) == self.eot || self.stops.binary_search(&id).is_ok()
     }
+
+    /// Harmony output rides named channels; streaming callers need to know
+    /// so they can route analysis/final instead of passing fences through.
+    pub fn is_harmony(&self) -> bool {
+        self.style == ChatStyle::Harmony
+    }
+}
+
+/// Today as YYYY-MM-DD, UTC. Hinnant's civil-from-days so the harmony
+/// preamble carries a real date without pulling in a date crate.
+fn today_ymd() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// GPT-2's byte<->unicode bijection: printable bytes map to themselves,

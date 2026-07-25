@@ -8,6 +8,15 @@
 #   - second warm run is the canonical number
 #   - quiet box: streaming decode is disk-bound, a busy box reads ~20% low
 #
+# COMPARING TWO BUILDS: consecutive runs are NOT independent samples. The
+# census and the resident tier keep warming across runs, so later runs read
+# systematically faster - measured 2.56 -> 2.83 tok/s on GLM-5.2 from the
+# SAME binary half an hour apart (tier 2812 -> 3023 slots, vram hits
+# 14% -> 19%). Never compare build A's runs against build B's runs taken
+# earlier; that is how a neutral change looks like a win or a regression.
+# Build both binaries, then ALTERNATE them (base, new, base, new, ...) so
+# the warming trend lands on both equally, and compare the means.
+#
 # usage: bench.sh MODEL.gguf [N]
 set -euo pipefail
 

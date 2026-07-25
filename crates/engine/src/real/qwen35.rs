@@ -1132,6 +1132,7 @@ impl Model {
                 &mut st.heads, &st.q, &st.kcache[il], &st.vcache[il],
                 t, s.n_head, s.n_head_kv, hd, st.ctx, pos,
                 1.0 / (hd as f32).sqrt(), 0, None, 0, 0,
+                None, // qwen35 has no attention sinks
             )?;
             kernels::qwen35_sigmoid_gate(&mut st.heads, &rt.gate, t * s.n_head * hd)?;
             if matches!(attn.out, MatW::Kq(_)) {

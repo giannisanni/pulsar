@@ -72,6 +72,10 @@ mod real {
         /// qwen3moe: softmax router, no bias, normalize top-k probs.
         /// false = sigmoid router (Hy3/GLM/DeepSeek/MiniMax lineage).
         pub router_softmax: bool,
+        /// YaRN applies to EVERY layer with the standard mscale, rather
+        /// than laguna's scheme of yarn on full-window layers only with the
+        /// kernel mscale cancelled. gpt-oss is the uniform kind.
+        pub rope_yarn_uniform: bool,
         /// expert gate activation: 0 = silu, 1 = gelu tanh (gemma4)
         pub moe_act_op: u32,
         pub rope_freq_base: f32,
@@ -212,6 +216,10 @@ mod real {
                 // Laguna-only pieces: a per-head output gate (attn_gate,
                 // softplus) and learnable sinks on the sliding layers.
                 Some("laguna") => Family::Gqa,
+                // OpenAI gpt-oss: GQA MoE with per-head attention sinks,
+                // alternating sliding/full attention, q/k/v/output biases,
+                // per-expert biases, and MXFP4 routed experts
+                Some("gpt-oss") => Family::Gqa,
                 // Qwen3.6-35B-A3B hybrid GDN (task #21)
                 Some("qwen35moe") => Family::Qwen35,
                 // Qwen3.6 dense (27B lineage, task #37): same GDN hybrid
@@ -302,16 +310,20 @@ mod real {
                 n_vocab,
                 // absent on qwen3moe (no scaling) - default 1.0
                 expert_weight_scale: f("expert_weights_scale").unwrap_or(1.0),
+                // softmax over the SELECTED top-k, not sigmoid per expert
+                // and not softmax over all of them: llama.cpp calls this
+                // SOFTMAX_WEIGHT, and gpt-oss uses it with no renorm after
                 router_softmax: matches!(
                     g.architecture(),
-                    Some("qwen3moe") | Some("gemma4") | Some("qwen35moe")
+                    Some("qwen3moe") | Some("gemma4") | Some("qwen35moe") | Some("gpt-oss")
                 ),
+                rope_yarn_uniform: g.architecture() == Some("gpt-oss"),
                 // gated-FFN op: 1 = gelu (gemma4), 2 = swiglu_oai (MiniMax
                 // M3: clamp 7, alpha 1.702, up+1 - llama.cpp PR 24523),
                 // 0 = plain silu everywhere else (inkling included)
                 moe_act_op: match g.architecture() {
                     Some("gemma4") => 1,
-                    Some("minimax-m3") => 2,
+                    Some("minimax-m3") | Some("gpt-oss") => 2,
                     _ => 0,
                 },
                 // inkling has no rope at all - the key may be absent
@@ -359,6 +371,14 @@ mod real {
                 // deepseek2 mscale path does not apply (log_mult 0).
                 s.rope_scale_factor = f("rope.scaling.factor").unwrap_or(1.0);
                 s.rope_orig_ctx = u("rope.scaling.original_context_length").unwrap_or(8192);
+                s.rope_yarn_log_mult = 0.0;
+            }
+            if g.architecture() == Some("gpt-oss") {
+                // yarn factor 32 over a 4096 native window, applied to every
+                // layer; without this parse the factor defaulted to 1.0 and
+                // rope ran unscaled, which is a different model
+                s.rope_scale_factor = f("rope.scaling.factor").unwrap_or(1.0);
+                s.rope_orig_ctx = u("rope.scaling.original_context_length").unwrap_or(4096);
                 s.rope_yarn_log_mult = 0.0;
             }
             if family == Family::Gqa {
@@ -560,6 +580,19 @@ mod real {
             /// here, so the offset-keyed cache/census/tier machinery
             /// serves shared experts like any other slab
             sink: Option<[ExpertTensor; 3]>,
+            /// per-expert f32 bias vectors, [n_expert][mid_dim] for gate/up
+            /// and [n_expert][out_dim] for down. gpt-oss is the only arch
+            /// here that ships them; everything else leaves this None and
+            /// the kernels skip the add. Resident, never streamed: the
+            /// whole set is n_expert * (2*mid + out) floats, a rounding
+            /// error next to one expert's quantized weights.
+            exp_bias: Option<[DeviceBuf; 3]>,
+            /// gpt-oss router bias [n_expert], added to the gate logits
+            /// before selection. Distinct from `probs_b`, which is the
+            /// DeepSeek-style correction that steers selection WITHOUT
+            /// entering the weights: this one is part of the linear layer,
+            /// so it moves the softmax too.
+            gate_inp_b: Option<DeviceBuf>,
         },
     }
 
@@ -619,8 +652,15 @@ mod real {
             /// None = k reused as v (gemma E-series attention_k_eq_v)
             attn_v: Option<DeviceBuf>,
             attn_k: DeviceBuf,
-            q_norm: DeviceBuf,
-            k_norm: DeviceBuf,
+            /// None = the arch has no qk-norm at all (gpt-oss uses q/k
+            /// biases instead). Distinct from passing a null weight to the
+            /// norm kernel, which still normalizes, just without a scale.
+            q_norm: Option<DeviceBuf>,
+            k_norm: Option<DeviceBuf>,
+            /// gpt-oss per-head attention sink [n_head]: a learned logit
+            /// that joins the softmax denominator and contributes no value,
+            /// letting a head attend to nothing. None everywhere else.
+            sinks: Option<DeviceBuf>,
         },
         Mla {
             q_a: DeviceBuf,
@@ -734,10 +774,20 @@ mod real {
         il < n_leading_dense as usize || (il >= 6 && (il - 6) % 4 == 0)
     }
 
+    /// gpt-oss attention biases, all f32. Every other arch here projects
+    /// without them and leaves this None.
+    struct AttnBias {
+        q: DeviceBuf,
+        k: DeviceBuf,
+        v: DeviceBuf,
+        out: DeviceBuf,
+    }
+
     struct LayerW {
         attn_norm: DeviceBuf,
         attn: Attn,
         attn_output: DeviceBuf,
+        attn_bias: Option<AttnBias>,
         ffn_norm: DeviceBuf,
         ffn: Ffn,
         gemma: Option<GemmaW>,
@@ -871,21 +921,41 @@ mod real {
         /// pure io_uring disk-fetch wait for cache misses (was hidden in host)
         pub resolve_fetch: std::time::Duration,
         pub h2d: std::time::Duration,
+        /// draining the disk prefetcher into the host store (absorb), and
+        /// how many slabs went through it - absorb evicts, and eviction
+        /// is the one O(cache) operation on the per-layer path
+        pub resolve_absorb: std::time::Duration,
+        pub absorbed: u64,
+        /// pointer/CSR build after the fetch, plus the blocking
+        /// expert_ptrs upload. That upload is ordered behind the async
+        /// expert H2D, so this bucket is dominated by PCIe drain, NOT by
+        /// the 8-entry pointer loop: measured 12.9s with experts on a
+        /// Gen4 x4 card (6.4 GB/s) vs 1.26s on Gen5 x8 (28.7 GB/s), same
+        /// work either side. A big number here means "wrong card owns the
+        /// experts", not "pointer building is slow".
+        pub resolve_ptrs: std::time::Duration,
         /// CPU expert lane wall time after the stage-A overlap (mid
         /// quantize + down-proj fan-out + join)
         pub cpu: std::time::Duration,
         pub tail: std::time::Duration,
         pub calls: u64,
+        /// Cross-layer prefetch accuracy: of the experts layer L+1 actually
+        /// routed to, how many did the prediction made at layer L name?
+        /// This gates the only overlap that is structurally possible - the
+        /// layers are serial, so the GPU can ONLY be busy during a disk
+        /// wait if the next layer's weights were already fetched.
+        pub pred_hits: u64,
+        pub pred_total: u64,
     }
 
     impl Prof {
         pub fn report(&self) -> String {
             let s = |d: std::time::Duration| d.as_secs_f64();
             let accounted = self.resolve_d2h + self.resolve_lists + self.resolve_host
-                + self.resolve_fetch + self.h2d;
+                + self.resolve_fetch + self.h2d + self.resolve_absorb + self.resolve_ptrs;
             let other = self.resolve.saturating_sub(accounted);
             format!(
-                "gpu-wait {:.2}s, resolve {:.2}s (d2h {:.2}s, lists {:.2}s, host {:.2}s, disk {:.2}s, h2d {:.2}s, other {:.2}s), cpu-lane {:.2}s, logits-tail {:.2}s over {} layer steps",
+                "gpu-wait {:.2}s, resolve {:.2}s (d2h {:.2}s, lists {:.2}s, host {:.2}s, disk {:.2}s, h2d {:.2}s, absorb {:.2}s/{} slabs, ptrs {:.2}s, other {:.2}s), cpu-lane {:.2}s, logits-tail {:.2}s over {} layer steps",
                 s(self.sync),
                 s(self.resolve),
                 s(self.resolve_d2h),
@@ -893,11 +963,23 @@ mod real {
                 s(self.resolve_host),
                 s(self.resolve_fetch),
                 s(self.h2d),
+                s(self.resolve_absorb),
+                self.absorbed,
+                s(self.resolve_ptrs),
                 s(other),
                 s(self.cpu),
                 s(self.tail),
                 self.calls
-            )
+            ) + &if self.pred_total > 0 {
+                format!(
+                    "\npulsar: cross-layer prefetch predicted {}/{} routed experts ({:.1}%)",
+                    self.pred_hits,
+                    self.pred_total,
+                    100.0 * self.pred_hits as f64 / self.pred_total as f64
+                )
+            } else {
+                String::new()
+            }
         }
     }
 
@@ -1034,9 +1116,40 @@ mod real {
             let (req_tx, req_rx) = std::sync::mpsc::channel::<Vec<stream::Read>>();
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
+                // Coalesce every pending request rather than keeping only
+                // the newest. Each send is a DIFFERENT layer's predicted
+                // experts, not a refresh of one list, so dropping a request
+                // skips that layer's prefetch entirely and its slabs come
+                // back as synchronous misses on the critical path.
+                // Coalescing also deepens the batch, which is what actually
+                // fills the drive: a ~7-read batch is latency-bound (~6GB/s
+                // measured in decode) while the same NVMe sustains 11GB/s
+                // once enough reads are in flight (fetch-bench, qd 8+).
+                // Sorted because ascending offsets read faster than the
+                // routing order, deduped because layers share slabs.
+                // Bounded: coalesce up to a cap, then DISCARD whatever is
+                // still queued. Prefetch is speculative, so a backlog is
+                // strictly harmful - stale requests keep the drive busy on
+                // layers the model has already passed while the current
+                // layer waits. Unbounded coalescing let a prefill flood
+                // queue ~177GiB of reads that drained through decode.
+                const COALESCE_MAX: usize = 192;
                 while let Ok(first) = req_rx.recv() {
-                    // stale requests are useless; keep only the newest
-                    let reads = req_rx.try_iter().last().unwrap_or(first);
+                    let mut reads = first;
+                    let mut dropped = false;
+                    for more in req_rx.try_iter() {
+                        if dropped || reads.len() >= COALESCE_MAX {
+                            dropped = true; // drain and drop the rest
+                            continue;
+                        }
+                        reads.extend(more);
+                    }
+                    // note: the FIRST request is never truncated - a real
+                    // 256-token chunk legitimately asks for a whole layer
+                    // (768 reads) and clipping that would gut the case this
+                    // path exists for. The cap only bounds COALESCING.
+                    reads.sort_unstable_by_key(|r| r.offset);
+                    reads.dedup_by_key(|r| r.offset);
                     let _ = fetcher.fetch_each(&reads, |i, slab| {
                         let _ = done_tx.send((reads[i].offset, slab));
                         Ok(())
@@ -2586,6 +2699,7 @@ mod real {
             let gemma_arch = gguf.architecture() == Some("gemma4");
             let ink_arch = gguf.architecture() == Some("inkling");
             let laguna_arch = gguf.architecture() == Some("laguna");
+            let oss_arch = gguf.architecture() == Some("gpt-oss");
             // per-layer attention geometry: gemma4 interleaves sliding-
             // window layers (own kv width, head_dim, theta) with full ones
             let geom: Vec<Geom> = if ink_arch {
@@ -2715,6 +2829,31 @@ mod real {
                             factors: false,
                             rot: if full { rot_full } else { rot_swa },
                         }
+                    })
+                    .collect()
+            } else if oss_arch {
+                // gpt-oss alternates sliding and full attention and ships no
+                // sliding_window_pattern array to say so; the reference
+                // pattern is sliding on even layers. Head geometry, rope and
+                // head_dim are uniform, so window is the only thing that
+                // varies per layer.
+                let window = gguf
+                    .arch_meta("attention.sliding_window")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32)
+                    .unwrap_or(128);
+                (0..shape.n_exec_layer as usize)
+                    .map(|il| Geom {
+                        n_head_q: shape.n_head,
+                        n_head_kv: shape.n_head_kv,
+                        head_dim: shape.head_dim,
+                        theta: shape.rope_freq_base,
+                        window: if il % 2 == 0 { window } else { 0 },
+                        factors: false,
+                        // non-zero routes rope through the yarn path, which
+                        // is what gpt-oss needs: uniform scaling with the
+                        // kernel's mscale. Zero here silently drops YaRN.
+                        rot: shape.head_dim,
                     })
                     .collect()
             } else {
@@ -2897,6 +3036,23 @@ mod real {
                         } else {
                             None
                         },
+                        // f32 and small enough to stay resident; presence is
+                        // decided by the file, so an arch that grows biases
+                        // later needs no code here
+                        gate_inp_b: if gguf.tensor(&t("ffn_gate_inp.bias")).is_some() {
+                            Some(upload(&file, &gguf, &t("ffn_gate_inp.bias"))?)
+                        } else {
+                            None
+                        },
+                        exp_bias: if gguf.tensor(&t("ffn_gate_exps.bias")).is_some() {
+                            Some([
+                                upload(&file, &gguf, &t("ffn_gate_exps.bias"))?,
+                                upload(&file, &gguf, &t("ffn_up_exps.bias"))?,
+                                upload(&file, &gguf, &t("ffn_down_exps.bias"))?,
+                            ])
+                        } else {
+                            None
+                        },
                     }
                 };
                 if let Some(d) = attn_dev {
@@ -2911,8 +3067,21 @@ mod real {
                         } else {
                             None // gemma attention_k_eq_v: k doubles as v
                         },
-                        q_norm: upload(&file, &gguf, &t("attn_q_norm.weight"))?,
-                        k_norm: upload(&file, &gguf, &t("attn_k_norm.weight"))?,
+                        q_norm: if gguf.tensor(&t("attn_q_norm.weight")).is_some() {
+                            Some(upload(&file, &gguf, &t("attn_q_norm.weight"))?)
+                        } else {
+                            None
+                        },
+                        k_norm: if gguf.tensor(&t("attn_k_norm.weight")).is_some() {
+                            Some(upload(&file, &gguf, &t("attn_k_norm.weight"))?)
+                        } else {
+                            None
+                        },
+                        sinks: if gguf.tensor(&t("attn_sinks.weight")).is_some() {
+                            Some(upload(&file, &gguf, &t("attn_sinks.weight"))?)
+                        } else {
+                            None
+                        },
                     },
                     Family::Mla => Attn::Mla {
                         q_a: upload_attn(&file, &gguf, &t("attn_q_a.weight"), &mut *no_budget)?,
@@ -3155,6 +3324,18 @@ mod real {
                     attn_norm: upload(&file, &gguf, &t("attn_norm.weight"))?,
                     attn,
                     attn_output,
+                    // presence decided by the file, so an arch that grows
+                    // attention biases later needs no code here
+                    attn_bias: if gguf.tensor(&t("attn_q.bias")).is_some() {
+                        Some(AttnBias {
+                            q: upload(&file, &gguf, &t("attn_q.bias"))?,
+                            k: upload(&file, &gguf, &t("attn_k.bias"))?,
+                            v: upload(&file, &gguf, &t("attn_v.bias"))?,
+                            out: upload(&file, &gguf, &t("attn_output.bias"))?,
+                        })
+                    } else {
+                        None
+                    },
                     // qwen35 calls the pre-FFN norm post_attention_norm
                     ffn_norm: if gguf.tensor(&t("ffn_norm.weight")).is_some() {
                         upload(&file, &gguf, &t("ffn_norm.weight"))?
@@ -3372,6 +3553,18 @@ mod real {
         if std::env::var("PULSAR_TIERS").ok().as_deref() == Some("off") {
             return Ok(Vec::new());
         }
+        // Expert biases live on the primary, and a tier kernel runs on
+        // another device where that pointer is not dereferenceable, so a
+        // tier would fault the moment it read one. Replicating the bias
+        // buffers per tier device is the real fix (they are ~1MB); until
+        // then, decline the tier rather than fault.
+        if m.layers.iter().any(|l| matches!(&l.ffn, Ffn::Moe { exp_bias: Some(_), .. })) {
+            eprintln!(
+                "pulsar: expert tiers disabled - this model carries per-expert biases, \
+                 which are resident on the primary only"
+            );
+            return Ok(Vec::new());
+        }
 
         // dedicated cards first; the attn card joins LAST with whatever
         // VRAM the resident attn stack left over (the free-space check
@@ -3462,12 +3655,15 @@ mod real {
                 map: std::collections::HashMap::new(),
                 xin: DeviceBuf::alloc(mb as usize * s.n_embd as usize * 4)?,
                 xq: DeviceBuf::alloc(
-                    mb as usize * s.n_embd as usize / kernels::Q8_K_BLOCK_ELEMS
+                    mb as usize
+                        * (s.n_embd as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS)
                         * kernels::Q8_K_BLOCK_BYTES,
                 )?,
                 mid: DeviceBuf::alloc(mb as usize * n_used * s.n_ff_exp as usize * 4)?,
                 midq: DeviceBuf::alloc(
-                    mb as usize * n_used * s.n_ff_exp as usize / kernels::Q8_K_BLOCK_ELEMS
+                    mb as usize
+                        * n_used
+                        * (s.n_ff_exp as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS)
                         * kernels::Q8_K_BLOCK_BYTES,
                 )?,
                 out: DeviceBuf::alloc(mb as usize * s.n_embd as usize * 4)?,
@@ -3589,6 +3785,10 @@ mod real {
         logits: DeviceBuf,
         pub store: StreamingStore,
         prefetcher: Prefetcher,
+        /// Last cross-layer prediction and the layer it was made for, so the
+        /// next layer can score it (PULSAR_PROFILE only).
+        pred_prev: Vec<i32>,
+        pred_prev_for: usize,
         pred_logits: DeviceBuf,
         pred_selected: DeviceBuf,
         pred_weights: DeviceBuf,
@@ -4610,11 +4810,14 @@ mod real {
                 moe_mid: f32s(mb * s.n_expert_used * s.n_ff_exp)?,
                 moe_out: f32s(mb * s.n_embd)?,
                 xq: DeviceBuf::alloc(
-                    mb as usize * s.n_embd as usize / kernels::Q8_K_BLOCK_ELEMS
+                    mb as usize
+                        * (s.n_embd as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS)
                         * kernels::Q8_K_BLOCK_BYTES,
                 )?,
                 midq: DeviceBuf::alloc(
-                    mb as usize * n_used * s.n_ff_exp as usize / kernels::Q8_K_BLOCK_ELEMS
+                    mb as usize
+                        * n_used
+                        * (s.n_ff_exp as usize).div_ceil(kernels::Q8_K_BLOCK_ELEMS)
                         * kernels::Q8_K_BLOCK_BYTES,
                 )?,
                 // placeholders: the capacity solver below sizes both from
@@ -4670,9 +4873,29 @@ mod real {
                 attn_out_a,
                 attn_gate_buf,
                 tier_ret: if tiers.is_empty() { f32s(1)? } else { f32s(mb * s.n_embd)? },
-                cpu_pool: cpu_tier::Pool::from_env(),
+                // The CPU lane dots quantized weights directly and has no
+                // bias term, so on an arch that carries expert biases it
+                // would silently drop them for whatever it steals. Refuse
+                // the lane rather than be quietly wrong.
+                cpu_pool: {
+                    let has_bias = m.layers.iter().any(|l| {
+                        matches!(&l.ffn, Ffn::Moe { exp_bias: Some(_), .. })
+                    });
+                    match (cpu_tier::Pool::from_env(), has_bias) {
+                        (Some(_), true) => {
+                            eprintln!(
+                                "pulsar: CPU expert lane disabled - this model carries per-expert \
+                                 biases and the lane has no bias path"
+                            );
+                            None
+                        }
+                        (p, _) => p,
+                    }
+                },
                 cpu_ret: f32s(1)?, // grows on first CPU-lane hit
                 cpu_hits: 0,
+                pred_prev: Vec::new(),
+                pred_prev_for: usize::MAX,
                 route_counts: vec![0u64; (m.shape.n_layer * m.shape.n_expert.max(1)) as usize],
                 tiers,
                 grp_ptrs: DeviceBuf::alloc(s.n_expert.max(1) as usize * std::mem::size_of::<ExpertPtrs>())?,
@@ -5067,7 +5290,7 @@ mod real {
                     Attn::Dsv4(_) | Attn::Qwen35(_) => {
                         return Err("hybrid-family layer in the shared eval path".into())
                     }
-                    Attn::Gqa { attn_q, attn_k, attn_v, q_norm, k_norm } => {
+                    Attn::Gqa { attn_q, attn_k, attn_v, q_norm, k_norm, sinks } => {
                         let (hkv, hd, theta, window) = match gm {
                             Some(g) => (g.n_head_kv, g.head_dim, g.theta, g.window),
                             None => (s.n_head_kv, s.head_dim, s.rope_freq_base, 0),
@@ -5086,8 +5309,17 @@ mod real {
                         let xin = if self.attn_dev.is_some() { &st.normed_a } else { &st.normed };
                         kernels::matmul_q8_0(&mut st.q, attn_q, xin, s.n_embd, nh_q * hd, n_tok)?;
                         kernels::matmul_q8_0(&mut st.k, attn_k, xin, s.n_embd, hkv * hd, n_tok)?;
+                        if let Some(ab) = &l.attn_bias {
+                            kernels::add_bias_rows(&mut st.q, &ab.q, nh_q * hd, n_tok)?;
+                            kernels::add_bias_rows(&mut st.k, &ab.k, hkv * hd, n_tok)?;
+                        }
                         match attn_v {
-                            Some(v_w) => kernels::matmul_q8_0(&mut st.v, v_w, xin, s.n_embd, hkv * hd, n_tok)?,
+                            Some(v_w) => {
+                                kernels::matmul_q8_0(&mut st.v, v_w, xin, s.n_embd, hkv * hd, n_tok)?;
+                                if let Some(ab) = &l.attn_bias {
+                                    kernels::add_bias_rows(&mut st.v, &ab.v, hkv * hd, n_tok)?;
+                                }
+                            }
                             // attention_k_eq_v: v = the raw k projection
                             None => kernels::copy_across(&mut st.v, &st.k, (n_tok * hkv * hd) as usize * 4)?,
                         }
@@ -5101,12 +5333,20 @@ mod real {
                             kernels::sconv(&mut st.sconv_tmp_kv, &st.v, &ink.sconv_v, &mut st.sconv_state[il][1], n_tok, hkv * hd, s.sconv_k)?;
                             kernels::copy_across(&mut st.v, &st.sconv_tmp_kv, kvb)?;
                         }
-                        kernels::gqa_head_rms_norm(&mut st.q, Some(q_norm), n_tok * nh_q, hd, eps)?;
-                        kernels::gqa_head_rms_norm(&mut st.k, Some(k_norm), n_tok * hkv, hd, eps)?;
-                        if gm.is_some() && l.ink.is_none() && l.attn_gate.is_none() {
+                        // absent qk-norm means no normalization at all, not
+                        // a weightless one - skip rather than pass None
+                        if let Some(qn) = q_norm {
+                            kernels::gqa_head_rms_norm(&mut st.q, Some(qn), n_tok * nh_q, hd, eps)?;
+                        }
+                        if let Some(kn) = k_norm {
+                            kernels::gqa_head_rms_norm(&mut st.k, Some(kn), n_tok * hkv, hd, eps)?;
+                        }
+                        if gm.is_some() && l.ink.is_none() && l.attn_gate.is_none() && q_norm.is_some() {
                             // gemma: v gets a weightless per-head rms norm.
                             // laguna also has per-layer geom but does NOT
-                            // do this (attn_gate marks it).
+                            // do this (attn_gate marks it), and neither does
+                            // gpt-oss (no qk-norm marks it - same
+                            // discriminator as the attention scale above).
                             kernels::gqa_head_rms_norm(&mut st.v, None, n_tok * hkv, hd, eps)?;
                         }
                         if let Some(rot_w) = gm.map(|g| g.rot).filter(|&r| r != 0) {
@@ -5119,14 +5359,18 @@ mod real {
                             // dims stay unit-scaled. SLIDING layers run
                             // PLAIN rope (theta 10k, rot 128): freq_scale
                             // 1.0 and ext_factor 0, NOT the global yarn.
-                            let yarn = window == 0 && s.rope_scale_factor > 1.0;
+                            // gpt-oss scales every layer and keeps the
+                            // kernel's mscale; laguna scales only the
+                            // full-window ones and cancels it
+                            let uni = s.rope_yarn_uniform;
+                            let yarn = (uni || window == 0) && s.rope_scale_factor > 1.0;
                             let f = s.rope_scale_factor;
                             let rc = kernels::RopeCfg {
                                 n_ctx_orig: s.rope_orig_ctx,
                                 freq_base: theta,
                                 freq_scale: if yarn { 1.0 / f } else { 1.0 },
                                 ext_factor: if yarn { 1.0 } else { 0.0 },
-                                attn_factor: if yarn { 1.0 / (1.0 + 0.1 * f.ln()) } else { 1.0 },
+                                attn_factor: if yarn && !uni { 1.0 / (1.0 + 0.1 * f.ln()) } else { 1.0 },
                                 beta_fast: 32.0,
                                 beta_slow: 1.0,
                                 kq_mult: 1.0,
@@ -5163,7 +5407,12 @@ mod real {
                         // inkling at muP 1/head_dim
                         let scale = if l.ink.is_some() {
                             1.0 / hd as f32
-                        } else if gm.is_some() && l.attn_gate.is_none() {
+                        } else if gm.is_some() && l.attn_gate.is_none() && q_norm.is_some() {
+                            // gemma only, and the reason is the qk-norm: q is
+                            // already per-head normalized, so the scores need
+                            // no 1/sqrt(head_dim). Keyed on that norm rather
+                            // than on "has per-layer geometry", which gpt-oss
+                            // also has while needing the ordinary scale.
                             1.0
                         } else {
                             // laguna: head_dim**-0.5 despite QK-norm
@@ -5199,7 +5448,7 @@ mod real {
                         } else {
                             &st.q
                         };
-                        kernels::gqa_attention_rel(&mut st.heads, qsrc, &st.kcache[il], &st.vcache[il], n_tok, nh_q, hkv, hd, st.ctx, pos0, scale, window, rel, rel_ext, kvq)?;
+                        kernels::gqa_attention_rel(&mut st.heads, qsrc, &st.kcache[il], &st.vcache[il], n_tok, nh_q, hkv, hd, st.ctx, pos0, scale, window, rel, rel_ext, kvq, sinks.as_ref())?;
 
                         // laguna: per-head output gate. g_proj gives one
                         // logit per (token, head); softplus of it scales
@@ -5339,6 +5588,9 @@ mod real {
                 }
                 if self.attn_dev.is_none() {
                     kernels::matmul_q8_0(&mut st.attn_out, attn_output_w, &st.heads, heads_dim, s.n_embd, n_tok)?;
+                    if let Some(ab) = &l.attn_bias {
+                        kernels::add_bias_rows(&mut st.attn_out, &ab.out, s.n_embd, n_tok)?;
+                    }
                 }
                 if let Some(gw) = &l.gemma {
                     // gemma post-attention norm sits INSIDE the residual
@@ -5390,7 +5642,7 @@ mod real {
                         }
                         kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, n_tok * s.n_embd)?;
                     }
-                    Ffn::Moe { gate_inp, probs_b, shexp, gate_exps, up_exps, down_exps, fused_up_off, down_scale, sink } => {
+                    Ffn::Moe { gate_inp, probs_b, shexp, gate_exps, up_exps, down_exps, fused_up_off, down_scale, sink, exp_bias, gate_inp_b } => {
                         let gw = l.gemma.as_ref();
                         // inkling: shared experts ride the router as
                         // always-on slots; per-layer gscale folds into the
@@ -5411,6 +5663,11 @@ mod real {
                             // after the n_expert routed ones
                             kernels::matmul_f32(&mut st.router_logits, gate_inp, &st.normed, s.n_embd, s.n_expert + sink_n, n_tok)?;
                         }
+                        // part of the gate's linear layer, so it lands on
+                        // the logits before both the top-k and the softmax
+                        if let Some(gb) = gate_inp_b {
+                            kernels::add_bias_rows(&mut st.router_logits, gb, s.n_expert, n_tok)?;
+                        }
                         kernels::router_select(
                             &mut st.router_selected,
                             &mut st.router_weights,
@@ -5423,6 +5680,21 @@ mod real {
                             if sink_n > 0 { 2 } else { s.router_softmax as u32 },
                             sink_n,
                         )?;
+                        if std::env::var_os("PULSAR_ROUTER_HIST").is_some() && n_tok == 1 {
+                            // Per-token gate weights by rank. The tail of
+                            // this distribution is what a top-p router
+                            // prune would drop, and its mass bounds the
+                            // error that dropping costs - so measure it
+                            // before believing any estimate.
+                            kernels::sync()?;
+                            let w = st.router_weights.read_f32(s.n_expert_used as usize)?;
+                            let sum: f32 = w.iter().sum::<f32>().max(1e-9);
+                            let mut line = String::new();
+                            for v in &w {
+                                line.push_str(&format!("{:.5} ", v / sum));
+                            }
+                            eprintln!("rw L{il} {line}");
+                        }
                         if let Some(ds) = down_scale {
                             // per-expert down scale folds into the route
                             // weight (the down projection is linear)
@@ -5510,6 +5782,32 @@ mod real {
                             None
                         };
                         st.prof.resolve_d2h += t_d2h.elapsed();
+                        // Score the prediction the PREVIOUS layer made for this
+                        // one. Layers are serial, so prefetch is the only way
+                        // the GPU can be busy during a disk wait; this ratio is
+                        // the ceiling on how much of that wait can ever be
+                        // hidden. Cheap set test - n_expert_used is 8.
+                        if n_tok == 1 && std::env::var_os("PULSAR_PROFILE").is_some() {
+                            if st.pred_prev_for == il && !st.pred_prev.is_empty() {
+                                for &e in &selected {
+                                    if e < 0 || e as u32 >= s.n_expert {
+                                        continue;
+                                    }
+                                    st.prof.pred_total += 1;
+                                    if st.pred_prev.contains(&e) {
+                                        st.prof.pred_hits += 1;
+                                    }
+                                }
+                            }
+                            match &pred_ids {
+                                Some(p) => {
+                                    st.pred_prev.clear();
+                                    st.pred_prev.extend_from_slice(p);
+                                    st.pred_prev_for = il + 1;
+                                }
+                                None => st.pred_prev_for = usize::MAX,
+                            }
+                        }
                         // true routing count: every selection this layer, resident
                         // or streamed (topic atlas / Brain heat, no tier blind spot)
                         {
@@ -5548,7 +5846,24 @@ mod real {
                         // full-layer load, via the host-cache channel).
                         // real prefill chunks only: a 2-row spec-verify
                         // batch must not ship whole layers to the fetcher
-                        if n_tok > 8 && std::env::var_os("PULSAR_NO_PREFETCH").is_none() {
+                        // Only when the chunk really does touch most of the
+                        // layer. t tokens picking top-k of E experts reach
+                        // E*(1-(1-k/E)^t) distinct ones: a 256-token chunk
+                        // gets ~100% and this is the right call, but a
+                        // 12-token prompt gets ~32% and it requests 2.36GiB
+                        // per layer to use a third of it. Ungated (n_tok > 8)
+                        // that was 177GiB of speculative reads across 75
+                        // layers into a ~20GB cache - it saturated the drive,
+                        // thrashed the cache, and the backlog drained into
+                        // decode starving the reads actually being waited on.
+                        // Measured on GLM-5.2: 1.43 tok/s with the flood vs
+                        // 2.63 with prefetch off entirely.
+                        let chunk_covers = {
+                            let p_miss =
+                                1.0 - (s.n_expert_used as f64 / s.n_expert.max(1) as f64);
+                            1.0 - p_miss.powi(n_tok as i32) >= 0.75
+                        };
+                        if chunk_covers && std::env::var_os("PULSAR_NO_PREFETCH").is_none() {
                             if let Some(Ffn::Moe {
                                 gate_exps: ng, up_exps: nu, down_exps: nd, ..
                             }) = self.layers.get(il + 1).map(|nl| &nl.ffn)
@@ -5598,9 +5913,12 @@ mod real {
                             }
                         }
                         // absorb whatever the disk prefetcher finished
+                        let t_absorb = std::time::Instant::now();
                         while let Ok((off, slab)) = st.prefetcher.done_rx.try_recv() {
                             st.store.absorb(off, slab);
+                            st.prof.absorbed += 1;
                         }
+                        st.prof.resolve_absorb += t_absorb.elapsed();
                         let t_lists = std::time::Instant::now();
                         // gate/up/down may use different quants (K-quant
                         // recipes put ffn_down a tier higher); staging
@@ -5625,6 +5943,28 @@ mod real {
                             }
                         };
                         let off_of = |t: &ExpertTensor, le: u64| t.abs_offset + le * t.expert_bytes;
+                        // Per-expert bias pointers. Biases are resident f32
+                        // and indexed by expert id, so unlike the weight
+                        // slabs they need no cache/tier resolve; sink slots
+                        // (id >= n_expert) have no bias tensor and stay null.
+                        let bias_of = |e: i32| -> (
+                            *const std::ffi::c_void,
+                            *const std::ffi::c_void,
+                            *const std::ffi::c_void,
+                        ) {
+                            match exp_bias {
+                                Some([gb, ub, db]) if e >= 0 && (e as u32) < s.n_expert => {
+                                    let mid = (e as u64) * s.n_ff_exp as u64 * 4;
+                                    let out = (e as u64) * s.n_embd as u64 * 4;
+                                    (
+                                        byte_off(gb.ptr(), mid),
+                                        byte_off(ub.ptr(), mid),
+                                        byte_off(db.ptr(), out),
+                                    )
+                                }
+                                _ => (std::ptr::null(), std::ptr::null(), std::ptr::null()),
+                            }
+                        };
                         // resolve tier placement once per distinct expert
                         // (was recomputed in cpu/offsets/ptrs loops)
                         let mut tier_place: std::collections::HashMap<
@@ -5651,6 +5991,9 @@ mod real {
                                             if is_sink { 0 } else { *fused_up_off },
                                         ),
                                         down: *t.map.get(&off_of(d3.0, d3.1))?,
+                                        gate_b: bias_of(e).0,
+                                        up_b: bias_of(e).1,
+                                        down_b: bias_of(e).2,
                                     },
                                     is_sink,
                                 ))
@@ -5743,6 +6086,68 @@ mod real {
                             }
                             st.store.pinned = pins;
                         }
+                        // ---- lane B: experts the DISK is about to deliver ----
+                        // Lane A above can only claim experts already in RAM,
+                        // so a disk-missed expert takes the most expensive
+                        // route in the engine: disk -> RAM -> PCIe -> GPU.
+                        // The bytes land in host memory anyway, so compute
+                        // them where they land and skip the bus entirely.
+                        // Unlike lane A this does NOT overlap the fetch (it
+                        // runs after), so it only pays while the CPU finishes
+                        // its share before the GPU finishes its own - hence
+                        // the cap. DEFAULT OFF: the mechanism is confirmed
+                        // (ptrs, the PCIe-drain bucket, falls 4.31 -> 3.05s on
+                        // a Gen4 x4 card) but the throughput gain is inside
+                        // the noise - slow card B=0 2.16/2.13/2.18 vs B=2
+                        // 2.29/2.14, and dead neutral on Gen5 x8 (2.90 vs
+                        // 2.91) where there is barely any PCIe cost to remove.
+                        // Worth having on a box whose experts sit on a slow
+                        // link; not worth changing the default path for.
+                        // PULSAR_CPU_B=N enables, bounding experts per layer.
+                        let lane_b_cap: usize = std::env::var("PULSAR_CPU_B")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(0);
+                        let mut lane_b = cpu_tier::Lane::new(
+                            gate_exps.quant, down_exps.quant,
+                            gate_exps.row_bytes as usize, down_exps.row_bytes as usize,
+                            ne, nf, s.moe_act_op,
+                        );
+                        // planned membership only - Lane::add needs the host
+                        // pointers, which do not exist until the fetch lands
+                        let mut lane_b_plan: Vec<i32> = Vec::new();
+                        let mut lane_b_offs: std::collections::HashMap<u64, i32> =
+                            std::collections::HashMap::new();
+                        if cpu_on && lane_b_cap > 0 {
+                            for &e in &distinct {
+                                if e < 0 || e as u32 >= s.n_expert || tier_of(e).is_some() {
+                                    continue;
+                                }
+                                if lane.idx.contains_key(&e) || lane_b_plan.len() >= lane_b_cap {
+                                    continue;
+                                }
+                                let [g3, u3, d3] = slabs_of(e as u32);
+                                let (go, uo, dno) =
+                                    (off_of(g3.0, g3.1), off_of(u3.0, u3.1), off_of(d3.0, d3.1));
+                                if self.mtp.as_ref().is_some_and(|mt| mt.res_map.contains_key(&go)) {
+                                    continue;
+                                }
+                                // only when ALL THREE need the disk: a mixed
+                                // expert would still pay a PCIe trip for its
+                                // resident slabs and gain nothing
+                                if st.store.contains(go) || st.store.contains(uo) || st.store.contains(dno)
+                                    || st.dev_cache.map.contains_key(&go)
+                                    || st.dev_cache.map.contains_key(&uo)
+                                    || st.dev_cache.map.contains_key(&dno)
+                                {
+                                    continue;
+                                }
+                                lane_b_plan.push(e);
+                                for o in [go, uo, dno] {
+                                    lane_b_offs.insert(o, e);
+                                }
+                            }
+                        }
                         if !lane.is_empty() {
                             let t_cpu_d2h = std::time::Instant::now();
                             let rw = st.router_weights.read_f32(n_tok as usize * n_used)?;
@@ -5820,11 +6225,51 @@ mod real {
                         if stage_total + SLAB_SLACK > st.staging.bytes() {
                             st.staging = DeviceBuf::alloc(stage_total + SLAB_SLACK)?;
                         }
+                        let mut host_ptr: std::collections::HashMap<u64, *const u8> =
+                            std::collections::HashMap::new();
                         let unified = st.unified;
                         let async_h2d = st.async_expert_h2d;
                         let mut h2d = std::time::Duration::ZERO;
                         let mut fetch_wait = std::time::Duration::ZERO;
                         let mut async_queued = false;
+                        // TRIED AND REVERTED (2026-07-25): splitting this into
+                        // two waves - launch the experts the host store already
+                        // holds, THEN block on the disk for the rest - so the
+                        // primary GPU computes through the disk wait. It is a
+                        // regression: 2.52/2.53/2.51 tok/s against 2.85/2.54/
+                        // 2.83 interleaved on GLM-5.2.
+                        //
+                        // The first explanation here (full-width kernels: NULL-
+                        // masked launches plus an unconditional quantize_q8_k
+                        // over n_ff_exp * n_expert_used) was WRONG. Measured by
+                        // adding exactly that overhead to this path with none of
+                        // the benefit - an extra expert_ptrs upload, then that
+                        // plus the whole three-kernel chain over an all-NULL
+                        // slot array:
+                        //     baseline   2.55  2.56
+                        //     +ptrs      2.63  2.77
+                        //     +full      2.75  2.48
+                        // Both variants land at or above baseline, so the extra
+                        // launches and the extra upload cost nothing findable.
+                        // Making the launches slot-sparse would optimise work
+                        // that is not on the clock.
+                        //
+                        // What the probe did NOT replicate is the one real
+                        // difference: the split calls ensure_with TWICE, and the
+                        // disk batch goes SECOND. Single-wave issues every read,
+                        // disk included, in one call, so io_uring starts filling
+                        // immediately; the split makes the disk reads wait for
+                        // the host-hit batch to finish staging first. Disk is
+                        // ~86% of this model's decode wall, so delaying its
+                        // start lands straight on the critical path - the split
+                        // postponed the bottleneck to overlap something cheaper.
+                        // A retry must issue the cold reads FIRST (the async
+                        // prefetcher already does non-blocking fetch), compute
+                        // the resident experts while they fly, then collect.
+                        // Launching the TIER partials before this wait is also
+                        // neutral (2.84/2.82) - they already overlapped the
+                        // primary MoE, so it just moves them under a different
+                        // shadow.
                         let t_host = std::time::Instant::now();
                         {
                             let dev_cache = &mut st.dev_cache;
@@ -5836,6 +6281,15 @@ mod real {
                                         off,
                                         payload.as_ptr() as *const std::ffi::c_void,
                                     );
+                                    return Ok(());
+                                }
+                                // lane B computes this on the CPU from the
+                                // slab that just landed - keep the host
+                                // pointer and skip the PCIe trip entirely.
+                                // The whole point of the extension: these
+                                // bytes never cross the bus.
+                                if lane_b_offs.contains_key(&off) {
+                                    host_ptr.insert(off, payload.as_ptr());
                                     return Ok(());
                                 }
                                 let t = std::time::Instant::now();
@@ -5875,7 +6329,39 @@ mod real {
                             st.expert_h2d.wait_default()?;
                             h2d += t.elapsed();
                         }
+                        // ---- submit lane B now its slabs are in RAM ----
+                        let mut cpu_guard_b: Option<cpu_tier::WaitGuard> = None;
+                        if !lane_b_plan.is_empty() {
+                            let mut pins = std::mem::take(&mut st.store.pinned);
+                            for &e in &lane_b_plan {
+                                let [g3, u3, d3] = slabs_of(e as u32);
+                                let (go, uo, dno) =
+                                    (off_of(g3.0, g3.1), off_of(u3.0, u3.1), off_of(d3.0, d3.1));
+                                let (Some(&gp), Some(&up), Some(&dp)) =
+                                    (host_ptr.get(&go), host_ptr.get(&uo), host_ptr.get(&dno))
+                                else {
+                                    continue; // slab came from somewhere else; leave it to the GPU
+                                };
+                                lane_b.add(e, gp, unsafe { up.add(*fused_up_off as usize) }, dp);
+                                // EXTEND, never replace: lane A's pins are
+                                // still live and its workers are still reading
+                                pins.extend([go, uo, dno]);
+                            }
+                            st.store.pinned = pins;
+                            if !lane_b.is_empty() {
+                                let rw = st.router_weights.read_f32(n_tok as usize * n_used)?;
+                                let normed_h = st.normed.read_f32(n_tok as usize * ne)?;
+                                let pool = st.cpu_pool.as_ref().unwrap();
+                                cpu_guard_b = Some(cpu_tier::WaitGuard {
+                                    pool,
+                                    n: lane_b.submit_a(
+                                        pool, &selected, n_used, &normed_h, &rw, n_tok as usize,
+                                    ),
+                                });
+                            }
+                        }
                         st.prof.h2d += h2d;
+                        let t_ptrs = std::time::Instant::now();
                         // sink slabs join the routed launch only when the
                         // bank shares quant AND row width; otherwise they
                         // run as a second NULL-masked launch below
@@ -5916,6 +6402,9 @@ mod real {
                                         gate: resolved[&off_of(g3.0, g3.1)],
                                         up: byte_off(resolved[&off_of(u3.0, u3.1)], *fused_up_off),
                                         down: resolved[&off_of(d3.0, d3.1)],
+                                        gate_b: bias_of(e).0,
+                                        up_b: bias_of(e).1,
+                                        down_b: bias_of(e).2,
                                     }
                                 } else {
                                     ExpertPtrs::NULL
@@ -5936,7 +6425,7 @@ mod real {
                                 }
                                 continue;
                             }
-                            if lane.idx.contains_key(&e) {
+                            if lane.idx.contains_key(&e) || lane_b.idx.contains_key(&e) {
                                 ptrs.push(ExpertPtrs::NULL);
                                 continue;
                             }
@@ -5950,6 +6439,9 @@ mod real {
                                     if e as u32 >= s.n_expert { 0 } else { *fused_up_off },
                                 ),
                                 down: resolved[&off_of(d3.0, d3.1)],
+                                gate_b: bias_of(e).0,
+                                up_b: bias_of(e).1,
+                                down_b: bias_of(e).2,
                             };
                             if !sink_same && e as u32 >= s.n_expert {
                                 sink_ptrs[si] = ep;
@@ -6007,6 +6499,7 @@ mod real {
                                 }
                             }
                         }
+                        st.prof.resolve_ptrs += t_ptrs.elapsed();
                         st.prof.resolve += t_resolve.elapsed();
                         st.prof.calls += 1;
 
@@ -6040,6 +6533,12 @@ mod real {
                                     &mut tier.out, &tier.ptrs, &tier.midq,
                                     s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
                                 )?;
+                                if exp_bias.is_some() {
+                                    kernels::moe_down_bias(
+                                        &mut tier.out, &tier.ptrs, &tier.weights,
+                                        s.n_embd, s.n_expert_used, n_tok,
+                                    )?;
+                                }
                             }
                             if sink_hits > 0 {
                                 // sink pass: same mid/midq scratch, stream-
@@ -6104,6 +6603,18 @@ mod real {
                             kernels::moe_down(
                                 &mut st.moe_out, &st.expert_ptrs, &st.midq,
                                 s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
+                            )?;
+                        }
+                        // The down bias is sum_s w_s * b_down_s, and the pair
+                        // stage already folded w_s into mid, so it needs the
+                        // weights again and cannot ride the down matmul. Both
+                        // branches above land in moe_out through expert_ptrs,
+                        // whose tier/lane/sink slots are NULL - those paths
+                        // add their own bias against their own ptrs.
+                        if exp_bias.is_some() {
+                            kernels::moe_down_bias(
+                                &mut st.moe_out, &st.expert_ptrs, &st.router_weights,
+                                s.n_embd, s.n_expert_used, n_tok,
                             )?;
                         }
 
@@ -6240,11 +6751,25 @@ mod real {
                         // and the GPU launches above; the down-proj fan-out
                         // runs here while those kernels are in flight, then
                         // one f32 upload joins moe_out on the primary.
-                        if !lane.is_empty() {
+                        if !lane.is_empty() || !lane_b.is_empty() {
                             drop(cpu_guard.take());
+                            drop(cpu_guard_b.take());
                             let t_cpu = std::time::Instant::now();
                             let pool = st.cpu_pool.as_ref().unwrap();
-                            let acc = lane.finish(pool, n_tok as usize);
+                            let mut acc = lane.finish(pool, n_tok as usize);
+                            // fold lane B's partial into the same vector: both
+                            // are sums over disjoint routed slots, so adding
+                            // them is the same reduction the GPU would do
+                            if !lane_b.is_empty() {
+                                let b = lane_b.finish(pool, n_tok as usize);
+                                if acc.is_empty() {
+                                    acc = b;
+                                } else {
+                                    for (a, v) in acc.iter_mut().zip(b.iter()) {
+                                        *a += *v;
+                                    }
+                                }
+                            }
                             if let Some(gpu) = &verify_gpu {
                                 let mut dmax = 0f32;
                                 let mut gmax = 0f32;
@@ -6267,7 +6792,7 @@ mod real {
                                 );
                             }
                             st.store.pinned.clear();
-                            st.cpu_hits += lane.idx.len() as u64;
+                            st.cpu_hits += (lane.idx.len() + lane_b.idx.len()) as u64;
                             st.prof.cpu += t_cpu.elapsed();
                             if st.cpu_ret.bytes() < acc.len() * 4 {
                                 st.cpu_ret = DeviceBuf::alloc(acc.len() * 4)?;

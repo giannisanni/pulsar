@@ -13,7 +13,7 @@ a neutron star that spins fast and emits beams.
 
 ## What it does today
 
-Ten model architectures running on consumer GPUs: **Hy3 295B**
+Eleven model architectures running on consumer GPUs: **Hy3 295B**
 (hy-v3, GQA), **GLM-5.2 743B** (glm-dsa, MLA + DSA sparse attention),
 **Kimi K2.7 1T** (deepseek2, MLA + YaRN), **MiniMax M3** (partial
 rotary, swiglu_oai), **Gemma 4 26B-A4B** (interleaved sliding-window
@@ -32,6 +32,9 @@ needle recall verified at 45k tokens with 19.6 tok/s decode at that
 depth; prefer K-quants for it: the Q4_K_XL decodes at 51.8 tok/s where
 the smaller Q3_K_XL manages 36, because iq3's codebook lookups are
 decode compute the simple K-quant shifts don't pay), and
+**gpt-oss 20B** (gpt-oss: per-head attention sinks in the softmax
+denominator, alternating sliding/full attention, biases on both the
+attention projections and every expert, MXFP4 routed experts), and
 **Laguna-S-2.1 118B** (laguna: hybrid attention with a full-window
 layer every fourth and sliding-window 512 elsewhere, a per-head output
 gate, and per-layer-type RoPE — YaRN on the full-window layers, plain
@@ -43,6 +46,7 @@ Gen5 NVMe.
 | Model | Total | Active / token | gguf | Decode, warm | vs ds4, same box |
 |---|---|---|---|---|---|
 | Gemma 4 26B-A4B | 26B | 4B | 16GB (Q4_K_XL) | **41 tok/s** | – |
+| gpt-oss 20B | 20B | 3.6B (top-4 of 32) | 12GB (Q8_0 attn + MXFP4 experts) | **21.2 tok/s** | – |
 | Qwen3.6-35B-A3B | 35B | 3B (top-8 of 256 + shared) | 22GB (Q4_K_XL) | **51.8 tok/s** | – |
 | ThinkingCap-Qwen3.6-27B (dense) | 27B | 27B | 16GB (Q4_K_M) | **18.7 tok/s** (27.8 w/ nextn MTP) | – |
 | Laguna-S-2.1 | 118B | 8B (top-10 of 256 + shared) | 36GB (IQ2_XXS, imatrix) | **17.3 tok/s** (22.4 w/ CPU lane) | – |
@@ -50,7 +54,7 @@ Gen5 NVMe.
 | Hy3 295B | 295B | 21B (top-8 of 192) | 79GB (IQ2_XXS) | **6.0 tok/s** (6.9 w/ CPU lane) | 0.64–0.70 |
 | Qwen3-235B-A22B | 235B | 22B (top-8 of 128) | 83GB (Q2_K_XL) | **5.3 tok/s** (6.4 w/ CPU lane) | – |
 | MiniMax M3 | 428B | 23B | 134GB (Q2_K_XL) | **5.0 tok/s** (5.9 w/ CPU lane) | – |
-| GLM-5.2 | 744B | 40B | 211GB (ds4 recipe) | **1.7 tok/s** (2.4 w/ CPU lane) | 0.40 |
+| GLM-5.2 | 744B | 40B | 211GB (ds4 recipe) | **2.7 tok/s** (2.8 w/ CPU lane) | 0.40 |
 | TML Inkling | 975B | 41B (6 + 2 shared) | 296GB (Q2_K_XL) | **1.6 tok/s** (1.75 w/ CPU lane) | – |
 | Kimi K2.7 Code† | ~1T | 32B | 339GB (Q2_K_XL) | **1.3 tok/s** | – |
 
@@ -63,8 +67,8 @@ whole quantized weight set lives resident in the tier, so warm Gemma is
 compute-bound, not streaming-bound.
 
 † Measured before the n=64 standardization and not yet re-run (model deleted
-to free disk); the sustained rate is likely a little lower than shown, as
-GLM-5.2's re-measurement confirmed (2.0 -> 1.7).
+to free disk); the sustained rate is likely a little lower than shown, for
+the same reason Hy3 reads 8.2 at n=32 against 6.0 at n=64.
 
 ThinkingCap-27B is pulsar's first fully-dense arch and runs a different
 mode entirely: no streaming, no tiers - the model fits across both
@@ -116,12 +120,16 @@ x q8_K kernels sustain 42 GB/s across the 9900X's cores, above the
 overlap the GPU resolve. Host-cached experts stop competing for
 upload bandwidth and VRAM cache slots, so both effects compound:
 DeepSeek-V4-Flash measures 8.2 to 11.3 tok/s, Hy3 6.0 to 6.9, GLM-5.2
-1.7 to 2.4 (re-measured 2026-07-19 after an iq2_xxs correctness fix:
+2.7 to 2.8 (re-measured 2026-07-19 after an iq2_xxs correctness fix:
 the CPU dot had been indexing the encoder-unit grid instead of the
 dequant lattice, scaling every lane partial by ~1/9 per dot - GLM
 surfaced it as repetition loops, and a one-row GPU-vs-CPU arbiter now
 pins the dot to the kernel bit-for-bit-scale; earlier lane numbers
-were measured with the broken dot and are superseded by these). Covers iq2_xxs, iq2_xs, iq3_xxs, q2_K, q3_K and q4_K
+were measured with the broken dot and are superseded by these).
+GLM's pair moved again on 2026-07-25 when a prefill prefetch bug was
+fixed, and the lane's margin there narrowed from +41% to +6%: much of
+what the lane had been buying on that model was insulation from the
+flood's cache thrashing, not upload bandwidth. Covers iq2_xxs, iq2_xs, iq3_xxs, q2_K, q3_K and q4_K
 expert tensors, which spans the ds4 recipes and the UD-Q2_K_XL mixes:
 Qwen3-235B 5.3 to 6.4 (+21%), TML Inkling 1.63 to 1.75 (+7%),
 MiniMax M3 5.0 to 5.9 (+18%; its IQ mix engages on 54 of 57 MoE

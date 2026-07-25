@@ -1931,6 +1931,11 @@ typedef struct {
     const void *gate;
     const void *up;
     const void *down;
+    /* per-expert f32 bias vectors, NULL when the arch has none (gpt-oss is
+     * the only one so far). gate/up are mid_dim long, down is out_dim. */
+    const float *gate_b;
+    const float *up_b;
+    const float *down_b;
 } pulsar_expert_ptrs;
 
 template <typename DOT>
@@ -1975,6 +1980,10 @@ __global__ static void moe_pair_swiglu_kernel(
         acc_up += __shfl_xor_sync(0xffffffffu, acc_up, mask);
     }
     if (lane == 0) {
+        /* per-expert bias lands on the projection output, i.e. before the
+         * gate, and the router weight still multiplies the whole thing */
+        if (p.gate_b) acc_gate += p.gate_b[row];
+        if (p.up_b) acc_up += p.up_b[row];
         mid[mid_off] = pulsar_glu(acc_gate, acc_up, act_op) * weights[slot_off];
     }
 }
@@ -2095,6 +2104,8 @@ __global__ static void moe_pair_swiglu_grouped_kernel(
             au += __shfl_xor_sync(0xffffffffu, au, mask);
         }
         if (lane == 0) {
+            if (p.gate_b) ag += p.gate_b[row];
+            if (p.up_b) au += p.up_b[row];
             mid[((uint64_t)token * n_used + slot) * mid_dim + row] =
                 pulsar_glu(ag, au, act_op) * weights[(uint64_t)token * n_used + slot];
         }
@@ -2665,8 +2676,11 @@ __global__ static void moe_grouped_mma_kernel(
                     if (row >= n_rows) continue;
                     const uint32_t ci = rh * 2u + half;
                     if (KIND == 0) {
+                        float g = accg[t][ci], u = accu[t][ci];
+                        if (p.gate_b) g += p.gate_b[row];
+                        if (p.up_b) u += p.up_b[row];
                         out[srow * n_rows + row] =
-                            pulsar_glu(accg[t][ci], accu[t][ci], act_op) * weights[srow];
+                            pulsar_glu(g, u, act_op) * weights[srow];
                     } else {
                         out[srow * n_rows + row] = accg[t][ci];
                     }
@@ -2801,6 +2815,64 @@ extern "C" int pulsar_moe_down_grouped(
             (const block_q8_K *)midq_dev, mid_blocks, out_dim, n_used,
             row_bytes);
     return cuda_ok(cudaGetLastError(), "moe down grouped launch");
+}
+
+/* Down-projection bias, as its own pass.
+ *
+ * The bias belongs to the projection output and the router weight scales
+ * the sum of that: out = sum_s w_s * (h_s @ W_s + b_s). The pair stage has
+ * already folded w_s into mid, so the weighted bias cannot ride along with
+ * the down matmul and needs w_s again here. Doing it separately keeps all
+ * three down kernels (plain, grouped, mma) untouched, and it reads the
+ * per-slot ptrs array, which both the plain and grouped paths populate. */
+__global__ static void moe_down_bias_kernel(
+        float *out,                     /* [n_tok][out_dim] */
+        const pulsar_expert_ptrs *ptrs, /* [n_tok][n_used] */
+        const float *weights,           /* [n_tok][n_used] */
+        uint32_t out_dim,
+        uint32_t n_used,
+        uint32_t n_tok) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= (uint64_t)n_tok * out_dim) return;
+    const uint32_t token = (uint32_t)(gid / out_dim);
+    const uint32_t row = (uint32_t)(gid % out_dim);
+    float b = 0.0f;
+    for (uint32_t s = 0; s < n_used; s++) {
+        const uint64_t so = (uint64_t)token * n_used + s;
+        const pulsar_expert_ptrs p = ptrs[so];
+        if (p.down_b) b += weights[so] * p.down_b[row];
+    }
+    if (b != 0.0f) out[gid] += b;
+}
+
+/* Adds a [dim] bias to each of `rows` contiguous rows. gpt-oss carries
+ * q/k/v/output biases on its attention projections; every other arch here
+ * has none and never calls this. */
+__global__ static void add_bias_rows_kernel(
+        float *x, const float *bias, uint32_t dim, uint32_t rows) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= (uint64_t)rows * dim) return;
+    x[gid] += bias[gid % dim];
+}
+
+extern "C" int pulsar_add_bias_rows(
+        void *x_dev, const void *bias_dev, uint32_t dim, uint32_t rows) {
+    if (dim == 0 || rows == 0) return 0;
+    const uint64_t total = (uint64_t)rows * dim;
+    add_bias_rows_kernel<<<(uint32_t)((total + 255u) / 256u), 256>>>(
+            (float *)x_dev, (const float *)bias_dev, dim, rows);
+    return cuda_ok(cudaGetLastError(), "add bias rows launch");
+}
+
+extern "C" int pulsar_moe_down_bias(
+        void *out_dev, const void *ptrs_dev, const void *weights_dev,
+        uint32_t out_dim, uint32_t n_used, uint32_t n_tok) {
+    if (out_dim == 0 || n_used == 0 || n_tok == 0) return 0;
+    const uint64_t total = (uint64_t)n_tok * out_dim;
+    moe_down_bias_kernel<<<(uint32_t)((total + 255u) / 256u), 256>>>(
+            (float *)out_dev, (const pulsar_expert_ptrs *)ptrs_dev,
+            (const float *)weights_dev, out_dim, n_used, n_tok);
+    return cuda_ok(cudaGetLastError(), "moe down bias launch");
 }
 
 extern "C" int pulsar_moe_slot_sum(
@@ -3055,11 +3127,17 @@ extern "C" int pulsar_moe_pair_swiglu(
         uint64_t row_bytes,
         uint32_t quant,
         uint32_t act_op) {
-    if (in_dim == 0 || in_dim % PULSAR_QK_K != 0 || mid_dim == 0 ||
+    if (in_dim == 0 || mid_dim == 0 ||
         n_used == 0 || n_tok == 0 || row_bytes == 0) {
         return 0;
     }
-    const uint32_t in_blocks = in_dim / PULSAR_QK_K;
+    /* ceil, matching pulsar_moe_down: a partial tail superblock rides
+     * zero-quantized activations (see q8_K_quantize_kernel) and the weight
+     * overread lands in the PULSAR_SLAB_SLACK after each expert slab. The
+     * down path has always done this; requiring exact division here just
+     * refused models whose hidden dim is not a multiple of 256, which
+     * gpt-oss (2880) is not. */
+    const uint32_t in_blocks = (in_dim + PULSAR_QK_K - 1) / PULSAR_QK_K;
     dim3 block(32, 4, 1);
     dim3 grid((mid_dim + 3u) / 4u, n_used, n_tok);
     switch (quant) {
@@ -3871,7 +3949,7 @@ static int moe_selftest_one2(uint32_t quant, const char *name, uint32_t mid_dim)
     void *gate_dev = NULL, *up_dev = NULL, *down_dev = NULL;
     void *xq_dev = NULL, *midq_dev = NULL, *w_dev = NULL, *ptrs_dev = NULL;
     void *mid_dev = NULL, *out_dev = NULL;
-    pulsar_expert_ptrs ptrs[n_tok * n_used];
+    pulsar_expert_ptrs ptrs[n_tok * n_used] = {}; /* bias fields must be null */
     const uint64_t xq_bytes = (uint64_t)n_tok * in_blocks * sizeof(block_q8_K);
     const uint64_t midq_bytes = (uint64_t)n_tok * n_used * mid_blocks * sizeof(block_q8_K);
     /* +256: the device dots read the same phantom tail as the host ones */
@@ -3971,7 +4049,7 @@ static int moe_selftest_one2(uint32_t quant, const char *name, uint32_t mid_dim)
         uint32_t n_group = 0;
         uint32_t starts_h[65];
         uint32_t pairs_h[64];
-        pulsar_expert_ptrs gptrs_h[64];
+        pulsar_expert_ptrs gptrs_h[64] = {}; /* bias fields must be null */
         /* group by expert (matches the engine's pointer-keyed grouping) */
         for (uint32_t si = 0; si < n_tok * n_used; si++) {
             if (sel[si] < 0) continue;
@@ -4704,36 +4782,39 @@ extern "C" int pulsar_gqa_attention(
         uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
         uint32_t head_dim, uint32_t cap, uint32_t pos0,
         float scale, uint32_t window,
-        const void *rel, uint32_t rel_extent, uint32_t kvq) {
+        const void *rel, uint32_t rel_extent, uint32_t kvq,
+        const void *sinks) {
     ds4_gpu_tensor ot = shim(out), qt = shim(q), kt = shim(k_cache),
                    vt = shim(v_cache);
     ds4_gpu_tensor rt = shim(rel);
     const ds4_gpu_tensor *rpt = rel ? &rt : NULL;
+    ds4_gpu_tensor st_ = shim(sinks);
+    const ds4_gpu_tensor *spt = sinks ? &st_ : NULL;
     switch (kvq) {
         case 1:
             return ds4_gpu_gqa_attention_fp8(&ot, &qt, &kt, &vt, n_tok, n_head,
                                              n_kv_head, head_dim, cap, pos0,
-                                             scale, window, rpt, rel_extent);
+                                             scale, window, rpt, rel_extent, spt);
         case 2:
             return ds4_gpu_gqa_attention_fp16(&ot, &qt, &kt, &vt, n_tok, n_head,
                                               n_kv_head, head_dim, cap, pos0,
-                                              scale, window, rpt, rel_extent);
+                                              scale, window, rpt, rel_extent, spt);
         case 3:
             return ds4_gpu_gqa_attention_int8(&ot, &qt, &kt, &vt, n_tok, n_head,
                                               n_kv_head, head_dim, cap, pos0,
-                                              scale, window, rpt, rel_extent);
+                                              scale, window, rpt, rel_extent, spt);
         case 4:
             return ds4_gpu_gqa_attention_q8_0(&ot, &qt, &kt, &vt, n_tok, n_head,
                                               n_kv_head, head_dim, cap, pos0,
-                                              scale, window, rpt, rel_extent);
+                                              scale, window, rpt, rel_extent, spt);
         case 5:
             return ds4_gpu_gqa_attention_q4_0(&ot, &qt, &kt, &vt, n_tok, n_head,
                                               n_kv_head, head_dim, cap, pos0,
-                                              scale, window, rpt, rel_extent);
+                                              scale, window, rpt, rel_extent, spt);
         default:
             return ds4_gpu_gqa_attention(&ot, &qt, &kt, &vt, n_tok, n_head,
                                          n_kv_head, head_dim, cap, pos0, scale,
-                                         window, rpt, rel_extent);
+                                         window, rpt, rel_extent, spt);
     }
 }
 
@@ -4795,13 +4876,28 @@ static void mla_fill_q8(uint8_t *w, uint64_t rows, uint32_t cols) {
     }
 }
 
+/* Shapes are parameters, not constants, because the attention kernel's
+ * scoring loop is warp-cooperative: lanes stride kv_lora_dim by 32 and the
+ * rope pairs by 32, so how many times each loop iterates depends entirely
+ * on the dims. A 64/8 toy exercises the single-iteration case only - GLM
+ * runs 512/64 with thousands of selected rows and takes different paths
+ * through the same code. Both are covered below. */
 static int mla_selftest_one(float freq_scale, float ext_factor,
                             float beta_fast, float beta_slow,
+                            uint32_t kv_lora, uint32_t qk_rope,
+                            uint32_t cache_cap, uint32_t n_prefill,
                             const char *name) {
-    const uint32_t n_head = 4, kv_lora = 64, qk_nope = 32, qk_rope = 8;
+    /* the host reference below keeps its per-head scratch on the stack;
+     * these bound it. Exceeding them silently smashed the stack when the
+     * dims first became parameters, so fail loudly instead. */
+    const uint32_t MAX_LORA = 1024u, MAX_SEL = 256u;
+    if (kv_lora > MAX_LORA || cache_cap > MAX_SEL) {
+        printf("mla-selftest %s: SKIP (dims exceed host scratch)\n", name);
+        return 0;
+    }
+    const uint32_t n_head = 4, qk_nope = 32;
     const uint32_t qk_dim = qk_nope + qk_rope, value_dim = 16;
     const uint32_t kv_raw_dim = kv_lora + qk_rope;
-    const uint32_t cache_cap = 16, n_prefill = 3;
     const uint32_t n_ctx_orig = 64;
     const float freq_base = 10000.0f, attn_factor = 1.0f, eps = 1e-5f;
     const float scale = 1.0f / sqrtf((float)qk_dim);
@@ -4859,11 +4955,11 @@ static int mla_selftest_one(float freq_scale, float ext_factor,
         }
         for (uint32_t h = 0; h < n_head; h++) {
             const float *qh = h_q_roped + ((uint64_t)t * n_head + h) * qk_dim;
-            float low[64];
+            float low[MAX_LORA];
             for (uint32_t j = 0; j < kv_lora; j++)
                 low[j] = mla_host_q8_dot(
                         k_b + ((uint64_t)h * kv_lora + j) * kb_row, qh, qk_nope);
-            float sc[16];
+            float sc[MAX_SEL];
             float maxs = -INFINITY;
             for (uint32_t r = 0; r <= t; r++) {
                 float dotv = 0.0f;
@@ -4889,7 +4985,7 @@ static int mla_selftest_one(float freq_scale, float ext_factor,
                 denom += sc[r];
             }
             denom = fmaxf(denom, 1.0e-20f);
-            float lora_sum[64];
+            float lora_sum[MAX_LORA];
             for (uint32_t j = 0; j < kv_lora; j++) {
                 float acc = 0.0f;
                 for (uint32_t r = 0; r <= t; r++)
@@ -4989,9 +5085,13 @@ static int mla_selftest_one(float freq_scale, float ext_factor,
 
 extern "C" int pulsar_mla_selftest(void) {
     /* plain rope (GLM-5.2's live config) and a yarn config to exercise
-     * the correction path */
-    return mla_selftest_one(1.0f, 0.0f, 0.0f, 0.0f, "plain") &&
-           mla_selftest_one(0.5f, 1.0f, 32.0f, 1.0f, "yarn");
+     * the correction path, both at toy dims; then GLM's real geometry
+     * (kv_lora 512, qk_rope 64) with enough cached rows that the
+     * warp-per-score loop iterates many times - the shape the toy cases
+     * cannot reach and the one the engine actually runs. */
+    return mla_selftest_one(1.0f, 0.0f, 0.0f, 0.0f, 64, 8, 16, 3, "plain") &&
+           mla_selftest_one(0.5f, 1.0f, 32.0f, 1.0f, 64, 8, 16, 3, "yarn") &&
+           mla_selftest_one(1.0f, 0.0f, 0.0f, 0.0f, 512, 64, 96, 24, "glm-shape");
 }
 #include "dsa_indexer.inc"
 #include "dsv4_kernels.inc"

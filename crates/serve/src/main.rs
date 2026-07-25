@@ -595,7 +595,25 @@ fn encode_messages(
         )
     });
     let mut ids: Vec<u32> = m.prologue();
+    ids.extend(m.prologue_effort(tok));
     let mut tools_injected = tool_text.is_none();
+    // Styles that require a system block get one even when the caller sends
+    // none. Harmony's channel list is not optional (gpt-oss never closes its
+    // analysis channel without it) and the web UI sends no system turn, so
+    // relying on the client to supply it means the model misbehaves by
+    // default. Returns None for every other style.
+    if !messages
+        .iter()
+        .any(|msg| msg["role"].as_str() == Some("system"))
+    {
+        if let Some(mut sys) = m.default_system() {
+            if !tools_injected {
+                sys.push_str(tool_text.as_deref().unwrap_or(""));
+                tools_injected = true;
+            }
+            ids.extend(m.render_system(tok, &sys));
+        }
+    }
     for msg in messages {
         let role = msg["role"].as_str().unwrap_or("");
         let mut content = text_of(&msg["content"]);
@@ -646,6 +664,62 @@ fn encode_messages(
 /// Split generated text into (visible text, parsed tool calls).
 /// Unclosed or unparseable blocks stay in the text untouched.
 #[cfg(target_os = "linux")]
+/// Split harmony channel output into (reasoning, reply).
+///
+/// gpt-oss answers on named channels: `analysis` carries its chain of
+/// thought, `final` the actual reply, fenced by <|channel|>NAME<|message|>.
+/// A client wants the reply in `content`, so everything that is not `final`
+/// becomes reasoning, the way llama.cpp splits it. Text with no channel
+/// markers passes through untouched, which is every other model here.
+/// Split a reply that STARTS inside a reasoning block (GLM with thinking
+/// on: `<think>` is the last prompt token, so the model emits reasoning
+/// first and closes with `</think>`). Everything before the close is
+/// reasoning, everything after is the reply. A reply that never closes hit
+/// the token cap mid-thought - hand it back as reasoning rather than
+/// returning an empty message.
+fn split_open_think(s: &str) -> (String, String) {
+    match s.split_once("</think>") {
+        Some((think, rest)) => (think.trim().to_string(), rest.trim().to_string()),
+        None => (s.trim().to_string(), String::new()),
+    }
+}
+
+fn split_harmony(s: &str) -> (String, String) {
+    if !s.contains("<|channel|>") {
+        return (String::new(), s.to_string());
+    }
+    let mut reasoning = String::new();
+    let mut reply = String::new();
+    for seg in s.split("<|channel|>").skip(1) {
+        // the name runs to the message marker, except the model sometimes
+        // emits a bare ':' in its place, so accept either
+        let (name, rest) = match seg.find("<|message|>") {
+            Some(i) => (&seg[..i], &seg[i + "<|message|>".len()..]),
+            None => match seg.find(':') {
+                Some(i) => (&seg[..i], &seg[i + 1..]),
+                None => (seg, ""),
+            },
+        };
+        let mut body = rest;
+        for end in ["<|end|>", "<|start|>", "<|return|>", "<|call|>"] {
+            if let Some(i) = body.find(end) {
+                body = &body[..i];
+            }
+        }
+        if name.trim() == "final" {
+            reply.push_str(body);
+        } else {
+            reasoning.push_str(body);
+        }
+    }
+    // hit the token cap mid-reasoning and never reached `final`: show the
+    // reasoning rather than hand back an empty reply
+    if reply.trim().is_empty() {
+        return (String::new(), reasoning.trim().to_string());
+    }
+    (reasoning.trim().to_string(), reply.trim().to_string())
+}
+
 fn extract_tool_calls(text: &str) -> (String, Vec<(String, String)>) {
     let mut clean = String::new();
     let mut calls = Vec::new();
@@ -702,9 +776,30 @@ fn handle_chat(
     let temp = req["temperature"].as_f64().map(|v| v as f32).unwrap_or(default_temp);
     let top_p = req["top_p"].as_f64().map(|v| v as f32).unwrap_or(1.0);
     let min_p = req["min_p"].as_f64().map(|v| v as f32).unwrap_or(0.0);
-    let max_tokens = req["max_tokens"].as_u64().unwrap_or(1024) as usize;
     let seed = req["seed"].as_u64().unwrap_or(42);
     let streaming = req["stream"].as_bool().unwrap_or(false);
+
+    // Per-request reasoning control, accepting both conventions clients
+    // actually send: OpenAI's top-level `reasoning_effort` and the
+    // vLLM/SGLang `chat_template_kwargs.enable_thinking`. "none"/"off"
+    // disables; anything else is clamped to the style's own vocabulary
+    // (GLM high|max, harmony low|medium|high) by set_reasoning. Markers
+    // are cloned per request so one client's choice cannot leak into the
+    // next - the server holds one engine but many callers.
+    let mut req_markers = markers.clone();
+    if let Some(e) = req["reasoning_effort"].as_str() {
+        match e {
+            "none" | "off" | "disabled" => req_markers.set_think(false),
+            _ => {
+                req_markers.set_think(true);
+                req_markers.set_reasoning(e);
+            }
+        }
+    }
+    if let Some(b) = req["chat_template_kwargs"]["enable_thinking"].as_bool() {
+        req_markers.set_think(b);
+    }
+    let markers = &req_markers;
 
     let tools = req["tools"].as_array().cloned();
     let prompt = encode_messages(tok, markers, messages, tools.as_ref());
@@ -723,6 +818,17 @@ fn handle_chat(
             &serde_json::json!({"error": {"message": format!("prompt exceeds context ({} tokens, ctx {})", prompt.len(), st.ctx())}}),
         );
     }
+    // Default and ceiling are the remaining context, not a fixed number: a
+    // reasoning model spends 1k+ tokens thinking before its final channel,
+    // and a mid-thought cap hands the client a truncated monologue and no
+    // answer. An explicit max_tokens is honoured but still clamped to what
+    // the KV can hold.
+    let room = (st.ctx() as usize).saturating_sub(prompt.len() + 2);
+    let max_tokens = req["max_tokens"]
+        .as_u64()
+        .map(|v| v as usize)
+        .unwrap_or(room)
+        .min(room);
     let mut sampler = engine::Sampler::new(temp, top_p, min_p, seed);
     let id = format!("chatcmpl-{request_id}");
 
@@ -817,6 +923,19 @@ fn handle_chat(
         let mut bytes: Vec<u8> = Vec::new();
         let mut n_out = 0usize;
         let send_err = std::cell::Cell::new(false);
+        // harmony channel state machine: the assistant turn is
+        // <|channel|>analysis<|message|>...<|end|><|start|>assistant
+        // <|channel|>final<|message|>... - header text (channel names,
+        // roles) is swallowed, `final` bodies stream as content, every
+        // other body as reasoning_content, mirroring the non-stream split
+        let harmony = markers.is_harmony();
+        let mut hdr = harmony; // generation opens on a channel header
+        let mut hdr_buf: Vec<u8> = Vec::new();
+        // GLM opens the think block in the PROMPT, so the stream begins
+        // inside reasoning and the first </think> ends it.
+        let open_think = markers.opens_thinking();
+        let mut reasoning = open_think;
+        let mut rbytes: Vec<u8> = Vec::new();
         engine::generate_cancellable(
             model,
             st,
@@ -838,7 +957,53 @@ fn handle_chat(
                 if tool_phase.get() {
                     return; // buffering a tool call; nothing streams
                 }
-                bytes.extend_from_slice(&tok.decode(&[t]));
+                {
+                    let d = tok.decode(&[t]);
+                    const FENCE: [&[u8]; 5] = [
+                        b"<|channel|>",
+                        b"<|message|>",
+                        b"<|start|>",
+                        b"<|end|>",
+                        b"<|constrain|>",
+                    ];
+                    if harmony {
+                        match d.as_slice() {
+                            b"<|channel|>" | b"<|start|>" | b"<|end|>" => {
+                                hdr = true;
+                                hdr_buf.clear();
+                            }
+                            b"<|message|>" => {
+                                hdr = false;
+                                reasoning = !hdr_buf.windows(5).any(|w| w == b"final");
+                            }
+                            b"<|constrain|>" => {}
+                            _ if hdr => hdr_buf.extend_from_slice(&d),
+                            _ if reasoning => rbytes.extend_from_slice(&d),
+                            _ => bytes.extend_from_slice(&d),
+                        }
+                    } else if open_think && d.as_slice() == b"</think>" {
+                        reasoning = false; // close: the reply starts here
+                    } else if open_think && reasoning {
+                        rbytes.extend_from_slice(&d);
+                    } else if !FENCE.contains(&d.as_slice()) {
+                        bytes.extend_from_slice(&d);
+                    }
+                }
+                let rvalid = match std::str::from_utf8(&rbytes) {
+                    Ok(s) => s.len(),
+                    Err(e) => e.valid_up_to(),
+                };
+                if rvalid > 0 && !send_err.get() {
+                    let text = String::from_utf8_lossy(&rbytes[..rvalid]).into_owned();
+                    rbytes.drain(..rvalid);
+                    let chunk = serde_json::json!({
+                        "id": id, "object": "chat.completion.chunk", "model": model_name,
+                        "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": null}],
+                    });
+                    if write!(stream, "data: {chunk}\n\n").and_then(|_| stream.flush()).is_err() {
+                        send_err.set(true);
+                    }
+                }
                 const MARK: &[u8] = b"<tool_call>";
                 if let Some(p) = bytes.windows(MARK.len()).position(|w| w == MARK) {
                     // stream the text before the call, then go silent
@@ -943,7 +1108,15 @@ fn handle_chat(
         )?;
         let full = String::from_utf8_lossy(&out).into_owned();
         let (clean, calls) = extract_tool_calls(&full);
+        let (reasoning, clean) = if markers.opens_thinking() {
+            split_open_think(&clean)
+        } else {
+            split_harmony(&clean)
+        };
         let mut message = serde_json::json!({"role": "assistant", "content": clean});
+        if !reasoning.is_empty() {
+            message["reasoning_content"] = serde_json::json!(reasoning);
+        }
         if !calls.is_empty() {
             message["tool_calls"] = serde_json::json!(calls
                 .iter()

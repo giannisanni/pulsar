@@ -269,7 +269,8 @@ __global__ static void gqa_attention_kernel(
         float scale,         /* qk scale (1/sqrt(head_dim) for vanilla) */
         uint32_t window,     /* sliding window; 0 = full causal */
         const float *rel,    /* inkling rel-pos bias [n_tok][n_head][rel_extent], NULL = none */
-        uint32_t rel_extent) {
+        uint32_t rel_extent,
+        const float *sinks) { /* gpt-oss per-head sink logit [n_head], NULL = none */
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tok || h >= n_head) return;
@@ -338,6 +339,23 @@ __global__ static void gqa_attention_kernel(
         }
         m = m_new;
         __syncthreads();
+    }
+    /* Attention sink: a learned per-head logit that joins the softmax
+     * denominator and contributes no value, so it can only bleed mass away
+     * from the real rows. Constant per head, so one fold at the end is the
+     * whole of it. Rebase onto the sink when it is the larger of the two,
+     * for the same reason the loop rebases on m_new. */
+    if (sinks) {
+        const float sv = sinks[h];
+        if (sv > m) {
+            const float corr = expf(m - sv);
+            #pragma unroll
+            for (uint32_t k = 0; k < 4; k++) acc[k] *= corr;
+            den = den * corr + 1.0f;
+            m = sv;
+        } else {
+            den += expf(sv - m);
+        }
     }
     for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++) {
         out[((uint64_t)t * n_head + h) * head_dim + d] = acc[k] / den;
@@ -448,7 +466,8 @@ __global__ static void gqa_attention_combine_kernel(
         uint32_t n_tok,
         uint32_t n_head,
         uint32_t head_dim,
-        uint32_t n_split) {
+        uint32_t n_split,
+        const float *sinks) {
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     const uint32_t tid = threadIdx.x;
@@ -457,6 +476,9 @@ __global__ static void gqa_attention_combine_kernel(
     const float *base = partial + ((uint64_t)t * n_head + h) * n_split * stride;
     float m = -INFINITY;
     for (uint32_t s = 0; s < n_split; s++) m = fmaxf(m, base[s * stride + head_dim]);
+    /* the sink joins the global max BEFORE the splits are rescaled onto it,
+     * so it is counted once no matter how many splits ran */
+    if (sinks) m = fmaxf(m, sinks[h]);
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float den = 0.0f;
     for (uint32_t s = 0; s < n_split; s++) {
@@ -467,6 +489,7 @@ __global__ static void gqa_attention_combine_kernel(
         for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++)
             acc[k] += base[s * stride + d] * w;
     }
+    if (sinks) den += expf(sinks[h] - m);
     for (uint32_t d = tid, k = 0; d < head_dim; d += 128u, k++)
         out[((uint64_t)t * n_head + h) * head_dim + d] = acc[k] / den;
 }
@@ -496,7 +519,7 @@ static int gqa_attention_dispatch(
         uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
         uint32_t head_dim, uint32_t cap, uint32_t pos0,
         float scale, uint32_t window,
-        const float *rel, uint32_t rel_extent) {
+        const float *rel, uint32_t rel_extent, const float *sinks) {
     uint32_t rows_eff = pos0 + n_tok;
     if (window != 0u && rows_eff > window) rows_eff = window;
     if (!rel && n_tok <= GQA_SPLIT_MAX_TOK && rows_eff >= GQA_SPLIT_MIN_ROWS) {
@@ -512,7 +535,7 @@ static int gqa_attention_dispatch(
                         head_dim, cap, pos0, scale, window, n_split);
                 if (!cuda_ok(cudaGetLastError(), "gqa split launch")) return 0;
                 dim3 g2(n_tok, n_head, 1);
-                gqa_attention_combine_kernel<<<g2, 128>>>(out, partial, n_tok, n_head, head_dim, n_split);
+                gqa_attention_combine_kernel<<<g2, 128>>>(out, partial, n_tok, n_head, head_dim, n_split, sinks);
                 return cuda_ok(cudaGetLastError(), "gqa combine launch");
             }
         }
@@ -520,7 +543,7 @@ static int gqa_attention_dispatch(
     dim3 grid(n_tok, n_head, 1);
     gqa_attention_kernel<KVF><<<grid, 128>>>(
             out, q, kc, vc, n_tok, n_head, n_kv_head, head_dim, cap, pos0,
-            scale, window, rel, rel_extent);
+            scale, window, rel, rel_extent, sinks);
     return cuda_ok(cudaGetLastError(), "gqa attention launch");
 }
 
@@ -566,7 +589,8 @@ extern "C" int ds4_gpu_gqa_attention(
         uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
         uint32_t head_dim, uint32_t cap, uint32_t pos0,
         float scale, uint32_t window,
-        const ds4_gpu_tensor *rel, uint32_t rel_extent) {
+        const ds4_gpu_tensor *rel, uint32_t rel_extent,
+        const ds4_gpu_tensor *sinks) {
     if (!out || !q || !k_cache || !v_cache ||
         n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
         head_dim == 0 || head_dim > 512u || pos0 + n_tok > cap ||
@@ -577,7 +601,8 @@ extern "C" int ds4_gpu_gqa_attention(
             (float *)out->ptr, (const float *)q->ptr,
             k_cache->ptr, v_cache->ptr,
             n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window,
-            rel ? (const float *)rel->ptr : NULL, rel_extent);
+            rel ? (const float *)rel->ptr : NULL, rel_extent,
+            sinks ? (const float *)sinks->ptr : NULL);
 }
 
 /* ---- fp8 KV variants ---------------------------------------------------- */
@@ -809,7 +834,8 @@ extern "C" int ds4_gpu_gqa_attention_fp8(
         uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
         uint32_t head_dim, uint32_t cap, uint32_t pos0,
         float scale, uint32_t window,
-        const ds4_gpu_tensor *rel, uint32_t rel_extent) {
+        const ds4_gpu_tensor *rel, uint32_t rel_extent,
+        const ds4_gpu_tensor *sinks) {
     if (!out || !q || !k_cache || !v_cache ||
         n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
         head_dim == 0 || head_dim > 512u || head_dim % 4u != 0 ||
@@ -820,7 +846,8 @@ extern "C" int ds4_gpu_gqa_attention_fp8(
             (float *)out->ptr, (const float *)q->ptr,
             k_cache->ptr, v_cache->ptr,
             n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window,
-            rel ? (const float *)rel->ptr : NULL, rel_extent);
+            rel ? (const float *)rel->ptr : NULL, rel_extent,
+            sinks ? (const float *)sinks->ptr : NULL);
 }
 
 extern "C" int ds4_gpu_gqa_attention_fp16(
@@ -829,7 +856,8 @@ extern "C" int ds4_gpu_gqa_attention_fp16(
         uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
         uint32_t head_dim, uint32_t cap, uint32_t pos0,
         float scale, uint32_t window,
-        const ds4_gpu_tensor *rel, uint32_t rel_extent) {
+        const ds4_gpu_tensor *rel, uint32_t rel_extent,
+        const ds4_gpu_tensor *sinks) {
     if (!out || !q || !k_cache || !v_cache ||
         n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
         head_dim == 0 || head_dim > 512u || head_dim % 2u != 0 ||
@@ -840,7 +868,8 @@ extern "C" int ds4_gpu_gqa_attention_fp16(
             (float *)out->ptr, (const float *)q->ptr,
             k_cache->ptr, v_cache->ptr,
             n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window,
-            rel ? (const float *)rel->ptr : NULL, rel_extent);
+            rel ? (const float *)rel->ptr : NULL, rel_extent,
+            sinks ? (const float *)sinks->ptr : NULL);
 }
 
 extern "C" int ds4_gpu_gqa_attention_int8(
@@ -849,7 +878,8 @@ extern "C" int ds4_gpu_gqa_attention_int8(
         uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
         uint32_t head_dim, uint32_t cap, uint32_t pos0,
         float scale, uint32_t window,
-        const ds4_gpu_tensor *rel, uint32_t rel_extent) {
+        const ds4_gpu_tensor *rel, uint32_t rel_extent,
+        const ds4_gpu_tensor *sinks) {
     if (!out || !q || !k_cache || !v_cache ||
         n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
         head_dim == 0 || head_dim > 512u || head_dim % 4u != 0 ||
@@ -860,7 +890,8 @@ extern "C" int ds4_gpu_gqa_attention_int8(
             (float *)out->ptr, (const float *)q->ptr,
             k_cache->ptr, v_cache->ptr,
             n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window,
-            rel ? (const float *)rel->ptr : NULL, rel_extent);
+            rel ? (const float *)rel->ptr : NULL, rel_extent,
+            sinks ? (const float *)sinks->ptr : NULL);
 }
 
 extern "C" int ds4_gpu_gqa_attention_q8_0(
@@ -869,7 +900,8 @@ extern "C" int ds4_gpu_gqa_attention_q8_0(
         uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
         uint32_t head_dim, uint32_t cap, uint32_t pos0,
         float scale, uint32_t window,
-        const ds4_gpu_tensor *rel, uint32_t rel_extent) {
+        const ds4_gpu_tensor *rel, uint32_t rel_extent,
+        const ds4_gpu_tensor *sinks) {
     if (!out || !q || !k_cache || !v_cache ||
         n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
         head_dim == 0 || head_dim > 512u || head_dim % 32u != 0 ||
@@ -880,7 +912,8 @@ extern "C" int ds4_gpu_gqa_attention_q8_0(
             (float *)out->ptr, (const float *)q->ptr,
             k_cache->ptr, v_cache->ptr,
             n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window,
-            rel ? (const float *)rel->ptr : NULL, rel_extent);
+            rel ? (const float *)rel->ptr : NULL, rel_extent,
+            sinks ? (const float *)sinks->ptr : NULL);
 }
 
 extern "C" int ds4_gpu_gqa_attention_q4_0(
@@ -889,7 +922,8 @@ extern "C" int ds4_gpu_gqa_attention_q4_0(
         uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
         uint32_t head_dim, uint32_t cap, uint32_t pos0,
         float scale, uint32_t window,
-        const ds4_gpu_tensor *rel, uint32_t rel_extent) {
+        const ds4_gpu_tensor *rel, uint32_t rel_extent,
+        const ds4_gpu_tensor *sinks) {
     if (!out || !q || !k_cache || !v_cache ||
         n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
         head_dim == 0 || head_dim > 512u || head_dim % 32u != 0 ||
@@ -900,7 +934,8 @@ extern "C" int ds4_gpu_gqa_attention_q4_0(
             (float *)out->ptr, (const float *)q->ptr,
             k_cache->ptr, v_cache->ptr,
             n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window,
-            rel ? (const float *)rel->ptr : NULL, rel_extent);
+            rel ? (const float *)rel->ptr : NULL, rel_extent,
+            sinks ? (const float *)sinks->ptr : NULL);
 }
 
 /* ---- CPU reference + self-test ---- */
@@ -1062,7 +1097,7 @@ extern "C" int ds4_gpu_gqa_selftest(void) {
                  ds4_gpu_gqa_kv_cache_append(g_kc, g_k, n_tok, n_kv_head, hd, cap, pos0) &&
                  ds4_gpu_gqa_kv_cache_append(g_vc, g_v, n_tok, n_kv_head, hd, cap, pos0) &&
                  ds4_gpu_gqa_attention(g_out, g_q, g_kc, g_vc, n_tok, n_head, n_kv_head, hd, cap, pos0,
-                                       1.0f / sqrtf((float)hd), 0u, NULL, 0u) &&
+                                       1.0f / sqrtf((float)hd), 0u, NULL, 0u, NULL) &&
                  cuda_ok(cudaDeviceSynchronize(), "gqa selftest sync");
         float *gpu_out = (float *)malloc(q_elems * sizeof(float));
         if (ok) ok = ds4_gpu_tensor_read(g_out, 0, gpu_out, q_elems * sizeof(float)) != 0;
@@ -1118,7 +1153,7 @@ extern "C" int ds4_gpu_gqa_selftest(void) {
         int ok = ds4_gpu_gqa_kv_cache_append(g_kc, g_k, n_tok, n_kv_head, hd, cap, pos0) &&
                  ds4_gpu_gqa_kv_cache_append(g_vc, g_v, n_tok, n_kv_head, hd, cap, pos0) &&
                  ds4_gpu_gqa_attention(g_out, g_q, g_kc, g_vc, n_tok, n_head, n_kv_head, hd, cap, pos0,
-                                       scale, window, g_rel, rel_ext) &&
+                                       scale, window, g_rel, rel_ext, NULL) &&
                  cuda_ok(cudaDeviceSynchronize(), "gqa rel selftest sync");
         float *gpu_out = (float *)malloc(q_elems * sizeof(float));
         if (ok) ok = ds4_gpu_tensor_read(g_out, 0, gpu_out, q_elems * sizeof(float)) != 0;
@@ -1168,7 +1203,7 @@ extern "C" int ds4_gpu_gqa_selftest(void) {
         int ok = ds4_gpu_gqa_kv_cache_append_fp8(g_kc8, g_k, n_tok, n_kv_head, hd, cap, pos0) &&
                  ds4_gpu_gqa_kv_cache_append_fp8(g_vc8, g_v, n_tok, n_kv_head, hd, cap, pos0) &&
                  ds4_gpu_gqa_attention_fp8(g_out, g_q, g_kc8, g_vc8, n_tok, n_head, n_kv_head, hd,
-                                           cap, pos0, scale, window, NULL, 0u) &&
+                                           cap, pos0, scale, window, NULL, 0u, NULL) &&
                  cuda_ok(cudaDeviceSynchronize(), "gqa fp8 selftest sync");
 
         /* host-decode the GPU cache into f32 caches for the reference */
@@ -1256,11 +1291,11 @@ extern "C" int ds4_gpu_gqa_selftest(void) {
                   ? (ds4_gpu_gqa_kv_cache_append_q8_0(g_kcb, g_k, n_tok, n_kv_head, hd, cap, pos0) &&
                      ds4_gpu_gqa_kv_cache_append_q8_0(g_vcb, g_v, n_tok, n_kv_head, hd, cap, pos0) &&
                      ds4_gpu_gqa_attention_q8_0(g_out, g_q, g_kcb, g_vcb, n_tok, n_head, n_kv_head, hd,
-                                               cap, pos0, scale, window, NULL, 0u))
+                                               cap, pos0, scale, window, NULL, 0u, NULL))
                   : (ds4_gpu_gqa_kv_cache_append_q4_0(g_kcb, g_k, n_tok, n_kv_head, hd, cap, pos0) &&
                      ds4_gpu_gqa_kv_cache_append_q4_0(g_vcb, g_v, n_tok, n_kv_head, hd, cap, pos0) &&
                      ds4_gpu_gqa_attention_q4_0(g_out, g_q, g_kcb, g_vcb, n_tok, n_head, n_kv_head, hd,
-                                               cap, pos0, scale, window, NULL, 0u))) &&
+                                               cap, pos0, scale, window, NULL, 0u, NULL))) &&
                  cuda_ok(cudaDeviceSynchronize(), "gqa block selftest sync");
 
         /* host-decode the GPU cache with a spec-reference formula (not the
@@ -1396,7 +1431,7 @@ extern "C" int ds4_gpu_gqa_selftest(void) {
             gqa_ref_attention(ref_out2, q2, kc2, vc2, n_tok2, n_head2, n_kv2, hd2, cap2, pos2,
                               scale2, wins[wi], NULL, 0u);
             int ok = ds4_gpu_gqa_attention(g_out2, g_q2, g_kc2, g_vc2, n_tok2, n_head2, n_kv2,
-                                           hd2, cap2, pos2, scale2, wins[wi], NULL, 0u) &&
+                                           hd2, cap2, pos2, scale2, wins[wi], NULL, 0u, NULL) &&
                      cuda_ok(cudaDeviceSynchronize(), "gqa split selftest sync");
             if (ok) ok = ds4_gpu_tensor_read(g_out2, 0, gpu_out2, q_elems2 * sizeof(float)) != 0;
             float diff = ok ? gqa_max_abs_diff(ref_out2, gpu_out2, q_elems2) : INFINITY;
@@ -1418,7 +1453,7 @@ extern "C" int ds4_gpu_gqa_selftest(void) {
         int ok8 = ds4_gpu_gqa_kv_cache_append_fp8(g_kc8, g_kin, pos2 + n_tok2, n_kv2, hd2, cap2, 0u) &&
                   ds4_gpu_gqa_kv_cache_append_fp8(g_vc8, g_vin, pos2 + n_tok2, n_kv2, hd2, cap2, 0u) &&
                   ds4_gpu_gqa_attention_fp8(g_out2, g_q2, g_kc8, g_vc8, n_tok2, n_head2, n_kv2,
-                                            hd2, cap2, pos2, scale2, 0u, NULL, 0u) &&
+                                            hd2, cap2, pos2, scale2, 0u, NULL, 0u, NULL) &&
                   cuda_ok(cudaDeviceSynchronize(), "gqa split fp8 selftest sync");
         uint8_t *kc8h = (uint8_t *)malloc(cache8_2);
         uint8_t *vc8h = (uint8_t *)malloc(cache8_2);
