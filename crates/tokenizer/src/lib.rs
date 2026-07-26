@@ -399,6 +399,26 @@ impl ChatMarkers {
         matches!(self.style, ChatStyle::Glm | ChatStyle::Harmony)
     }
 
+    /// The effort levels this style understands, weakest first. Clients
+    /// build their control from this rather than hardcoding a list: the
+    /// vocabularies differ per model and set_reasoning silently clamps
+    /// anything else to the style default. Empty when not steerable.
+    pub fn reasoning_levels(&self) -> &'static [&'static str] {
+        match self.style {
+            ChatStyle::Glm => &["high", "max"],
+            ChatStyle::Harmony => &["low", "medium", "high"],
+            _ => &[],
+        }
+    }
+
+    /// The level this style falls back to when none was requested.
+    pub fn reasoning_default(&self) -> &'static str {
+        match self.style {
+            ChatStyle::Glm => "max",
+            _ => "medium",
+        }
+    }
+
     /// Conversation prologue: bos for most styles, [gMASK]<sop> for GLM.
     pub fn prologue(&self) -> Vec<u32> {
         let mut v: Vec<u32> = self.bos.into_iter().collect();

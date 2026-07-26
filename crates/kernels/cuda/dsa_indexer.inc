@@ -63,12 +63,20 @@ extern "C" int pulsar_idx_rope0(
 /* LayerNorm (mean/var, weight + bias) over the raw indexer K row, partial
  * rope over the first rot_dim dims, stored to the f32 indexer key cache
  * at rows pos0..pos0+n_tokens. */
-/* Index K cache is stored as f16: the scores only pick top-k rows (the
- * reference DSA indexer runs FP8 in production), and f16 keys halve the
- * cache and feed the tensor-core batch scorer directly. */
+/* Index K cache is stored as f16 by default: the scores only pick top-k
+ * rows (the reference DSA indexer runs FP8 in production), and f16 keys
+ * halve the cache and feed the tensor-core batch scorer directly. FP8=1
+ * (rides PULSAR_KV=fp8 with the MLA latent) halves it again: e4m3 bytes
+ * + one f32 row scale at the tail, stride head_dim+4, matching the
+ * production-DSA precision. Row stride: */
+__device__ static inline uint64_t idx_row_stride(uint32_t fp8, uint32_t head_dim) {
+    return fp8 ? (uint64_t)head_dim + 4u : (uint64_t)head_dim * 2u;
+}
+
+template <uint32_t FP8>
 __global__ static void idx_store_k_kernel(
         const float *raw_k, const float *w, const float *b,
-        __half *key_cache, uint32_t pos0, uint32_t n_tokens,
+        uint8_t *key_cache, uint32_t pos0, uint32_t n_tokens,
         uint32_t cache_cap, uint32_t head_dim, uint32_t rot_dim,
         uint32_t n_ctx_orig, float eps, float freq_base, float freq_scale,
         float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
@@ -78,6 +86,9 @@ __global__ static void idx_store_k_kernel(
     if (pos >= cache_cap) return;
     const float *src = raw_k + (uint64_t)token * head_dim;
     __shared__ float partial[256];
+    /* fp8 needs the whole normed row before it can pick the scale; the
+     * wrapper bounds head_dim to this staging size on the fp8 path */
+    __shared__ float rowv[512];
 
     float sum = 0.0f;
     for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) sum += src[i];
@@ -107,7 +118,8 @@ __global__ static void idx_store_k_kernel(
         mla_rope_corr_dims(rot_dim, n_ctx_orig, freq_base,
                                 beta_fast, beta_slow, &corr0, &corr1);
     }
-    __half *dst = key_cache + (uint64_t)pos * head_dim;
+    uint8_t *dst8 = key_cache + (uint64_t)pos * idx_row_stride(FP8, head_dim);
+    __half *dst16 = (__half *)dst8;
     for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
         if (i < rot_dim) {
             if ((i & 1u) != 0u) continue;
@@ -117,11 +129,39 @@ __global__ static void idx_store_k_kernel(
                           ext_factor, attn_factor, &cos_t, &sin_t);
             const float x0 = (src[i] - mean) * inv * w[i] + b[i];
             const float x1 = (src[i + 1u] - mean) * inv * w[i + 1u] + b[i + 1u];
-            dst[i] = __float2half(x0 * cos_t - x1 * sin_t);
-            dst[i + 1u] = __float2half(x0 * sin_t + x1 * cos_t);
+            const float y0 = x0 * cos_t - x1 * sin_t;
+            const float y1 = x0 * sin_t + x1 * cos_t;
+            if (FP8) {
+                rowv[i] = y0;
+                rowv[i + 1u] = y1;
+            } else {
+                dst16[i] = __float2half(y0);
+                dst16[i + 1u] = __float2half(y1);
+            }
         } else {
-            dst[i] = __float2half((src[i] - mean) * inv * w[i] + b[i]);
+            const float y = (src[i] - mean) * inv * w[i] + b[i];
+            if (FP8) rowv[i] = y;
+            else dst16[i] = __float2half(y);
         }
+    }
+    if (FP8) {
+        __syncthreads();
+        float amax = 0.0f;
+        for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x)
+            amax = fmaxf(amax, fabsf(rowv[i]));
+        partial[threadIdx.x] = amax;
+        __syncthreads();
+        for (uint32_t s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (threadIdx.x < s)
+                partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + s]);
+            __syncthreads();
+        }
+        const float rmax = partial[0];
+        const float scale8 = rmax / 448.0f;
+        const float qinv = rmax > 0.0f ? 448.0f / rmax : 0.0f;
+        for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x)
+            dst8[i] = e4m3_enc(rowv[i] * qinv);
+        if (threadIdx.x == 0u) memcpy(dst8 + head_dim, &scale8, 4);
     }
 }
 
@@ -130,33 +170,50 @@ extern "C" int pulsar_idx_store_k(
         void *key_cache_dev, uint32_t pos0, uint32_t n_tokens,
         uint32_t cache_cap, uint32_t head_dim, uint32_t rot_dim,
         uint32_t n_ctx_orig, float eps, float freq_base, float freq_scale,
-        float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
+        float ext_factor, float attn_factor, float beta_fast, float beta_slow,
+        uint32_t fp8) {
     if (!raw_k_dev || !w_dev || !b_dev || !key_cache_dev || n_tokens == 0 ||
-        head_dim == 0 || rot_dim > head_dim || (rot_dim & 1u)) {
+        head_dim == 0 || rot_dim > head_dim || (rot_dim & 1u) ||
+        (fp8 && head_dim > 512u)) {
         return 0;
     }
-    idx_store_k_kernel<<<n_tokens, 256>>>(
-            (const float *)raw_k_dev, (const float *)w_dev, (const float *)b_dev,
-            (__half *)key_cache_dev, pos0, n_tokens, cache_cap, head_dim,
-            rot_dim, n_ctx_orig, eps, freq_base, freq_scale, ext_factor,
-            attn_factor, beta_fast, beta_slow);
+    if (fp8) {
+        idx_store_k_kernel<1u><<<n_tokens, 256>>>(
+                (const float *)raw_k_dev, (const float *)w_dev, (const float *)b_dev,
+                (uint8_t *)key_cache_dev, pos0, n_tokens, cache_cap, head_dim,
+                rot_dim, n_ctx_orig, eps, freq_base, freq_scale, ext_factor,
+                attn_factor, beta_fast, beta_slow);
+    } else {
+        idx_store_k_kernel<0u><<<n_tokens, 256>>>(
+                (const float *)raw_k_dev, (const float *)w_dev, (const float *)b_dev,
+                (uint8_t *)key_cache_dev, pos0, n_tokens, cache_cap, head_dim,
+                rot_dim, n_ctx_orig, eps, freq_base, freq_scale, ext_factor,
+                attn_factor, beta_fast, beta_slow);
+    }
     return cuda_ok(cudaGetLastError(), "idx store k launch");
 }
 
-/* single-token scores over the whole visible cache */
+/* single-token scores over the whole visible cache. The fp8 row scale is
+ * uniform per row, so it applies to the dot BEFORE the relu (the relu is
+ * the reason it cannot fold into the epilogue weight). */
+template <uint32_t FP8>
 __global__ static void idx_score_one_kernel(
         float *scores, const float *q, const float *weights,
-        const __half *key_cache, uint32_t n_rows, uint32_t n_head,
+        const uint8_t *key_cache, uint32_t n_rows, uint32_t n_head,
         uint32_t head_dim, float scale) {
     const uint32_t row = blockIdx.x;
     if (row >= n_rows) return;
     __shared__ float partial[256];
+    const uint8_t *krow = key_cache + (uint64_t)row * idx_row_stride(FP8, head_dim);
+    float rs = 1.0f;
+    if (FP8) memcpy(&rs, krow + head_dim, 4);
     float score = 0.0f;
     for (uint32_t h = 0; h < n_head; h++) {
         const float *qh = q + (uint64_t)h * head_dim;
         float dot = 0.0f;
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
-            dot += qh[d] * __half2float(key_cache[(uint64_t)row * head_dim + d]);
+            dot += qh[d] * (FP8 ? e4m3_dec_common(krow[d])
+                                : __half2float(((const __half *)krow)[d]));
         }
         partial[threadIdx.x] = dot;
         __syncthreads();
@@ -164,7 +221,7 @@ __global__ static void idx_score_one_kernel(
             if (threadIdx.x < s) partial[threadIdx.x] += partial[threadIdx.x + s];
             __syncthreads();
         }
-        if (threadIdx.x == 0) score += fmaxf(partial[0] * scale, 0.0f) * weights[h];
+        if (threadIdx.x == 0) score += fmaxf(partial[0] * rs * scale, 0.0f) * weights[h];
         __syncthreads();
     }
     if (threadIdx.x == 0) scores[row] = score;
@@ -173,22 +230,30 @@ __global__ static void idx_score_one_kernel(
 extern "C" int pulsar_idx_score_one(
         void *scores_dev, const void *q_dev, const void *weights_dev,
         const void *key_cache_dev, uint32_t n_rows, uint32_t n_head,
-        uint32_t head_dim, float scale) {
+        uint32_t head_dim, float scale, uint32_t fp8) {
     if (!scores_dev || !q_dev || !weights_dev || !key_cache_dev ||
         n_rows == 0 || n_head == 0 || head_dim == 0) {
         return 0;
     }
-    idx_score_one_kernel<<<n_rows, 256>>>(
-            (float *)scores_dev, (const float *)q_dev,
-            (const float *)weights_dev, (const __half *)key_cache_dev,
-            n_rows, n_head, head_dim, scale);
+    if (fp8) {
+        idx_score_one_kernel<1u><<<n_rows, 256>>>(
+                (float *)scores_dev, (const float *)q_dev,
+                (const float *)weights_dev, (const uint8_t *)key_cache_dev,
+                n_rows, n_head, head_dim, scale);
+    } else {
+        idx_score_one_kernel<0u><<<n_rows, 256>>>(
+                (float *)scores_dev, (const float *)q_dev,
+                (const float *)weights_dev, (const uint8_t *)key_cache_dev,
+                n_rows, n_head, head_dim, scale);
+    }
     return cuda_ok(cudaGetLastError(), "idx score one launch");
 }
 
 /* batch scores with causal masking: token t sees rows < pos0 + t + 1 */
+template <uint32_t FP8>
 __global__ static void idx_scores_batch_kernel(
         float *scores, const float *q, const float *weights,
-        const __half *key_cache, uint32_t n_rows, uint32_t n_tokens,
+        const uint8_t *key_cache, uint32_t n_rows, uint32_t n_tokens,
         uint32_t pos0, uint32_t n_head, uint32_t head_dim, float scale) {
     const uint32_t row = blockIdx.x;
     const uint32_t token = blockIdx.y;
@@ -200,12 +265,16 @@ __global__ static void idx_scores_batch_kernel(
         return;
     }
     __shared__ float partial[256];
+    const uint8_t *krow = key_cache + (uint64_t)row * idx_row_stride(FP8, head_dim);
+    float rs = 1.0f;
+    if (FP8) memcpy(&rs, krow + head_dim, 4);
     float score = 0.0f;
     for (uint32_t h = 0; h < n_head; h++) {
         const float *qh = q + ((uint64_t)token * n_head + h) * head_dim;
         float dot = 0.0f;
         for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
-            dot += qh[d] * __half2float(key_cache[(uint64_t)row * head_dim + d]);
+            dot += qh[d] * (FP8 ? e4m3_dec_common(krow[d])
+                                : __half2float(((const __half *)krow)[d]));
         }
         partial[threadIdx.x] = dot;
         __syncthreads();
@@ -216,7 +285,7 @@ __global__ static void idx_scores_batch_kernel(
         /* weights are PER TOKEN ([n_tok][n_head], projected from each
          * token's residual) - indexing [h] alone scored every token with
          * token 0's weights (pre-existing bug, fixed with the wmma port) */
-        if (threadIdx.x == 0) score += fmaxf(partial[0] * scale, 0.0f) * weights[(uint64_t)token * n_head + h];
+        if (threadIdx.x == 0) score += fmaxf(partial[0] * rs * scale, 0.0f) * weights[(uint64_t)token * n_head + h];
         __syncthreads();
     }
     if (threadIdx.x == 0) *dst = score;
@@ -230,9 +299,10 @@ __global__ static void idx_scores_batch_kernel(
  * cannot be one big fused GEMM). Block = 4 warps = a 16-token x 32-row
  * tile; K is read straight from the f16 cache, Q from a pre-converted f16
  * scratch. Falls back to the scalar kernel below sm_80 / PULSAR_NO_MMA. */
+template <uint32_t FP8>
 __global__ static void idx_scores_batch_mma_kernel(
         float *scores, const __half *q16, const float *weights,
-        const __half *key_cache, uint32_t n_rows, uint32_t n_tokens,
+        const uint8_t *key_cache, uint32_t n_rows, uint32_t n_tokens,
         uint32_t pos0, uint32_t n_head, uint32_t head_dim, float scale) {
 #if __CUDA_ARCH__ >= 800
     const uint32_t warp = threadIdx.x >> 5;
@@ -258,13 +328,24 @@ __global__ static void idx_scores_batch_mma_kernel(
                     ? q16[((uint64_t)tok * n_head + h) * head_dim + ks + k]
                     : __float2half(0.0f);
             }
-            /* stage this warp's B slice: 128 halfs over 32 lanes */
+            /* stage this warp's B slice: 128 halfs over 32 lanes. fp8
+             * dequantizes here (scale applied per row) so the mma stays
+             * pure f16; the scale read is an L2-broadcast 4B hit. */
             for (uint32_t e = lane; e < 128u; e += 32u) {
                 const uint32_t k = e >> 3, r = e & 7u;
                 const uint32_t row = tile_r0 + r;
-                Bs[warp][k][r] = row < n_rows
-                    ? key_cache[(uint64_t)row * head_dim + ks + k]
-                    : __float2half(0.0f);
+                if (row >= n_rows) {
+                    Bs[warp][k][r] = __float2half(0.0f);
+                } else if (FP8) {
+                    const uint8_t *krow =
+                        key_cache + (uint64_t)row * idx_row_stride(1u, head_dim);
+                    float rs;
+                    memcpy(&rs, krow + head_dim, 4);
+                    Bs[warp][k][r] = __float2half(e4m3_dec_common(krow[ks + k]) * rs);
+                } else {
+                    Bs[warp][k][r] =
+                        ((const __half *)(key_cache + (uint64_t)row * idx_row_stride(0u, head_dim)))[ks + k];
+                }
             }
             __syncthreads();
             uint32_t a0, a1, a2, a3, b0, b1;
@@ -326,7 +407,8 @@ extern "C" int pulsar_idx_scores_batch(
         void *scores_dev, const void *q_dev, const void *weights_dev,
         const void *key_cache_dev, void *q16_scratch_dev,
         uint32_t n_rows, uint32_t n_tokens,
-        uint32_t pos0, uint32_t n_head, uint32_t head_dim, float scale) {
+        uint32_t pos0, uint32_t n_head, uint32_t head_dim, float scale,
+        uint32_t fp8) {
     if (!scores_dev || !q_dev || !weights_dev || !key_cache_dev ||
         n_rows == 0 || n_tokens == 0 || n_head == 0 || head_dim == 0) {
         return 0;
@@ -337,17 +419,31 @@ extern "C" int pulsar_idx_scores_batch(
         idx_f32_to_f16_kernel<<<(uint32_t)((nq + 255u) / 256u), 256>>>(
                 (__half *)q16_scratch_dev, (const float *)q_dev, nq);
         dim3 grid((n_rows + 31u) / 32u, (n_tokens + 15u) / 16u, 1);
-        idx_scores_batch_mma_kernel<<<grid, 128>>>(
-                (float *)scores_dev, (const __half *)q16_scratch_dev,
-                (const float *)weights_dev, (const __half *)key_cache_dev,
-                n_rows, n_tokens, pos0, n_head, head_dim, scale);
+        if (fp8) {
+            idx_scores_batch_mma_kernel<1u><<<grid, 128>>>(
+                    (float *)scores_dev, (const __half *)q16_scratch_dev,
+                    (const float *)weights_dev, (const uint8_t *)key_cache_dev,
+                    n_rows, n_tokens, pos0, n_head, head_dim, scale);
+        } else {
+            idx_scores_batch_mma_kernel<0u><<<grid, 128>>>(
+                    (float *)scores_dev, (const __half *)q16_scratch_dev,
+                    (const float *)weights_dev, (const uint8_t *)key_cache_dev,
+                    n_rows, n_tokens, pos0, n_head, head_dim, scale);
+        }
         return cuda_ok(cudaGetLastError(), "idx scores batch mma launch");
     }
     dim3 grid(n_rows, n_tokens, 1);
-    idx_scores_batch_kernel<<<grid, 256>>>(
-            (float *)scores_dev, (const float *)q_dev,
-            (const float *)weights_dev, (const __half *)key_cache_dev,
-            n_rows, n_tokens, pos0, n_head, head_dim, scale);
+    if (fp8) {
+        idx_scores_batch_kernel<1u><<<grid, 256>>>(
+                (float *)scores_dev, (const float *)q_dev,
+                (const float *)weights_dev, (const uint8_t *)key_cache_dev,
+                n_rows, n_tokens, pos0, n_head, head_dim, scale);
+    } else {
+        idx_scores_batch_kernel<0u><<<grid, 256>>>(
+                (float *)scores_dev, (const float *)q_dev,
+                (const float *)weights_dev, (const uint8_t *)key_cache_dev,
+                n_rows, n_tokens, pos0, n_head, head_dim, scale);
+    }
     return cuda_ok(cudaGetLastError(), "idx scores batch launch");
 }
 
@@ -464,7 +560,7 @@ extern "C" int pulsar_idx_topk(
     return cuda_ok(cudaGetLastError(), "idx topk launch");
 }
 /* ---- indexer selftest: f16 store + scalar/mma batch vs host reference --- */
-extern "C" int pulsar_idx_selftest(void) {
+static int idx_selftest_one(uint32_t fp8) {
     const uint32_t hd = 128, n_head = 4, rows = 48, cap = 64, n_tok = 5, pos0 = 40;
     const float eps = 1e-6f;
     const float scale = 1.0f / sqrtf((float)(hd * n_head));
@@ -490,7 +586,8 @@ extern "C" int pulsar_idx_selftest(void) {
     ds4_gpu_tensor *g_q = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_head * hd * sizeof(float));
     ds4_gpu_tensor *g_q16 = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_head * hd * sizeof(__half));
     ds4_gpu_tensor *g_wt = ds4_gpu_tensor_alloc((uint64_t)n_tok * n_head * sizeof(float));
-    ds4_gpu_tensor *g_kc = ds4_gpu_tensor_alloc((uint64_t)cap * hd * sizeof(__half));
+    const uint64_t kc_stride = fp8 ? (uint64_t)hd + 4u : (uint64_t)hd * sizeof(__half);
+    ds4_gpu_tensor *g_kc = ds4_gpu_tensor_alloc((uint64_t)cap * kc_stride);
     ds4_gpu_tensor *g_sc = ds4_gpu_tensor_alloc((uint64_t)n_tok * rows * sizeof(float));
     if (!g_raw || !g_w || !g_b || !g_q || !g_q16 || !g_wt || !g_kc || !g_sc) {
         fprintf(stderr, "idx-selftest: alloc failed\n");
@@ -504,16 +601,19 @@ extern "C" int pulsar_idx_selftest(void) {
 
     /* store in two appends (0..30, 30..48), rot_dim 0 = pure layernorm */
     int ok = pulsar_idx_store_k(g_raw->ptr, g_w->ptr, g_b->ptr, g_kc->ptr,
-                                0, 30, cap, hd, 0, 0, eps, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+                                0, 30, cap, hd, 0, 0, eps, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, fp8) &&
              pulsar_idx_store_k((const char *)g_raw->ptr + (uint64_t)30 * hd * sizeof(float),
                                 g_w->ptr, g_b->ptr, g_kc->ptr,
-                                30, rows - 30, cap, hd, 0, 0, eps, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+                                30, rows - 30, cap, hd, 0, 0, eps, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, fp8) &&
              cuda_ok(cudaDeviceSynchronize(), "idx store sync");
 
-    /* host: expected layernorm+affine keys; check the f16 cache matches */
-    __half *kc16 = (__half *)malloc((uint64_t)cap * hd * sizeof(__half));
+    /* host: expected layernorm+affine keys; check the decoded cache
+     * matches. fp8 tolerance is the e4m3 mantissa bound (~6.25% of the
+     * row amax); the score references below read the DECODED rows, so
+     * the score comparisons stay tight in both formats. */
+    uint8_t *kc_raw = (uint8_t *)malloc((uint64_t)cap * kc_stride);
     float *keys = (float *)malloc((uint64_t)rows * hd * sizeof(float));
-    if (ok) ok = ds4_gpu_tensor_read(g_kc, 0, kc16, (uint64_t)cap * hd * sizeof(__half)) != 0;
+    if (ok) ok = ds4_gpu_tensor_read(g_kc, 0, kc_raw, (uint64_t)cap * kc_stride) != 0;
     float store_err = 0.0f;
     if (ok) {
         for (uint32_t r = 0; r < rows; r++) {
@@ -523,14 +623,19 @@ extern "C" int pulsar_idx_selftest(void) {
             mean /= hd;
             for (uint32_t i = 0; i < hd; i++) { double d = src[i] - mean; ss += d * d; }
             const float inv = 1.0f / sqrtf((float)(ss / hd) + eps);
+            const uint8_t *krow = kc_raw + (uint64_t)r * kc_stride;
+            float rs = 1.0f;
+            if (fp8) memcpy(&rs, krow + hd, 4);
             for (uint32_t i = 0; i < hd; i++) {
                 const float expect = ((float)(src[i] - mean)) * inv * w[i] + b[i];
-                const float got = __half2float(kc16[(uint64_t)r * hd + i]);
+                const float got = fp8 ? e4m3_dec_common(krow[i]) * rs
+                                      : __half2float(((const __half *)krow)[i]);
                 keys[(uint64_t)r * hd + i] = got; /* decoded cache = score ref */
                 store_err = fmaxf(store_err, fabsf(got - expect));
             }
         }
     }
+    const float store_tol = fp8 ? 3e-1f : 2e-3f;
 
     /* reference scores from the decoded f16 cache, per-token weights */
     float *ref = (float *)malloc((uint64_t)n_tok * rows * sizeof(float));
@@ -554,7 +659,7 @@ extern "C" int pulsar_idx_selftest(void) {
     for (int mode = 0; mode < 2; mode++) {
         int mok = ok && pulsar_idx_scores_batch(g_sc->ptr, g_q->ptr, g_wt->ptr, g_kc->ptr,
                                                 mode == 0 ? NULL : g_q16->ptr,
-                                                rows, n_tok, pos0, n_head, hd, scale) &&
+                                                rows, n_tok, pos0, n_head, hd, scale, fp8) &&
                   cuda_ok(cudaDeviceSynchronize(), "idx batch sync");
         float diff = INFINITY;
         if (mok && ds4_gpu_tensor_read(g_sc, 0, got, (uint64_t)n_tok * rows * sizeof(float))) {
@@ -566,9 +671,9 @@ extern "C" int pulsar_idx_selftest(void) {
         }
         /* mode 1 runs mma on sm_80+ (f16 q adds rounding); scalar is tight */
         const float tol = mode == 0 ? 2e-3f : 3e-2f;
-        const int pass = mok && diff < tol && store_err < 2e-3f;
-        fprintf(stderr, "idx-selftest %s: %s (max diff %.2e, store err %.2e)\n",
-                names[mode], pass ? "PASS" : "FAIL", diff, store_err);
+        const int pass = mok && diff < tol && store_err < store_tol;
+        fprintf(stderr, "idx-selftest %s%s: %s (max diff %.2e, store err %.2e)\n",
+                names[mode], fp8 ? "-fp8" : "", pass ? "PASS" : "FAIL", diff, store_err);
         if (!pass) all_ok = 0;
     }
 
@@ -579,7 +684,7 @@ extern "C" int pulsar_idx_selftest(void) {
         int mok = ok && pulsar_idx_score_one(g_sc->ptr,
                         (const char *)g_q->ptr + (uint64_t)t * n_head * hd * sizeof(float),
                         (const char *)g_wt->ptr + (uint64_t)t * n_head * sizeof(float),
-                        g_kc->ptr, visible, n_head, hd, scale) &&
+                        g_kc->ptr, visible, n_head, hd, scale, fp8) &&
                   cuda_ok(cudaDeviceSynchronize(), "idx one sync");
         float diff = INFINITY;
         if (mok && ds4_gpu_tensor_read(g_sc, 0, got, visible * sizeof(float))) {
@@ -588,13 +693,17 @@ extern "C" int pulsar_idx_selftest(void) {
                 diff = fmaxf(diff, fabsf(ref[(uint64_t)t * rows + r] - got[r]));
         }
         const int pass = mok && diff < 2e-3f;
-        fprintf(stderr, "idx-selftest score_one: %s (max diff %.2e)\n", pass ? "PASS" : "FAIL", diff);
+        fprintf(stderr, "idx-selftest score_one%s: %s (max diff %.2e)\n", fp8 ? "-fp8" : "", pass ? "PASS" : "FAIL", diff);
         if (!pass) all_ok = 0;
     }
 
-    free(raw); free(w); free(b); free(q); free(wt); free(kc16); free(keys); free(ref); free(got);
+    free(raw); free(w); free(b); free(q); free(wt); free(kc_raw); free(keys); free(ref); free(got);
     ds4_gpu_tensor_free(g_raw); ds4_gpu_tensor_free(g_w); ds4_gpu_tensor_free(g_b);
     ds4_gpu_tensor_free(g_q); ds4_gpu_tensor_free(g_q16); ds4_gpu_tensor_free(g_wt);
     ds4_gpu_tensor_free(g_kc); ds4_gpu_tensor_free(g_sc);
     return all_ok;
+}
+
+extern "C" int pulsar_idx_selftest(void) {
+    return idx_selftest_one(0u) && idx_selftest_one(1u);
 }

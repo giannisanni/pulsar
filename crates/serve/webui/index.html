@@ -365,10 +365,20 @@
     gap: 7px;
     min-width: 38px;
   }
-  .icon-only { min-width: 38px; padding: 8px 10px; }
+  .icon-only {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 38px;
+    padding: 8px 10px;
+  }
   .icon-only svg { display: block; }
   .theme-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     width: 14px;
+    height: 14px;
     font-family: var(--serif);
     font-size: 17px;
     font-weight: 400;
@@ -648,6 +658,8 @@
     border-color: var(--accent);
   }
   .cpu-toggle:disabled { opacity: .5; cursor: default; }
+  .model-switch-actions { display: flex; gap: 6px; margin-top: 6px; }
+  .model-switch-actions button[hidden] { display: none; }
   .ctx-row { display: flex; gap: 8px; align-items: center; }
   .ctx-row input { flex: 1; }
   .ctx-row .cpu-toggle { flex: 0 0 auto; min-height: 28px; }
@@ -1031,6 +1043,10 @@
     flex-direction: column;
     gap: 13px;
     width: 290px;
+    /* cap at the viewport minus footer clearance; the panel grows upward
+       from the toolbar, so a height cap also keeps its top above y=0 */
+    max-height: calc(100dvh - 130px);
+    overflow-y: auto;
     padding: 18px;
     border: 1px solid var(--glass-border);
     border-radius: var(--radius-lg);
@@ -1038,6 +1054,8 @@
     -webkit-backdrop-filter: var(--blur-deep);
     backdrop-filter: var(--blur-deep);
     box-shadow: var(--edge-light), var(--shadow-lift);
+    scrollbar-color: var(--ring) transparent;
+    scrollbar-width: thin;
   }
   .panel-title {
     padding-bottom: 11px;
@@ -1067,6 +1085,22 @@
   .panel textarea { min-height: 72px; resize: vertical; }
   .panel input:focus, .panel textarea:focus { border-color: var(--focus); box-shadow: 0 0 0 1px var(--focus); }
   .hint { color: var(--text-tertiary); font-size: 11px; }
+  .panel input[type=range] { width: 100%; accent-color: var(--text-warm); margin: 2px 0 0; }
+  .effort-ticks { display: flex; justify-content: space-between; color: var(--text-tertiary); font-size: 10px; }
+  .effort-ticks span { flex: 1; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .effort-ticks span:first-child { text-align: left; }
+  .effort-ticks span:last-child { text-align: right; }
+  .effort-ticks span.on { color: var(--text); font-weight: 600; }
+  .effort-ticks span.risky { color: var(--danger); opacity: .65; text-decoration: line-through; }
+  .effort-ticks span.risky.on { color: var(--danger); opacity: 1; }
+  .ctx-running { color: var(--text-tertiary); font-size: 11px; margin-top: 2px; }
+  .ctx-warn { color: var(--danger); font-size: 11px; margin-top: 2px; }
+  .ctx-row .cpu-toggle.needs { color: var(--accent); border-color: var(--accent); }
+  /* author `display:flex` above outranks the UA's [hidden] rule, so
+     el.hidden = true would leave the row visible without this */
+  .panel label[hidden] { display: none; }
+  .check-row { flex-direction: row !important; align-items: center; gap: 8px !important; }
+  .check-row input[type=checkbox] { accent-color: var(--text-warm); margin: 0; }
 
   :root[data-theme="dark"] .msg .content pre {
     color: var(--warm-silver);
@@ -1163,6 +1197,10 @@
     <div class="side-title">Active model</div>
     <select id="model-switch" class="model-switch" title="Switch model — reloads the server"></select>
     <div class="model-switch-note" id="model-switch-note" hidden></div>
+    <div class="model-switch-actions">
+      <button id="model-switch-go" class="cpu-toggle" type="button" hidden>Switch</button>
+      <button id="model-switch-cancel" class="cpu-toggle" type="button" hidden>Cancel</button>
+    </div>
   </div>
 
   <div class="side-section">
@@ -1292,24 +1330,53 @@
           <label><span class="field-label">top_p</span>
             <input type="number" id="top-p" step="0.05" min="0" max="1" value="0.95" />
           </label>
-          <label><span class="field-label">max_tokens</span>
-            <input type="number" id="max-tokens" step="32" min="1" value="4096" />
+          <label><span class="field-label">max_tokens <span class="hint" id="max-tokens-hint">blank = use all remaining context</span></span>
+            <input type="number" id="max-tokens" step="32" min="1" placeholder="auto" />
           </label>
-          <label><span class="field-label">reasoning <span class="hint">thinking models only</span></span>
-            <select id="reasoning-effort">
-              <option value="">model default</option>
-              <option value="none">off</option>
-              <option value="low">low</option>
-              <option value="medium">medium</option>
-              <option value="high">high</option>
-              <option value="max">max</option>
-            </select>
+          <label><span class="field-label">min_p</span>
+            <input type="number" id="min-p" step="0.01" min="0" max="1" placeholder="0" />
           </label>
-          <label><span class="field-label">context window <span class="hint">reloads the model</span></span>
+          <label><span class="field-label">seed</span>
+            <input type="number" id="seed" step="1" placeholder="42" />
+          </label>
+          <div id="reasoning-wrap">
+            <label><span class="field-label">reasoning <span class="hint" id="reasoning-current">model default</span></span>
+              <input type="range" id="reasoning-slider" min="0" max="0" step="1" value="0" />
+              <input type="hidden" id="reasoning-effort" value="" />
+              <div class="effort-ticks" id="reasoning-ticks"></div>
+            </label>
+            <div class="hint">higher effort costs a lot of tokens on this hardware</div>
+            <label class="check-row" id="thinking-row">
+              <input type="checkbox" id="enable-thinking" checked />
+              <span>enable thinking</span>
+            </label>
+          </div>
+          <label><span class="field-label">KV cache format <span class="hint" id="kv-current">—</span></span>
             <div class="ctx-row">
-              <input type="number" id="ctx-window" step="1024" min="512" max="262144" value="8192" />
-              <button id="ctx-apply" class="cpu-toggle" type="button" title="Resize the KV context window (reloads the model)">Resize</button>
+              <select id="kv-format">
+                <option value="auto">auto (recommended)</option>
+                <option value="f32">f32</option>
+                <option value="fp8">fp8</option>
+                <option value="fp16">fp16</option>
+                <option value="int8">int8</option>
+                <option value="q8_0">q8_0</option>
+                <option value="q4_0">q4_0</option>
+                <option value="turbo4">turbo4</option>
+              </select>
+              <button id="kv-apply" class="cpu-toggle" type="button" title="Re-exec the server at this KV format (clears the chat)" disabled>Apply</button>
             </div>
+            <div class="hint">lossy except f32; frees VRAM for expert residency</div>
+            <div class="model-switch-note" id="kv-note" hidden></div>
+          </label>
+          <label><span class="field-label">context window <span class="hint" id="ctx-current">8k</span></span>
+            <input type="range" id="ctx-slider" min="0" max="0" step="1" value="0" />
+            <input type="hidden" id="ctx-window" value="8192" />
+            <div class="effort-ticks" id="ctx-ticks"></div>
+            <div class="ctx-row">
+              <div class="ctx-running" id="ctx-running">running: —</div>
+              <button id="ctx-apply" class="cpu-toggle" type="button" title="Resize the KV context window (reloads the model)" disabled>Resize</button>
+            </div>
+            <div class="ctx-warn" id="ctx-warn" hidden></div>
           </label>
           <div class="model-switch-note" id="ctx-note" hidden></div>
         </div>
@@ -1373,6 +1440,21 @@ const $ = (id) => document.getElementById(id);
 const messagesEl = $("messages");
 const inputEl = $("input");
 const sendBtn = $("send");
+// Every control that re-execs the server (ctx resize, KV format, model
+// switch, CPU lane, MTP) leaves it unreachable for ~30-90s. Without this
+// the composer stayed live and a send during that window surfaced a raw
+// "Failed to fetch" with no explanation.
+let reloading = "";
+function setReloading(why) {
+  reloading = why || "";
+  const on = !!reloading;
+  inputEl.disabled = on;
+  inputEl.placeholder = on
+    ? "server reloading (" + reloading + ") — the page recovers on its own"
+    : "Send a message...";
+  if (on) sendBtn.disabled = true;
+  else if (!controller) sendBtn.disabled = false;
+}
 const stopBtn = $("stop");
 const clearBtn = $("clear");
 const statusEl = $("status");
@@ -1426,6 +1508,8 @@ async function fetchStats() {
 // --- Model switcher: list ggufs, load = server re-exec + reload ---
 const modelSwitch = $("model-switch");
 const modelSwitchNote = $("model-switch-note");
+const modelSwitchGo = $("model-switch-go");
+const modelSwitchCancel = $("model-switch-cancel");
 const stem = (n) => n.replace(/\.gguf$/, "");
 async function loadModelList() {
   try {
@@ -1436,7 +1520,7 @@ async function loadModelList() {
     for (const m of models) {
       const opt = document.createElement("option");
       opt.value = m.id;
-      opt.textContent = stem(m.id) + "  (" + (m.bytes / 1073741824).toFixed(0) + "GB)";
+      opt.textContent = stem(m.id) + "  (" + (m.bytes / 1073741824).toFixed(0) + "GiB)";
       if (m.current) opt.selected = true;
       modelSwitch.appendChild(opt);
     }
@@ -1445,6 +1529,7 @@ async function loadModelList() {
   } catch {}
 }
 async function switchModel(name) {
+  setReloading("model switch");
   modelSwitch.disabled = true;
   modelSwitchNote.hidden = false;
   modelSwitchNote.textContent = "switching to " + stem(name) + " … reloading (~1-3 min)";
@@ -1454,12 +1539,12 @@ async function switchModel(name) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model: name }),
     });
-    if (!r.ok) { modelSwitchNote.textContent = "switch rejected"; modelSwitch.disabled = false; return; }
+    if (!r.ok) { modelSwitchNote.textContent = "switch rejected"; modelSwitch.disabled = false; setReloading(""); return; }
   } catch {}
   // the server is re-execing; poll /stats until it is back on the new model
   const t0 = Date.now();
   const poll = async () => {
-    if (Date.now() - t0 > 360000) { modelSwitchNote.textContent = "switch timed out"; modelSwitch.disabled = false; return; }
+    if (Date.now() - t0 > 360000) { modelSwitchNote.textContent = "switch timed out"; modelSwitch.disabled = false; setReloading(""); return; }
     try {
       const j = await fetchStats();
       if (j.model === stem(name)) {
@@ -1467,6 +1552,7 @@ async function switchModel(name) {
         await loadModelList();
         modelSwitchNote.hidden = true;
         modelSwitch.disabled = false;
+        setReloading("");
         return;
       }
     } catch {}
@@ -1474,54 +1560,260 @@ async function switchModel(name) {
   };
   setTimeout(poll, 5000);
 }
+// Deferred confirm in the note line, NOT window.confirm: once a browser's
+// "prevent this page from creating additional dialogs" is set, confirm()
+// returns false forever and the switch silently does nothing.
+let pendingModel = null;
 modelSwitch.addEventListener("change", () => {
   const name = modelSwitch.value;
-  if (window.confirm("Switch to " + stem(name) + "?\nThe server reloads the model (~1-3 min) and the chat clears.")) {
-    switchModel(name);
-  } else {
-    loadModelList(); // revert the selection
-  }
+  pendingModel = name;
+  modelSwitchNote.hidden = false;
+  modelSwitchNote.textContent =
+    "switch to " + stem(name) + "? reloads the model (~1-3 min) and clears the chat";
+  modelSwitchGo.hidden = false;
+  modelSwitchCancel.hidden = false;
+});
+modelSwitchGo.addEventListener("click", () => {
+  modelSwitchGo.hidden = true;
+  modelSwitchCancel.hidden = true;
+  if (pendingModel) switchModel(pendingModel);
+  pendingModel = null;
+});
+modelSwitchCancel.addEventListener("click", () => {
+  modelSwitchGo.hidden = true;
+  modelSwitchCancel.hidden = true;
+  modelSwitchNote.hidden = true;
+  pendingModel = null;
+  loadModelList(); // revert the selection
 });
 
 // --- Context window resize (--ctx; re-exec, reallocates KV, same reload as a switch) ---
+// Slider over power-of-two stops (512…262144) capped at ctx_max from /stats,
+// with ctx_max itself appended when it isn't a power of two. Hidden input
+// #ctx-window carries the resolved numeric value so existing readers work.
 const ctxWindow = $("ctx-window");
 const ctxApply = $("ctx-apply");
 const ctxNote = $("ctx-note");
+const ctxSlider = $("ctx-slider");
+const ctxTicks = $("ctx-ticks");
+let ctxStops = [8192];
+let ctxFit = 0;     // largest ctx whose KV fits VRAM right now (0 = unknown/older server)
+let runningCtx = 0; // what the server is currently running (j.ctx)
+function buildCtxStops(cap, fit) {
+  // Set, not array: the machine's ceiling (fit) is inserted out of order,
+  // so a "is the last element < cap" check would compare against fit and
+  // append cap a second time - two identical final stops.
+  const s = new Set();
+  for (let v = 512; v <= cap; v *= 2) s.add(v);
+  // The real ceiling gets its own stop. Powers of two alone strand
+  // capacity: a box that fits 330641 would top out at the 262144 stop,
+  // losing a fifth of the window it can actually hold.
+  if (fit > 512 && fit < cap) s.add(fit);
+  s.add(cap);
+  return [...s].filter((v) => v >= 512 && v <= cap).sort((a, b) => a - b);
+}
+function nearestStop(n) {
+  let best = 0;
+  for (let i = 0; i < ctxStops.length; i++) if (Math.abs(ctxStops[i] - n) < Math.abs(ctxStops[best] - n)) best = i;
+  return best;
+}
+function syncCtx() {
+  const i = parseInt(ctxSlider.value, 10) || 0;
+  const sel = ctxStops[i] || ctxStops[0];
+  ctxWindow.value = sel;
+  $("ctx-current").textContent = fmtCtx(sel);
+  $("ctx-running").textContent = "running: " + (runningCtx ? fmtCtx(runningCtx) : "—");
+  const risky = ctxFit > 0 && sel > ctxFit;
+  const warn = $("ctx-warn");
+  if (risky) { warn.textContent = "above what VRAM fits now (~" + fmtCtx(ctxFit) + ") — server will refuse"; warn.hidden = false; }
+  else warn.hidden = true;
+  const needs = sel !== runningCtx;
+  ctxApply.disabled = !needs;
+  ctxApply.classList.toggle("needs", needs);
+  for (const [k, s] of [...ctxTicks.children].entries()) {
+    s.classList.toggle("on", k === i);
+    s.classList.toggle("risky", ctxFit > 0 && ctxStops[k] > ctxFit);
+  }
+}
+function applyCtxCaps(j) {
+  const cap = Number.isFinite(j?.ctx_max) && j.ctx_max > 0 ? j.ctx_max : (Number.isFinite(j?.ctx) && j.ctx > 0 ? j.ctx : maxCtx);
+  ctxFit = Number.isFinite(j?.ctx_fit) && j.ctx_fit > 0 ? j.ctx_fit : 0;
+  if (Number.isFinite(j?.ctx) && j.ctx > 0) runningCtx = j.ctx;
+  const prevSel = parseInt(ctxWindow.value, 10) || runningCtx || cap;
+  ctxStops = buildCtxStops(cap, ctxFit);
+  ctxSlider.max = ctxStops.length - 1;
+  ctxSlider.value = nearestStop(prevSel);
+  ctxTicks.textContent = "";
+  for (const v of ctxStops) {
+    const s = document.createElement("span");
+    s.textContent = fmtCtx(v);
+    ctxTicks.appendChild(s);
+  }
+  syncCtx();
+}
+ctxSlider.addEventListener("input", syncCtx);
 async function resizeCtx(n) {
+  setReloading("context resize");
   ctxApply.disabled = true;
   ctxNote.hidden = false;
-  ctxNote.textContent = "resizing to " + fmtCtx(n) + " … reloading";
+  // the server re-execs, so it stops answering for ~30-90s. This page
+  // recovers on its own via the poll below; a manual reload during the
+  // gap just gets ERR_CONNECTION_REFUSED, so say so explicitly.
+  ctxNote.textContent = "resizing to " + fmtCtx(n) + " … keep this tab open, do NOT reload";
   try {
     const r = await fetch("/ctx", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ctx: n }),
     });
-    if (!r.ok) { ctxNote.textContent = "resize rejected (512..262144)"; ctxApply.disabled = false; return; }
+    if (!r.ok) {
+      let msg = "resize rejected";
+      try { const b = await r.json(); if (b?.error?.message) msg = b.error.message; } catch {}
+      ctxNote.textContent = msg;
+      ctxApply.disabled = false;
+      setReloading("");
+      return;
+    }
   } catch {}
   const t0 = Date.now();
   const poll = async () => {
-    if (Date.now() - t0 > 360000) { ctxNote.textContent = "resize timed out (larger windows may OOM)"; ctxApply.disabled = false; return; }
+    if (Date.now() - t0 > 360000) { ctxNote.textContent = "resize timed out (larger windows may OOM)"; ctxApply.disabled = false; setReloading(""); return; }
     try {
       const j = await fetchStats();
       if (j.ctx === n) {
         applyStats(j);
         ctxNote.hidden = true;
         ctxApply.disabled = false;
+        setReloading("");
         return;
       }
     } catch {}
+    const secs = Math.round((Date.now() - t0) / 1000);
+    ctxNote.textContent =
+      "resizing to " + fmtCtx(n) + " … " + secs + "s — keep this tab open, do NOT reload";
     setTimeout(poll, 3000);
   };
   setTimeout(poll, 5000);
 }
+// Two-step inline confirm, NOT window.confirm: browsers offer a "prevent
+// this page from creating additional dialogs" checkbox after repeated
+// dialogs, and once set confirm() returns false instantly and forever -
+// the resize then silently does nothing with no way to tell why.
+let ctxArmed = 0;
 ctxApply.addEventListener("click", () => {
   const n = parseInt(ctxWindow.value, 10);
-  if (!Number.isFinite(n) || n < 512 || n > 262144) { ctxNote.hidden = false; ctxNote.textContent = "enter 512..262144"; return; }
-  if (n === maxCtx) return;
-  if (window.confirm("Resize context to " + fmtCtx(n) + "?\nThe server reloads the model and the chat clears. Larger windows use more memory and may fail to load on a tight box.")) {
-    resizeCtx(n);
+  if (!Number.isFinite(n) || n < 512 || n > ctxStops[ctxStops.length - 1]) { ctxNote.hidden = false; ctxNote.textContent = "pick a stop"; return; }
+  if (n === runningCtx) return;
+  if (Date.now() - ctxArmed > 6000) {
+    ctxArmed = Date.now();
+    ctxApply.textContent = "confirm?";
+    ctxApply.classList.add("needs");
+    ctxNote.hidden = false;
+    ctxNote.textContent = "reloads the model and clears the chat — click again to confirm";
+    setTimeout(() => {
+      if (Date.now() - ctxArmed >= 6000) {
+        ctxApply.textContent = "Resize";
+        ctxNote.hidden = true;
+      }
+    }, 6100);
+    return;
   }
+  ctxArmed = 0;
+  ctxApply.textContent = "Resize";
+  resizeCtx(n);
+});
+
+// --- KV cache format (--kv; re-exec, same reload + chat clear as a resize) ---
+const kvFormat = $("kv-format");
+const kvApply = $("kv-apply");
+const kvNote = $("kv-note");
+const kvCurrent = $("kv-current");
+let runningKvFormat = "auto"; // what the server was launched with (j.kv_format)
+function syncKv() {
+  const needs = kvFormat.value !== runningKvFormat;
+  kvApply.disabled = !needs;
+  kvApply.classList.toggle("needs", needs);
+}
+kvFormat.addEventListener("change", syncKv);
+function applyKvStats(j) {
+  if (typeof j?.kv_format === "string" && j.kv_format) {
+    runningKvFormat = j.kv_format;
+    // don't clobber an in-progress selection
+    if (document.activeElement !== kvFormat) kvFormat.value = j.kv_format;
+  }
+  // On "auto" the selected value says nothing about what the size-aware
+  // default actually picked, so name the resolved format alongside the size.
+  const size = Number.isFinite(j?.kv_bytes) ? gbB(j.kv_bytes) + " GiB" : "";
+  const res = typeof j?.kv_resolved === "string" ? j.kv_resolved : "";
+  const auto = runningKvFormat === "auto";
+  kvCurrent.textContent =
+    res && auto ? "auto → " + res + (size ? " · " + size : "")
+    : size || res || "—";
+  syncKv();
+}
+async function applyKv(f) {
+  setReloading("KV format");
+  kvApply.disabled = true;
+  kvNote.hidden = false;
+  kvNote.textContent = "switching KV to " + f + " … keep this tab open, do NOT reload";
+  try {
+    const r = await fetch("/kv", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ format: f }),
+    });
+    if (!r.ok) {
+      let msg = "KV switch rejected";
+      try { const b = await r.json(); if (b?.error?.message) msg = b.error.message; } catch {}
+      kvNote.textContent = msg;
+      kvApply.disabled = false;
+      setReloading("");
+      return;
+    }
+  } catch {}
+  const t0 = Date.now();
+  const poll = async () => {
+    if (Date.now() - t0 > 360000) { kvNote.textContent = "KV switch timed out"; kvApply.disabled = false; setReloading(""); return; }
+    try {
+      const j = await fetchStats();
+      if (j.kv_format === f) {
+        applyStats(j);
+        kvNote.hidden = true;
+        kvApply.disabled = false;
+        setReloading("");
+        return;
+      }
+    } catch {}
+    const secs = Math.round((Date.now() - t0) / 1000);
+    kvNote.textContent =
+      "switching KV to " + f + " … " + secs + "s — keep this tab open, do NOT reload";
+    setTimeout(poll, 3000);
+  };
+  setTimeout(poll, 5000);
+}
+// same two-step inline confirm as ctxApply (no window.confirm — browsers can
+// permanently suppress it).
+let kvArmed = 0;
+kvApply.addEventListener("click", () => {
+  const f = kvFormat.value;
+  if (f === runningKvFormat) return;
+  if (Date.now() - kvArmed > 6000) {
+    kvArmed = Date.now();
+    kvApply.textContent = "confirm?";
+    kvApply.classList.add("needs");
+    kvNote.hidden = false;
+    kvNote.textContent = "reloads the model and clears the chat — click again to confirm";
+    setTimeout(() => {
+      if (Date.now() - kvArmed >= 6000) {
+        kvApply.textContent = "Apply";
+        kvNote.hidden = true;
+      }
+    }, 6100);
+    return;
+  }
+  kvArmed = 0;
+  kvApply.textContent = "Apply";
+  applyKv(f);
 });
 
 // --- CPU expert lane toggle (PULSAR_CPU; re-exec, same reload as a switch) ---
@@ -1532,6 +1824,7 @@ function setCpuToggle(on) {
   cpuToggle.dataset.on = on ? "1" : "0";
 }
 async function toggleCpuLane() {
+  setReloading("CPU lane");
   const want = cpuToggle.dataset.on !== "1";
   cpuToggle.disabled = true;
   modelSwitchNote.hidden = false;
@@ -1541,13 +1834,14 @@ async function toggleCpuLane() {
   } catch {}
   const t0 = Date.now();
   const poll = async () => {
-    if (Date.now() - t0 > 360000) { modelSwitchNote.textContent = "CPU-lane switch timed out"; cpuToggle.disabled = false; return; }
+    if (Date.now() - t0 > 360000) { modelSwitchNote.textContent = "CPU-lane switch timed out"; cpuToggle.disabled = false; setReloading(""); return; }
     try {
       const j = await fetchStats();
       if (typeof j.cpu_lane === "boolean" && j.cpu_lane === want) {
         applyStats(j);
         modelSwitchNote.hidden = true;
         cpuToggle.disabled = false;
+        setReloading("");
         return;
       }
     } catch {}
@@ -1564,6 +1858,7 @@ function setMtpToggle(on) {
   mtpToggle.dataset.on = on ? "1" : "0";
 }
 async function toggleMtp() {
+  setReloading("MTP");
   const want = mtpToggle.dataset.on !== "1";
   mtpToggle.disabled = true;
   modelSwitchNote.hidden = false;
@@ -1573,13 +1868,14 @@ async function toggleMtp() {
   } catch {}
   const t0 = Date.now();
   const poll = async () => {
-    if (Date.now() - t0 > 360000) { modelSwitchNote.textContent = "MTP switch timed out"; mtpToggle.disabled = false; return; }
+    if (Date.now() - t0 > 360000) { modelSwitchNote.textContent = "MTP switch timed out"; mtpToggle.disabled = false; setReloading(""); return; }
     try {
       const j = await fetchStats();
       if (typeof j.mtp === "boolean" && j.mtp === want) {
         applyStats(j);
         modelSwitchNote.hidden = true;
         mtpToggle.disabled = false;
+        setReloading("");
         return;
       }
     } catch {}
@@ -1622,7 +1918,10 @@ function renderBar(barEl, legEl, segs) {
 }
 
 // Static runtime/hardware/tier rendering from a /stats snapshot.
-const gbB = (b) => (b / 1073741824).toFixed(1); // bytes → GiB, 1 decimal
+// bytes → GiB. Binary units throughout, and LABELLED GiB: these values
+// are compared against card capacities, and a decimal-GB label on a binary
+// number made a 69MiB board difference read as a 0.1GB gap.
+const gbB = (b) => (b / 1073741824).toFixed(1);
 function applyStats(j) {
   const hw = j?.hardware || {};
   const gb = (kb) => (kb / 1048576).toFixed(0);
@@ -1641,14 +1940,14 @@ function applyStats(j) {
     k.textContent = "G" + g.dev;
     const v = document.createElement("span");
     v.className = "v v-name";
-    v.textContent = nm + " · " + gbB(g.vram_total) + " GB";
-    v.title = (g.name || "") + " — " + gbB(g.vram_total) + " GB VRAM";
+    v.textContent = nm + " · " + gbB(g.vram_total) + " GiB";
+    v.title = (g.name || "") + " — " + gbB(g.vram_total) + " GiB VRAM";
     row.appendChild(k);
     row.appendChild(v);
     gEl.appendChild(row);
   });
   $("hw-ram").textContent = Number.isFinite(hw.ram_total_kb)
-    ? gb(hw.ram_total_kb) + " GB (" + gb(hw.ram_available_kb || 0) + " free)"
+    ? gb(hw.ram_total_kb) + " GiB (" + gb(hw.ram_available_kb || 0) + " free)"
     : "—";
   $("hw-cores").textContent = Number.isFinite(hw.cores) ? String(hw.cores) : "—";
   if (j?.model) {
@@ -1656,23 +1955,72 @@ function applyStats(j) {
     modelSideEl.textContent = j.model;
   }
   if (Number.isFinite(j?.ctx) && j.ctx > 0) {
+    // the RUNNING window, not the checkpoint's ceiling: this drives the
+    // used/total chip and the max_tokens bound, both of which are limited
+    // by the KV actually allocated. ctx_max only sizes the resize slider,
+    // which reads it separately in applyCtxCaps.
     maxCtx = j.ctx;
-    if (!curCtx) $("stat-ctx").textContent = fmtCtx(maxCtx);
-    if (document.activeElement !== ctxWindow) ctxWindow.value = maxCtx;
+    if (!curCtx) $("stat-ctx").textContent = fmtCtx(j.ctx);
+    $("max-tokens").placeholder = "auto (up to " + fmtCtx(maxCtx) + ")";
+    applyCtxCaps(j);
   }
+  applyReasoning(j?.reasoning);
+  applyKvStats(j);
   if (typeof j?.cpu_lane === "boolean") setCpuToggle(j.cpu_lane);
   if (typeof j?.mtp === "boolean") setMtpToggle(j.mtp);
   // model residency: how much of the model sits in VRAM / RAM cache / on disk
   const rz = j?.residency || {};
   const rTot = (rz.vram || 0) + (rz.ram || 0) + (rz.disk || 0);
   renderBar($("resid-bar"), $("resid-legend"), [
-    { cls: "seg-a", label: "VRAM", pct: rTot > 0 ? (rz.vram || 0) / rTot * 100 : 0, text: gbB(rz.vram || 0) + " GB" },
-    { cls: "seg-c", label: "RAM", pct: rTot > 0 ? (rz.ram || 0) / rTot * 100 : 0, text: gbB(rz.ram || 0) + " GB" },
-    { cls: "seg-d", label: "disk", pct: rTot > 0 ? (rz.disk || 0) / rTot * 100 : 0, text: gbB(rz.disk || 0) + " GB" },
+    { cls: "seg-a", label: "VRAM", pct: rTot > 0 ? (rz.vram || 0) / rTot * 100 : 0, text: gbB(rz.vram || 0) + " GiB" },
+    { cls: "seg-c", label: "RAM", pct: rTot > 0 ? (rz.ram || 0) / rTot * 100 : 0, text: gbB(rz.ram || 0) + " GiB" },
+    { cls: "seg-d", label: "disk", pct: rTot > 0 ? (rz.disk || 0) / rTot * 100 : 0, text: gbB(rz.disk || 0) + " GiB" },
   ]);
   renderGpuBars(gpus);
   setChips(controller ? "busy" : "idle");
 }
+
+// Reasoning effort slider: stops are [model default, ...reasoning.levels] from
+// /stats. Hidden input #reasoning-effort carries the resolved string ("" at
+// stop 0) so getSettings keeps working unchanged. Non-thinking models: disable.
+let effortStops = [""]; // index 0 = model default (omit reasoning_effort)
+function applyReasoning(rs) {
+  const wrap = $("reasoning-wrap");
+  const slider = $("reasoning-slider");
+  const ticks = $("reasoning-ticks");
+  if (!rs?.capable || !Array.isArray(rs.levels) || !rs.levels.length) {
+    effortStops = [""];
+    slider.max = 0;
+    slider.value = 0;
+    slider.disabled = true;
+    $("thinking-row").hidden = true;
+    ticks.textContent = "";
+    syncEffort();
+    $("reasoning-current").textContent = "not a thinking model";
+    return;
+  }
+  slider.disabled = false;
+  $("thinking-row").hidden = false;
+  effortStops = ["", ...rs.levels];
+  const prev = parseInt(slider.value, 10) || 0;
+  slider.max = effortStops.length - 1;
+  slider.value = Math.min(prev, effortStops.length - 1);
+  ticks.textContent = "";
+  const names = ["default", ...rs.levels];
+  for (let i = 0; i < names.length; i++) {
+    const s = document.createElement("span");
+    s.textContent = names[i];
+    ticks.appendChild(s);
+  }
+  syncEffort();
+}
+function syncEffort() {
+  const i = parseInt($("reasoning-slider").value, 10) || 0;
+  $("reasoning-effort").value = effortStops[i] || "";
+  $("reasoning-current").textContent = i === 0 ? "model default" : effortStops[i];
+  for (const [k, s] of [...$("reasoning-ticks").children].entries()) s.classList.toggle("on", k === i);
+}
+$("reasoning-slider").addEventListener("input", syncEffort);
 
 // Per-GPU VRAM bars: one row per physical GPU, used / total.
 function renderGpuBars(gpus) {
@@ -1696,7 +2044,7 @@ function renderGpuBars(gpus) {
     track.appendChild(fill);
     const val = document.createElement("span");
     val.className = "gpu-val";
-    val.textContent = gbB(g.vram_used) + "/" + (g.vram_total / 1073741824).toFixed(0) + " GB";
+    val.textContent = gbB(g.vram_used) + "/" + (g.vram_total / 1073741824).toFixed(0) + " GiB";
     row.appendChild(label);
     row.appendChild(track);
     row.appendChild(val);
@@ -1950,17 +2298,29 @@ function getSettings() {
     messages,
     temperature: parseFloat($("temp").value) || 0.8,
     top_p: parseFloat($("top-p").value) || 0.95,
-    max_tokens: parseInt($("max-tokens").value, 10) || 1024,
     stream: true,
   };
+  // blank = omit: the server then defaults max_tokens to all remaining
+  // context, which beats any number we could guess here
+  const maxTok = parseInt($("max-tokens").value, 10);
+  if (Number.isFinite(maxTok) && maxTok > 0) body.max_tokens = maxTok;
+  const minP = parseFloat($("min-p").value);
+  if (Number.isFinite(minP)) body.min_p = minP;
+  const seed = parseInt($("seed").value, 10);
+  if (Number.isFinite(seed)) body.seed = seed;
   // omitted entirely when left on "model default" - sending an empty
   // string would override the checkpoint's own setting with nothing
   const effort = $("reasoning-effort").value;
   if (effort) body.reasoning_effort = effort;
+  // thinking off = explicit false; on = omit and let the checkpoint decide
+  if (!$("thinking-row").hidden && !$("enable-thinking").checked) {
+    body.chat_template_kwargs = { enable_thinking: false };
+  }
   return body;
 }
 
 async function send() {
+  if (reloading) return;
   const text = inputEl.value.trim();
   if (!text || controller) return;
   conversation.push({ role: "user", content: text });
@@ -2112,17 +2472,26 @@ async function streamAssistant() {
       setStatus("stopped");
     } else {
       cancelRender();
-      body.innerHTML = '<p style="color:var(--danger)">error: ' + escapeHtml(err.message) + "</p>";
+      // A bare "Failed to fetch" is what a reloading server looks like from
+      // here; name the likely cause instead of the raw TypeError.
+      const net = err instanceof TypeError || /fetch/i.test(err.message || "");
+      body.innerHTML = net
+        ? '<p style="color:var(--danger)">server unreachable — it may be reloading (context, KV format or model change). It comes back on its own; resend in a moment.</p>'
+        : '<p style="color:var(--danger)">error: ' + escapeHtml(err.message) + "</p>";
       setStatus("error", "err");
     }
   } finally {
     controller = null;
-    sendBtn.disabled = false;
+    // don't hand the composer back while a re-exec is still in flight
+    sendBtn.disabled = !!reloading;
     stopBtn.disabled = true;
-    inputEl.focus();
+    if (!reloading) inputEl.focus();
   }
 }
 
+// focusing the composer closes the settings popover (it overlaps the chat)
+const settingsDetails = document.querySelector(".toolbar details");
+inputEl.addEventListener("focus", () => { settingsDetails.open = false; });
 inputEl.addEventListener("input", autoGrow);
 inputEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {

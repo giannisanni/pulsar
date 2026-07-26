@@ -246,13 +246,26 @@ extern "C" int pulsar_mla_kv_lora_rms_norm(
     return cuda_ok(cudaGetLastError(), "mla kv lora rms norm launch");
 }
 
-/* ---- store compact kv: latent row + raw rope tail at pos --------------- */
+/* ---- store compact kv: latent row + raw rope tail at pos ---------------
+ * KVQ selects the latent storage format: 0=f32 (exact), 2=fp16, 1=fp8
+ * e4m3 + one f32 scale (amax/448) at the row tail, mirroring the GQA fp8
+ * layout. Block formats (q8_0/q4_0) are excluded on purpose: the latent
+ * is one flat kv_lora-wide vector, not head-shaped rows, and fp8 already
+ * buys the 3.9x that matters. Both buffers (latent + rope tail) use the
+ * same format so the sizing stays one rule. */
 
+__device__ __host__ static inline uint64_t mla_lat_stride(uint32_t kvq, uint32_t dim) {
+    if (kvq == 1u) return (uint64_t)dim + 4u; /* fp8 + f32 row scale */
+    if (kvq == 2u) return (uint64_t)dim * 2u; /* fp16 */
+    return (uint64_t)dim * 4u;                /* f32 */
+}
+
+template <uint32_t KVQ>
 __global__ static void mla_store_compact_kv_kernel(
         const float *kv_norm,
         const float *kv_raw,
-        float *kv_lora_cache,
-        float *k_rope_cache,
+        uint8_t *kv_lora_cache,
+        uint8_t *k_rope_cache,
         uint32_t pos0,
         uint32_t n_tokens,
         uint32_t cache_cap,
@@ -265,16 +278,43 @@ __global__ static void mla_store_compact_kv_kernel(
     const uint32_t pos = pos0 + token;
     if (pos >= cache_cap) return;
 
+    const float *src;
+    uint32_t dim;
+    uint8_t *dst;
     if (part == 0u) {
-        const float *src = kv_norm + (uint64_t)token * kv_lora_dim;
-        for (uint32_t i = threadIdx.x; i < kv_lora_dim; i += blockDim.x) {
-            kv_lora_cache[(uint64_t)pos * kv_lora_dim + i] = src[i];
-        }
+        src = kv_norm + (uint64_t)token * kv_lora_dim;
+        dim = kv_lora_dim;
+        dst = kv_lora_cache + (uint64_t)pos * mla_lat_stride(KVQ, kv_lora_dim);
     } else {
-        const float *src = kv_raw + (uint64_t)token * kv_raw_dim + kv_lora_dim;
-        for (uint32_t i = threadIdx.x; i < qk_rope; i += blockDim.x) {
-            k_rope_cache[(uint64_t)pos * qk_rope + i] = src[i];
+        src = kv_raw + (uint64_t)token * kv_raw_dim + kv_lora_dim;
+        dim = qk_rope;
+        dst = k_rope_cache + (uint64_t)pos * mla_lat_stride(KVQ, qk_rope);
+    }
+    if (KVQ == 0u) {
+        float *out = (float *)dst;
+        for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) out[i] = src[i];
+    } else if (KVQ == 2u) {
+        __half *out = (__half *)dst;
+        for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x)
+            out[i] = __float2half(src[i]);
+    } else {
+        __shared__ float red[256];
+        float amax = 0.0f;
+        for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x)
+            amax = fmaxf(amax, fabsf(src[i]));
+        red[threadIdx.x] = amax;
+        __syncthreads();
+        for (uint32_t step = blockDim.x >> 1; step > 0; step >>= 1) {
+            if (threadIdx.x < step)
+                red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + step]);
+            __syncthreads();
         }
+        const float rmax = red[0];
+        const float scale = rmax / 448.0f;
+        const float inv = rmax > 0.0f ? 448.0f / rmax : 0.0f;
+        for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x)
+            dst[i] = e4m3_enc(src[i] * inv);
+        if (threadIdx.x == 0u) memcpy(dst + dim, &scale, 4);
     }
 }
 
@@ -288,19 +328,37 @@ extern "C" int pulsar_mla_store_compact_kv(
         uint32_t cache_cap,
         uint32_t kv_raw_dim,
         uint32_t kv_lora_dim,
-        uint32_t qk_rope) {
+        uint32_t qk_rope,
+        uint32_t kvq) {
     if (!kv_lora_cache_dev || !k_rope_cache_dev || !kv_norm_dev || !kv_raw_dev ||
         n_tokens == 0 || cache_cap == 0 ||
         kv_lora_dim == 0 || qk_rope == 0 ||
         kv_lora_dim + qk_rope > kv_raw_dim ||
-        pos0 > cache_cap || n_tokens > cache_cap - pos0) {
+        pos0 > cache_cap || n_tokens > cache_cap - pos0 ||
+        kvq > 2u) {
         return 0;
     }
     dim3 grid(n_tokens, 2, 1);
-    mla_store_compact_kv_kernel<<<grid, 256>>>(
-            (const float *)kv_norm_dev, (const float *)kv_raw_dev,
-            (float *)kv_lora_cache_dev, (float *)k_rope_cache_dev,
-            pos0, n_tokens, cache_cap, kv_raw_dim, kv_lora_dim, qk_rope);
+    switch (kvq) {
+        case 1u:
+            mla_store_compact_kv_kernel<1u><<<grid, 256>>>(
+                    (const float *)kv_norm_dev, (const float *)kv_raw_dev,
+                    (uint8_t *)kv_lora_cache_dev, (uint8_t *)k_rope_cache_dev,
+                    pos0, n_tokens, cache_cap, kv_raw_dim, kv_lora_dim, qk_rope);
+            break;
+        case 2u:
+            mla_store_compact_kv_kernel<2u><<<grid, 256>>>(
+                    (const float *)kv_norm_dev, (const float *)kv_raw_dev,
+                    (uint8_t *)kv_lora_cache_dev, (uint8_t *)k_rope_cache_dev,
+                    pos0, n_tokens, cache_cap, kv_raw_dim, kv_lora_dim, qk_rope);
+            break;
+        default:
+            mla_store_compact_kv_kernel<0u><<<grid, 256>>>(
+                    (const float *)kv_norm_dev, (const float *)kv_raw_dev,
+                    (uint8_t *)kv_lora_cache_dev, (uint8_t *)k_rope_cache_dev,
+                    pos0, n_tokens, cache_cap, kv_raw_dim, kv_lora_dim, qk_rope);
+            break;
+    }
     return cuda_ok(cudaGetLastError(), "mla store compact kv launch");
 }
 
@@ -381,12 +439,13 @@ extern "C" int pulsar_mla_qk_lowrank(
  * scores + softmax + latent accumulation + q8_0 v_b projection in one
  * launch. Cached k_rope is rotated lazily by row position here. */
 
+template <uint32_t KVQ>
 __global__ static void mla_attention_kernel(
         float *heads,
         const float *q,
         const float *qk_low,
-        const float *kv_lora_cache,
-        const float *k_rope_cache,
+        const uint8_t *kv_lora_cache,
+        const uint8_t *k_rope_cache,
         const char *value_weight,  /* q8_0 [n_head][value_dim] rows of kv_lora_dim */
         const uint32_t *selected,
         uint32_t n_tokens,
@@ -452,29 +511,65 @@ __global__ static void mla_attention_kernel(
     const uint32_t lane = tid & 31u;
     const uint32_t warp = tid >> 5;
     const uint32_t n_warp = nth >> 5;
+    const uint64_t lat_stride = mla_lat_stride(KVQ, kv_lora_dim);
+    const uint64_t rope_stride = mla_lat_stride(KVQ, qk_rope);
     float local_max = -INFINITY;
     for (uint32_t s = warp; s < n_selected; s += n_warp) {
         const uint32_t row = token_selected[s];
         float score = -INFINITY;
         if (row < cache_cap) {
-            float dotv = 0.0f;
-            const uint64_t lora_base = (uint64_t)row * kv_lora_dim;
-            for (uint32_t j = lane; j < kv_lora_dim; j += 32u) {
-                dotv += low_s[j] * kv_lora_cache[lora_base + j];
+            /* latent and rope-tail dots kept separate: the fp8 per-row
+             * scales differ between the two buffers, and scaling each
+             * lane's partial before the shuffle reduce distributes over
+             * the sum since the scale is uniform per row. */
+            const uint8_t *lrow = kv_lora_cache + (uint64_t)row * lat_stride;
+            const uint8_t *rrow = k_rope_cache + (uint64_t)row * rope_stride;
+            float dlat = 0.0f;
+            if (KVQ == 0u) {
+                const float *k = (const float *)lrow;
+                for (uint32_t j = lane; j < kv_lora_dim; j += 32u)
+                    dlat += low_s[j] * k[j];
+            } else if (KVQ == 2u) {
+                const __half *k = (const __half *)lrow;
+                for (uint32_t j = lane; j < kv_lora_dim; j += 32u)
+                    dlat += low_s[j] * __half2float(k[j]);
+            } else {
+                for (uint32_t j = lane; j < kv_lora_dim; j += 32u)
+                    dlat += low_s[j] * e4m3_dec_common(lrow[j]);
+                float rs;
+                memcpy(&rs, lrow + kv_lora_dim, 4);
+                dlat *= rs;
             }
-            const uint64_t rope_base = (uint64_t)row * qk_rope;
+            float drope = 0.0f;
             for (uint32_t p = lane; p < n_pair; p += 32u) {
                 const uint32_t r = p << 1;
                 const float theta = (float)row * ropef[p];
                 float c, sn;
                 mla_rope_yarn(theta, freq_scale, corr0, corr1, (int)r,
                               ext_factor, attn_factor, &c, &sn);
-                const float x0 = k_rope_cache[rope_base + r];
-                const float x1 = k_rope_cache[rope_base + r + 1u];
+                float x0, x1;
+                if (KVQ == 0u) {
+                    const float *k = (const float *)rrow;
+                    x0 = k[r];
+                    x1 = k[r + 1u];
+                } else if (KVQ == 2u) {
+                    const __half *k = (const __half *)rrow;
+                    x0 = __half2float(k[r]);
+                    x1 = __half2float(k[r + 1u]);
+                } else {
+                    x0 = e4m3_dec_common(rrow[r]);
+                    x1 = e4m3_dec_common(rrow[r + 1u]);
+                }
                 const float y0 = x0 * c - x1 * sn;
                 const float y1 = x0 * sn + x1 * c;
-                dotv += qh[qk_nope + r] * y0 + qh[qk_nope + r + 1u] * y1;
+                drope += qh[qk_nope + r] * y0 + qh[qk_nope + r + 1u] * y1;
             }
+            if (KVQ == 1u) {
+                float rst;
+                memcpy(&rst, rrow + qk_rope, 4);
+                drope *= rst;
+            }
+            float dotv = dlat + drope;
             #pragma unroll
             for (uint32_t m = 16u; m > 0u; m >>= 1u) {
                 dotv += __shfl_xor_sync(0xffffffffu, dotv, m);
@@ -508,12 +603,32 @@ __global__ static void mla_attention_kernel(
     const float denom = fmaxf(red[0], 1.0e-20f);
     __syncthreads();
 
+    /* fp8: fold each row's scale into its softmax weight once, after
+     * denom is fixed, so the j-loop below stays one dequant per element
+     * instead of re-reading the scale per (j, s). */
+    if (KVQ == 1u) {
+        for (uint32_t s = tid; s < n_selected; s += nth) {
+            const uint32_t row = token_selected[s];
+            if (row < cache_cap) {
+                float rs;
+                memcpy(&rs, kv_lora_cache + (uint64_t)row * lat_stride + kv_lora_dim, 4);
+                scores[s] *= rs;
+            }
+        }
+        __syncthreads();
+    }
+
     for (uint32_t j = tid; j < kv_lora_dim; j += nth) {
         float acc = 0.0f;
         for (uint32_t s = 0; s < n_selected; s++) {
             const uint32_t row = token_selected[s];
             if (row < cache_cap) {
-                acc += scores[s] * kv_lora_cache[(uint64_t)row * kv_lora_dim + j];
+                const uint8_t *lrow = kv_lora_cache + (uint64_t)row * lat_stride;
+                float v;
+                if (KVQ == 0u)      v = ((const float *)lrow)[j];
+                else if (KVQ == 2u) v = __half2float(((const __half *)lrow)[j]);
+                else                v = e4m3_dec_common(lrow[j]);
+                acc += scores[s] * v;
             }
         }
         lora_sum[j] = acc / denom;
@@ -551,38 +666,48 @@ extern "C" int pulsar_mla_attention(
         float attn_factor,
         float beta_fast,
         float beta_slow,
-        float kq_mult) {
+        float kq_mult,
+        uint32_t kvq) {
     if (!heads_dev || !q_dev || !qk_low_dev || !kv_lora_cache_dev ||
         !k_rope_cache_dev || !v_b_dev || !selected_dev ||
         n_tokens == 0 || n_selected == 0 || cache_cap == 0 ||
         n_selected > cache_cap + 1u ||
         n_head == 0 || kv_lora_dim == 0 ||
         qk_nope == 0 || qk_rope == 0 || (qk_rope & 1u) != 0 ||
-        value_dim == 0) {
+        value_dim == 0 || kvq > 2u) {
         return 0;
     }
     const uint64_t smem =
         (256u + (uint64_t)n_selected + 2u * (uint64_t)kv_lora_dim
          + (uint64_t)(qk_rope >> 1)) * sizeof(float);
-    if (!mla_smem_ok((const void *)mla_attention_kernel, smem,
-                     "mla attention smem opt-in")) {
+    const void *kfn = kvq == 1u ? (const void *)mla_attention_kernel<1u>
+                    : kvq == 2u ? (const void *)mla_attention_kernel<2u>
+                                : (const void *)mla_attention_kernel<0u>;
+    if (!mla_smem_ok(kfn, smem, "mla attention smem opt-in")) {
         return 0;
     }
     const uint32_t qk_dim = qk_nope + qk_rope;
     dim3 grid(n_head, n_tokens, 1);
-    mla_attention_kernel<<<grid, 256, (size_t)smem>>>(
-            (float *)heads_dev,
-            (const float *)q_dev,
-            (const float *)qk_low_dev,
-            (const float *)kv_lora_cache_dev,
-            (const float *)k_rope_cache_dev,
-            (const char *)v_b_dev,
-            (const uint32_t *)selected_dev,
-            n_tokens, n_selected, cache_cap,
-            n_head, kv_lora_dim, qk_nope, qk_rope, value_dim, n_ctx_orig,
-            (uint32_t)mla_q8_row_bytes(kv_lora_dim),
-            kq_mult / sqrtf((float)qk_dim),
-            freq_base, freq_scale, ext_factor, attn_factor,
-            beta_fast, beta_slow);
+    #define MLA_ATTN_LAUNCH(KVQ)                                              \
+        mla_attention_kernel<KVQ><<<grid, 256, (size_t)smem>>>(               \
+                (float *)heads_dev,                                           \
+                (const float *)q_dev,                                         \
+                (const float *)qk_low_dev,                                    \
+                (const uint8_t *)kv_lora_cache_dev,                           \
+                (const uint8_t *)k_rope_cache_dev,                            \
+                (const char *)v_b_dev,                                        \
+                (const uint32_t *)selected_dev,                               \
+                n_tokens, n_selected, cache_cap,                              \
+                n_head, kv_lora_dim, qk_nope, qk_rope, value_dim, n_ctx_orig, \
+                (uint32_t)mla_q8_row_bytes(kv_lora_dim),                      \
+                kq_mult / sqrtf((float)qk_dim),                               \
+                freq_base, freq_scale, ext_factor, attn_factor,               \
+                beta_fast, beta_slow)
+    switch (kvq) {
+        case 1u: MLA_ATTN_LAUNCH(1u); break;
+        case 2u: MLA_ATTN_LAUNCH(2u); break;
+        default: MLA_ATTN_LAUNCH(0u); break;
+    }
+    #undef MLA_ATTN_LAUNCH
     return cuda_ok(cudaGetLastError(), "mla attention launch");
 }

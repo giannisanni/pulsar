@@ -15,6 +15,13 @@
 
 #[cfg(target_os = "linux")]
 mod real {
+    /// Bytes per GiB. Memory sizes are reported in GiB everywhere so a
+    /// printed number can be compared directly against a card's capacity;
+    /// mixing decimal GB with binary GiB under one "GB" label made a 69MiB
+    /// board difference read as a 0.1GB gap. Throughput stays decimal GB/s,
+    /// which is the convention for PCIe and NVMe.
+    const GIB: f64 = (1u64 << 30) as f64;
+
     mod dsv4;
     mod qwen35;
     pub use qwen35::{generate_dflash, DraftModel};
@@ -829,7 +836,15 @@ mod real {
         /// KV resident (Mla only). Attention weights are read every layer
         /// every token, so residency is the one job a bandwidth-crippled
         /// PCIe link can still do: only activations cross per layer.
+        /// Under the layer split this is the FIRST off-primary owner -
+        /// coarse is-offload-on-at-all gates key off it; per-layer sites
+        /// use attn_layer_dev.
         pub attn_dev: Option<i32>,
+        /// Per-exec-layer (+ MTP slot) owner of the ATTENTION stack
+        /// (weights, KV, idx cache, scratch) - Mla layer split. Contiguous
+        /// ranges by construction so the DSA selection list hops only at
+        /// range boundaries. All-attn_dev (or all-primary) when no split.
+        pub attn_layer_dev: Vec<i32>,
         /// Per-exec-layer owner device (dense split); all-primary
         /// everywhere else. Weights, KV, and GDN state live on the owner
         /// and the layer evals there.
@@ -1014,6 +1029,21 @@ mod real {
         pub host_budget: usize,
         /// model bytes resident in VRAM: fixed expert tiers + the VRAM slab cache
         pub vram_resident: usize,
+        /// total KV complex bytes at the CURRENT ctx (k/v caches + the DSA
+        /// indexer key cache, across every layer and owner device). Divided
+        /// by ctx this gives bytes-per-position, which is how a caller
+        /// projects whether a different ctx would fit.
+        pub kv_bytes: usize,
+        /// The format the KV actually resolved to, after PULSAR_KV and the
+        /// size-aware auto-default were both applied. A caller showing
+        /// "auto" needs this to say WHICH format auto landed on.
+        pub kv_resolved: &'static str,
+        /// Whether that KV is already in a compact format. False means a
+        /// LARGER ctx would likely cost ~3.9x less per position than
+        /// kv_bytes implies, because the auto-sizer switches to fp8 once
+        /// the f32 projection gets big - a projection that ignores this
+        /// rejects context sizes that would in fact load.
+        pub kv_compact: bool,
         /// cumulative per-stage wall time, seconds (see Prof)
         pub prof_gpu_wait: f64,
         pub prof_resolve: f64,
@@ -2540,55 +2570,10 @@ mod real {
                         }
                         ok
                     }),
-                    None => {
-                        // auto: largest-free secondary that fits the stack
-                        let mut need = 0u64;
-                        for il in 0..shape.n_exec_layer {
-                            for suf in [
-                                "attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight",
-                                "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight",
-                                "attn_k_b.weight", "attn_v_b.weight", "attn_output.weight",
-                            ] {
-                                if let Some(ti) = gguf.tensor(&format!("blk.{il}.{suf}")) {
-                                    need += ti.byte_size().unwrap_or(0);
-                                }
-                            }
-                        }
-                        // reserve: compact KV at ctx 4096 (both caches span
-                        // n_kv_lora + qk_rope) + scratch/hop buffers + CUDA
-                        // context overhead. Pinned overflow would be read
-                        // over the attn card's own link, so it must FIT.
-                        let kv = shape.n_exec_layer as u64
-                            * 4096
-                            * (shape.n_kv_lora + shape.qk_rope) as u64
-                            * 4;
-                        need += kv + (1 << 30);
-                        let mut best: Option<(usize, i32)> = None;
-                        for d in 0..kernels::device_count() {
-                            if d == primary {
-                                continue;
-                            }
-                            if let Ok((free, _)) = kernels::mem_info(d) {
-                                if free as u64 >= need && best.is_none_or(|(bf, _)| free > bf) {
-                                    best = Some((free, d));
-                                } else if (free as u64) < need {
-                                    eprintln!(
-                                        "pulsar: CUDA device {d} skipped for attn ({:.1}GB free < {:.1}GB needed)",
-                                        free as f64 / 1e9,
-                                        need as f64 / 1e9
-                                    );
-                                }
-                            }
-                        }
-                        best.map(|(free, d)| {
-                            eprintln!(
-                                "pulsar: auto-detected attn GPU: CUDA device {d} ({:.1}GB free, attn stack needs {:.1}GB)",
-                                free as f64 / 1e9,
-                                need as f64 / 1e9
-                            );
-                            d
-                        })
-                    }
+                    // auto: the layer-split planner below assigns per-layer
+                    // owners across every secondary; None here means "let
+                    // the planner decide", not "no offload"
+                    None => None,
                 },
                 // Gqa: opt-in only (PULSAR_ATTN_GPU=<idx>). Gqa attention is
                 // already VRAM-resident on the primary, so offloading is a
@@ -2610,8 +2595,100 @@ mod real {
                 // attn offload comes with the perf pass
                 Family::Dsv4 | Family::Qwen35 => None,
             };
-            if let Some(d) = attn_dev {
-                eprintln!("pulsar: attn weights + KV resident on CUDA device {d}");
+            // ---- MLA layer-split planner: per-layer attention ownership.
+            // Contiguous layer ranges spread across secondaries in
+            // proportion to their post-reserve free VRAM, so each card's
+            // KV/ctx headroom comes out even. Degenerates to one card (=
+            // the old auto-detect) when one secondary holds everything
+            // with headroom to spare, and to all-primary when there are no
+            // secondaries. PULSAR_ATTN_GPU=<d> still forces one card,
+            // =off forces primary.
+            let n_attn_slots = shape.n_exec_layer as usize + 1; // + MTP draft slot
+            let mut attn_layer_dev: Vec<i32> = vec![attn_dev.unwrap_or(primary); n_attn_slots];
+            if shape.family == Family::Mla
+                && attn_dev.is_none()
+                && std::env::var("PULSAR_ATTN_GPU").ok().as_deref().is_none_or(|v| v != "off" && v != "-1")
+            {
+                let mut lb = vec![0u64; shape.n_exec_layer as usize];
+                for il in 0..shape.n_exec_layer {
+                    for suf in [
+                        "attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight",
+                        "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight",
+                        "attn_k_b.weight", "attn_v_b.weight", "attn_output.weight",
+                        "indexer.attn_q_b.weight", "indexer.attn_k.weight",
+                        "indexer.k_norm.weight", "indexer.k_norm.bias",
+                        "indexer.proj.weight",
+                    ] {
+                        if let Some(ti) = gguf.tensor(&format!("blk.{il}.{suf}")) {
+                            lb[il as usize] += ti.byte_size().unwrap_or(0);
+                        }
+                    }
+                }
+                let mut cards: Vec<(usize, i32)> = (0..kernels::device_count())
+                    .filter(|&d| d != primary)
+                    .filter_map(|d| kernels::mem_info(d).ok().map(|(f, _)| (f, d)))
+                    .collect();
+                cards.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                // CUDA context + per-card scratch/hop buffers + slack; KV
+                // and idx cache sizes are ctx-dependent and resolved at
+                // State::new, which fails with a clear message when the
+                // requested ctx outgrows the per-card leftover.
+                let reserve: u64 = 5 << 28;
+                let caps: Vec<u64> = cards
+                    .iter()
+                    .map(|&(f, _)| (f as u64).saturating_sub(reserve))
+                    .collect();
+                let total_w: u64 = lb.iter().sum();
+                let total_cap: u64 = caps.iter().sum();
+                if !cards.is_empty() && total_cap > 0 {
+                    let spare = total_cap.saturating_sub(total_w);
+                    let mut il = 0usize;
+                    for (ci, &(_, d)) in cards.iter().enumerate() {
+                        // weight share = cap minus this card's even slice
+                        // of the spare headroom; last card sweeps rounding.
+                        // u128: spare * cap overflows u64 at ~16GB * 16GB
+                        let share = caps[ci]
+                            .saturating_sub((spare as u128 * caps[ci] as u128 / total_cap as u128) as u64);
+                        let mut used = 0u64;
+                        while il < lb.len()
+                            && (used + lb[il] <= share
+                                || (ci == cards.len() - 1 && used + lb[il] <= caps[ci]))
+                        {
+                            used += lb[il];
+                            attn_layer_dev[il] = d;
+                            il += 1;
+                        }
+                        if il >= lb.len() {
+                            break;
+                        }
+                    }
+                    if il < lb.len() {
+                        eprintln!(
+                            "pulsar: attn split: {} layers overflow every secondary and stay on the primary",
+                            lb.len() - il
+                        );
+                    }
+                }
+                // MTP draft slot runs right after the last layer
+                attn_layer_dev[shape.n_exec_layer as usize] =
+                    attn_layer_dev[(shape.n_exec_layer as usize).saturating_sub(1)];
+            }
+            let attn_dev = attn_layer_dev.iter().find(|&&d| d != primary).copied();
+            if attn_dev.is_some() {
+                // banner: one line per contiguous range
+                let mut i = 0usize;
+                while i < attn_layer_dev.len() - 1 {
+                    let d = attn_layer_dev[i];
+                    let mut j = i;
+                    while j + 1 < attn_layer_dev.len() - 1 && attn_layer_dev[j + 1] == d {
+                        j += 1;
+                    }
+                    eprintln!(
+                        "pulsar: attn layers {i}..={j} resident on CUDA device {d}{}",
+                        if d == primary { " (primary)" } else { "" }
+                    );
+                    i = j + 1;
+                }
             }
 
             // Dense qwen35 on 2+ cards: whole-layer ownership. The model
@@ -2684,9 +2761,9 @@ mod real {
                 }
                 let b1: u64 = lbytes[n0..].iter().sum();
                 eprintln!(
-                    "pulsar: dense split: layers 0..{n0} on device {primary}, {n0}..{} on device {second} ({:.1}GB)",
+                    "pulsar: dense split: layers 0..{n0} on device {primary}, {n0}..{} on device {second} ({:.1}GiB)",
                     lbytes.len(),
-                    b1 as f64 / 1e9
+                    b1 as f64 / GIB
                 );
             }
 
@@ -2901,10 +2978,10 @@ mod real {
                     let cap = (free as i64) - (9i64 << 30);
                     if cap > 0 && attn_vram_budget > cap {
                         eprintln!(
-                            "pulsar: attn VRAM budget clamped {:.1} -> {:.1}GB (free {:.1}GB)",
-                            attn_vram_budget as f64 / 1e9,
-                            cap as f64 / 1e9,
-                            free as f64 / 1e9
+                            "pulsar: attn VRAM budget clamped {:.1} -> {:.1}GiB (free {:.1}GiB)",
+                            attn_vram_budget as f64 / GIB,
+                            cap as f64 / GIB,
+                            free as f64 / GIB
                         );
                         attn_vram_budget = cap;
                     }
@@ -3055,8 +3132,11 @@ mod real {
                         },
                     }
                 };
-                if let Some(d) = attn_dev {
-                    kernels::set_device(d)?;
+                // attention stack lands on this layer's owner (the
+                // layer split can spread ranges across secondaries)
+                let a_dev = attn_layer_dev.get(il as usize).copied().unwrap_or(primary);
+                if a_dev != primary {
+                    kernels::set_device(a_dev)?;
                 }
                 let attn = match shape.family {
                     Family::Gqa => Attn::Gqa {
@@ -3237,7 +3317,7 @@ mod real {
                 } else {
                     upload_attn(&file, &gguf, &t("attn_output.weight"), &mut *attn_vram_budget)?
                 };
-                if attn_dev.is_some() {
+                if a_dev != primary {
                     kernels::set_device(primary)?;
                 }
                 let gemma = if gemma_arch {
@@ -3396,15 +3476,15 @@ mod real {
                                     }
                                 }
                                 eprintln!(
-                                    "pulsar: MTP draft experts resident ({:.1}GB, all {} triples)",
-                                    total as f64 / 1e9,
+                                    "pulsar: MTP draft experts resident ({:.1}GiB, all {} triples)",
+                                    total as f64 / GIB,
                                     shape.n_expert
                                 );
                                 res_pool = pool;
                             }
                             Err(_) => eprintln!(
-                                "pulsar: MTP expert residency didn't fit ({:.1}GB needed) - drafts will stream",
-                                total as f64 / 1e9
+                                "pulsar: MTP expert residency didn't fit ({:.1}GiB needed) - drafts will stream",
+                                total as f64 / GIB
                             ),
                         }
                     }
@@ -3527,6 +3607,7 @@ mod real {
                 output,
                 layers,
                 attn_dev,
+                attn_layer_dev,
                 layer_dev,
                 mtp,
                 mtp_depth,
@@ -3705,9 +3786,9 @@ mod real {
             }
             kernels::set_device(primary)?;
             eprintln!(
-                "pulsar: expert tier on CUDA device {d}: {} triples ({:.1}GB) resident in {:.1}s",
+                "pulsar: expert tier on CUDA device {d}: {} triples ({:.1}GiB) resident in {:.1}s",
                 tier.map.len() / 3,
-                cursor as f64 / 1e9,
+                cursor as f64 / GIB,
                 t0.elapsed().as_secs_f32()
             );
             tiers.push(tier);
@@ -3717,6 +3798,26 @@ mod real {
 
     /// Per-decode device state: activation buffers, KV caches, the routed
     /// expert staging arena, and reusable host staging.
+    /// See State.attn_sc.
+    struct MlaScratch {
+        dev: i32,
+        normed_a: DeviceBuf,
+        attn_out_a: DeviceBuf,
+        q_rank: DeviceBuf,
+        q_rank_norm: DeviceBuf,
+        q: DeviceBuf,
+        kv_raw: DeviceBuf,
+        kv_norm: DeviceBuf,
+        qk_low: DeviceBuf,
+        heads: DeviceBuf,
+        idx_kraw: DeviceBuf,
+        idx_q: DeviceBuf,
+        idx_q16: DeviceBuf,
+        idx_w: DeviceBuf,
+        idx_scores: DeviceBuf,
+        mla_selected: DeviceBuf,
+    }
+
     pub struct State {
         ctx: u32,
         max_batch: u32,
@@ -3758,14 +3859,27 @@ mod real {
         /// Disable async expert H2D (PULSAR_NO_ASYNC_H2D=1) — blocking path.
         async_expert_h2d: bool,
         expert_ptrs: DeviceBuf,
+        /// Per-device attention scratch for the Mla layer split: every
+        /// buffer the attn segment touches, replicated once per distinct
+        /// owner in attn_layer_dev. Single-card offload = one entry.
+        /// Non-Mla families keep the flat fields below.
+        attn_sc: Vec<MlaScratch>,
+        /// Device holding the live DSA selection list (mla_selected of
+        /// that device's scratch); -1 = none written yet. Reuse layers on
+        /// a different owner copy the list across before attending.
+        sel_dev: i32,
         kcache: Vec<DeviceBuf>,
         vcache: Vec<DeviceBuf>,
         /// Gqa KV storage format (kvq). 0=f32 (exact, default), 1=fp8
         /// e4m3 + per-row scale, 2=fp16, 3=int8 + per-row scale, 4=q8_0,
         /// 5=q4_0. All lossy formats opt-in via PULSAR_KV=<fmt>; the
-        /// default f32 path keeps bit-exact guarantees. MLA/Dsv4 keep
-        /// their own caches as-is.
+        /// default f32 path keeps bit-exact guarantees. Dsv4 keeps its
+        /// own cache as-is.
         kvq: u32,
+        /// MLA latent KV storage format. 0=f32, 1=fp8 e4m3 + per-row
+        /// scale, 2=fp16. Applies to both the latent rows and the rope
+        /// tail; strides must match mla_lat_stride on the kernel side.
+        kvq_lat: u32,
         /// Whether K/Q are rotated by `pi` (orthogonal Π) before block-quant.
         /// turbo4/turbo8 set this true. Drops back to false with a warning if
         /// qk_dim exceeds head_dim (q and qrot strides would disagree) or if Π
@@ -4134,6 +4248,22 @@ mod real {
                 host_used: self.store.used,
                 host_budget: self.store.budget,
                 vram_resident,
+                kv_resolved: match (self.kvq, self.kvq_lat) {
+                    (1, _) | (_, 1) => "fp8",
+                    (2, _) | (_, 2) => "fp16",
+                    (3, _) => "int8",
+                    (4, _) => if self.kvq_rot { "turbo8" } else { "q8_0" },
+                    (5, _) => if self.kvq_rot { "turbo4" } else { "q4_0" },
+                    _ => "f32",
+                },
+                kv_compact: self.kvq != 0 || self.kvq_lat != 0,
+                kv_bytes: self
+                    .kcache
+                    .iter()
+                    .chain(self.vcache.iter())
+                    .chain(self.idx_kcache.iter())
+                    .map(|b| b.bytes())
+                    .sum(),
                 prof_gpu_wait: s(self.prof.sync),
                 prof_resolve: s(self.prof.resolve),
                 prof_h2d: s(self.prof.h2d),
@@ -4432,6 +4562,58 @@ mod real {
                 // MLA/Dsv4 carry their own compact latent caches
                 Family::Mla | Family::Dsv4 => false,
             };
+            // The MLA latent cache has its own quantized formats (fp8/fp16,
+            // kvq_lat below) through mla_store_compact_kv/mla_attention;
+            // Dsv4 keeps its reference fp8-sim path and stays f32 here.
+            let kv_lat_ok = s.family == Family::Mla;
+            // f32 KV projection across exec layers (+ MTP slot), mirroring
+            // the per-layer sizing loop below. Only consulted for kv_ok /
+            // kv_lat_ok families, so the qwen35-dense and Dsv4 shapes never
+            // reach it.
+            let kv_f32_total = || -> usize {
+                let slots = s.n_exec_layer as usize + usize::from(m.mtp.is_some());
+                (0..slots)
+                    .map(|i| {
+                        if s.family == Family::Mla {
+                            (s.n_kv_lora + s.qk_rope) as usize * ctx as usize * 4
+                        } else if s.family == Family::Qwen35 {
+                            if i == s.n_exec_layer as usize
+                                || (i as u32 + 1) % s.full_attn_interval == 0
+                            {
+                                2 * s.n_head_kv as usize * ctx as usize * s.head_dim as usize * 4
+                            } else {
+                                8
+                            }
+                        } else {
+                            let (hkv, hd) = match m.geom.get(i) {
+                                Some(g) => (g.n_head_kv as usize, g.head_dim as usize),
+                                None => (s.n_head_kv as usize, s.head_dim as usize),
+                            };
+                            2 * hkv * ctx as usize * hd * 4
+                        }
+                    })
+                    .sum()
+            };
+            // Shared adaptive-default rule (see the None arm below for the
+            // full rationale): big f32 KV on a streaming model silently
+            // starves the expert cache, so above 2GB absolute AND a third
+            // of the KV card's free VRAM the default flips to fp8.
+            let kv_auto_fp8 = |total: usize| -> bool {
+                let kv_dev = m.attn_dev.unwrap_or_else(kernels::get_device);
+                let free = kernels::mem_info(kv_dev).map(|(f, _)| f).unwrap_or(usize::MAX);
+                if total > (2usize << 30) && total > free / 3 {
+                    eprintln!(
+                        "pulsar: KV auto: f32 KV at ctx {} would be {:.1}GiB of {:.1}GiB free -> defaulting to fp8 ({:.1}GiB); set PULSAR_KV=f32 to force exact f32 KV",
+                        ctx,
+                        total as f64 / GIB,
+                        free as f64 / GIB,
+                        total as f64 / 3.9e9,
+                    );
+                    true
+                } else {
+                    false
+                }
+            };
             let (kvq, kvq_rot) = if kv_ok {
                 let (q, rot) = match kv_req.as_deref() {
                     Some("fp8") => (1, false),
@@ -4441,6 +4623,18 @@ mod real {
                     Some("q4_0") | Some("q4") => (5, false),
                     Some("turbo8") | Some("rotq8") | Some("turboq8") => (4, true),
                     Some("turbo4") | Some("rotq4") | Some("turboq4") => (5, true),
+                    None => {
+                        // A too-big f32 KV never OOMs on a streaming model -
+                        // it silently eats the expert cache instead (measured:
+                        // gpt-oss ctx 131072 one card, f32 left 0.4GB of
+                        // expert cache and prefill chunk 4; fp8 left 9.7GB
+                        // and chunk 256). So when nothing was requested and
+                        // the projection is both large and a big share of
+                        // the KV card's free VRAM, default to fp8. The 2GB
+                        // absolute floor keeps small-ctx runs (bench.sh 512,
+                        // check.sh 256) on the bit-exact f32 path.
+                        if kv_auto_fp8(kv_f32_total()) { (1, false) } else { (0, false) }
+                    }
                     _ => (0, false),
                 };
                 // Rotation writes head_dim-strided vectors into qrot, which is
@@ -4462,13 +4656,34 @@ mod real {
                     (q, rot)
                 }
             } else {
-                if kv_req.as_deref().is_some_and(|v| !v.is_empty() && v != "f32") {
+                if !kv_lat_ok && kv_req.as_deref().is_some_and(|v| !v.is_empty() && v != "f32") {
                     eprintln!(
                         "pulsar: PULSAR_KV={} ignored - this arch keeps its f32 KV cache (quantized KV unsupported here)",
                         kv_req.as_deref().unwrap_or("")
                     );
                 }
                 (0, false)
+            };
+            // MLA latent storage format: 0=f32 (exact), 1=fp8 e4m3 +
+            // per-row scale (~3.9x), 2=fp16 (2x). Block formats need
+            // head-shaped rows, which the flat latent is not.
+            let kvq_lat: u32 = if kv_lat_ok {
+                match kv_req.as_deref() {
+                    Some("fp8") => 1,
+                    Some("fp16") | Some("f16") => 2,
+                    None => {
+                        if kv_auto_fp8(kv_f32_total()) { 1 } else { 0 }
+                    }
+                    Some(v) if !v.is_empty() && v != "f32" => {
+                        eprintln!(
+                            "pulsar: PULSAR_KV={v} unsupported for the MLA latent cache (fp8|fp16|f32 only) - keeping f32"
+                        );
+                        0
+                    }
+                    _ => 0,
+                }
+            } else {
+                0
             };
             let kv_row = |hd: usize| match kvq {
                 0 => hd * 4,
@@ -4478,14 +4693,21 @@ mod real {
                 5 => (hd / 32) * 18,  // q4_0: 18 B / 32 elems
                 _ => hd * 4,
             };
+            // fp8 latent rows carry one f32 scale at the tail, mirroring
+            // the GQA fp8 layout (and mla_lat_stride on the kernel side)
+            let lat_row = |d: usize| match kvq_lat {
+                1 => d + 4,
+                2 => d * 2,
+                _ => d * 4,
+            };
             let (k_bytes, v_bytes) = match s.family {
                 Family::Gqa => {
                     let b = s.n_head_kv as usize * ctx as usize * kv_row(s.head_dim as usize);
                     (b, b)
                 }
                 Family::Mla => (
-                    ctx as usize * s.n_kv_lora as usize * 4,
-                    ctx as usize * s.qk_rope as usize * 4,
+                    ctx as usize * lat_row(s.n_kv_lora as usize),
+                    ctx as usize * lat_row(s.qk_rope as usize),
                 ),
                 // raw SWA ring in kcache; the compressed-row cache rides
                 // vcache, sized per layer in the loop below
@@ -4505,9 +4727,9 @@ mod real {
                     _ => if kvq_rot { "turbo4" } else { "q4_0" },
                 };
                 eprintln!(
-                    "pulsar: {name} KV cache on ({:.2} GB -> {:.2} GB over {} layers)",
-                    (full * 2 * s.n_exec_layer as usize) as f64 / 1e9,
-                    ((k_bytes + v_bytes) * s.n_exec_layer as usize) as f64 / 1e9,
+                    "pulsar: {name} KV cache on ({:.2} GiB -> {:.2} GiB over {} layers)",
+                    (full * 2 * s.n_exec_layer as usize) as f64 / GIB,
+                    ((k_bytes + v_bytes) * s.n_exec_layer as usize) as f64 / GIB,
                     s.n_exec_layer,
                 );
                 // q8_0/q4_0 kernels require 32-wide blocks; a non-multiple head_dim
@@ -4525,6 +4747,16 @@ mod real {
                         s.head_dim,
                     );
                 }
+            }
+            if kvq_lat != 0 {
+                let full = (s.n_kv_lora + s.qk_rope) as usize * ctx as usize * 4;
+                eprintln!(
+                    "pulsar: {} MLA latent KV cache on ({:.2} GiB -> {:.2} GiB over {} layers)",
+                    if kvq_lat == 1 { "fp8" } else { "fp16" },
+                    (full * s.n_exec_layer as usize) as f64 / GIB,
+                    ((k_bytes + v_bytes) * s.n_exec_layer as usize) as f64 / GIB,
+                    s.n_exec_layer,
+                );
             }
             // batch prefill: activations sized for max_batch tokens; the
             // logits/lm-head path stays single-row (last token only)
@@ -4565,11 +4797,15 @@ mod real {
             let mut vcache = Vec::new();
             let n_kv_slots = s.n_exec_layer as usize + usize::from(m.mtp.is_some());
             let dense_split = m.layer_dev.iter().any(|&d| d != primary);
+            let attn_split = m.attn_layer_dev.windows(2).any(|w| w[0] != w[1]);
             for i in 0..n_kv_slots {
                 if dense_split {
                     // dense split: KV lives with its layer (MTP slot ->
                     // primary, where the tail runs)
                     kernels::set_device(m.layer_dev.get(i).copied().unwrap_or(primary))?;
+                } else if attn_split {
+                    // attn layer split: KV lives with its layer's owner
+                    kernels::set_device(m.attn_layer_dev.get(i).copied().unwrap_or(primary))?;
                 }
                 // per-layer geometry (gemma4): a SWA layer's cache is its
                 // own kv width, not the Shape max
@@ -4612,34 +4848,83 @@ mod real {
             }
             if dense_split {
                 kernels::set_device(primary)?;
+            } else if attn_split {
+                kernels::set_device(m.attn_dev.unwrap_or(primary))?;
             }
-            let q = f32s(mb * s.n_head * s.head_dim.max(s.qk_dim()))?;
-            let heads = f32s(mb * s.heads_dim().max(s.n_head * s.head_dim))?;
-            let q_rank = f32s(mb * s.n_lora_q.max(1))?;
-            let q_rank_norm = f32s(mb * s.n_lora_q.max(1))?;
-            let kv_raw = f32s(mb * (s.n_kv_lora + s.qk_rope).max(1))?;
-            let kv_norm = f32s(mb * s.n_kv_lora.max(1))?;
-            let qk_low = f32s(mb * s.n_head * s.n_kv_lora.max(1))?;
-            let mla_selected = DeviceBuf::alloc(mb as usize * ctx as usize * 4)?;
+            // Mla keeps its attention scratch in attn_sc (one set per
+            // owner device); the flat fields become stubs so the single-
+            // card case pays no duplicate VRAM
+            let mla = s.family == Family::Mla;
+            let q = f32s(if mla { 1 } else { mb * s.n_head * s.head_dim.max(s.qk_dim()) })?;
+            let heads = f32s(if mla { 1 } else { mb * s.heads_dim().max(s.n_head * s.head_dim) })?;
+            let q_rank = f32s(if mla { 1 } else { mb * s.n_lora_q.max(1) })?;
+            let q_rank_norm = f32s(if mla { 1 } else { mb * s.n_lora_q.max(1) })?;
+            let kv_raw = f32s(if mla { 1 } else { mb * (s.n_kv_lora + s.qk_rope).max(1) })?;
+            let kv_norm = f32s(if mla { 1 } else { mb * s.n_kv_lora.max(1) })?;
+            let qk_low = f32s(if mla { 1 } else { mb * s.n_head * s.n_kv_lora.max(1) })?;
+            let mla_selected = DeviceBuf::alloc(if mla { 4 } else { mb as usize * ctx as usize * 4 })?;
             // DSA indexer buffers live beside the attn stack (same device)
             let has_idx = s.n_idx_topk > 0 && s.family == Family::Mla;
             let mut idx_kcache = Vec::new();
             // n_kv_slots, not n_exec_layer: the MTP draft layer runs the
             // same MLA path as slot n_exec_layer and maintains its own
             // indexer keys
+            // f16 keys by default; fp8 (e4m3 + f32 row scale) rides the
+            // same PULSAR_KV=fp8 that quantizes the latent cache
+            let idx8 = (kvq_lat == 1) as u32;
+            let idx_row = if idx8 != 0 { s.n_idx_dim as usize + 4 } else { s.n_idx_dim as usize * 2 };
             for il in 0..n_kv_slots {
+                if attn_split {
+                    kernels::set_device(m.attn_layer_dev.get(il).copied().unwrap_or(primary))?;
+                }
                 idx_kcache.push(if has_idx && uses_full_indexer(il, s.n_leading_dense) {
-                    DeviceBuf::alloc(ctx as usize * s.n_idx_dim as usize * 2)? // f16 keys
+                    DeviceBuf::alloc(ctx as usize * idx_row)?
                 } else {
                     f32s(1)?
                 });
             }
-            let idx_kraw = f32s(if has_idx { mb * s.n_idx_dim } else { 1 })?;
-            let idx_q = f32s(if has_idx { mb * s.n_idx_head * s.n_idx_dim } else { 1 })?;
-            let idx_q16 = DeviceBuf::alloc(if has_idx { (mb * s.n_idx_head * s.n_idx_dim) as usize * 2 } else { 1 })?;
-            let idx_w = f32s(if has_idx { mb * s.n_idx_head } else { 1 })?;
-            let idx_scores = f32s(if has_idx { mb * ctx } else { 1 })?;
-            let (normed_a, attn_out_a) = if m.attn_dev.is_some() {
+            if attn_split {
+                kernels::set_device(m.attn_dev.unwrap_or(primary))?;
+            }
+            let idx_kraw = f32s(if has_idx && !mla { mb * s.n_idx_dim } else { 1 })?;
+            let idx_q = f32s(if has_idx && !mla { mb * s.n_idx_head * s.n_idx_dim } else { 1 })?;
+            let idx_q16 = DeviceBuf::alloc(if has_idx && !mla { (mb * s.n_idx_head * s.n_idx_dim) as usize * 2 } else { 1 })?;
+            let idx_w = f32s(if has_idx && !mla { mb * s.n_idx_head } else { 1 })?;
+            let idx_scores = f32s(if has_idx && !mla { mb * ctx } else { 1 })?;
+            // per-owner attention scratch (Mla only; see MlaScratch)
+            let mut attn_sc: Vec<MlaScratch> = Vec::new();
+            if mla {
+                let mut devs: Vec<i32> = Vec::new();
+                for &d in m.attn_layer_dev.iter() {
+                    if !devs.contains(&d) {
+                        devs.push(d);
+                    }
+                }
+                for d in devs {
+                    kernels::set_device(d)?;
+                    let off = d != primary; // hop buffers only exist off-primary
+                    attn_sc.push(MlaScratch {
+                        dev: d,
+                        normed_a: f32s(if off { mb * s.n_embd } else { 1 })?,
+                        attn_out_a: f32s(if off { mb * s.n_embd } else { 1 })?,
+                        q_rank: f32s(mb * s.n_lora_q.max(1))?,
+                        q_rank_norm: f32s(mb * s.n_lora_q.max(1))?,
+                        q: f32s(mb * s.n_head * s.head_dim.max(s.qk_dim()))?,
+                        kv_raw: f32s(mb * (s.n_kv_lora + s.qk_rope).max(1))?,
+                        kv_norm: f32s(mb * s.n_kv_lora.max(1))?,
+                        qk_low: f32s(mb * s.n_head * s.n_kv_lora.max(1))?,
+                        heads: f32s(mb * s.heads_dim().max(s.n_head * s.head_dim))?,
+                        idx_kraw: f32s(if has_idx { mb * s.n_idx_dim } else { 1 })?,
+                        idx_q: f32s(if has_idx { mb * s.n_idx_head * s.n_idx_dim } else { 1 })?,
+                        idx_q16: DeviceBuf::alloc(if has_idx { (mb * s.n_idx_head * s.n_idx_dim) as usize * 2 } else { 1 })?,
+                        idx_w: f32s(if has_idx { mb * s.n_idx_head } else { 1 })?,
+                        idx_scores: f32s(if has_idx { mb * ctx } else { 1 })?,
+                        mla_selected: DeviceBuf::alloc(mb as usize * ctx as usize * 4)?,
+                    });
+                }
+                kernels::set_device(m.attn_dev.unwrap_or(primary))?;
+            }
+            let (normed_a, attn_out_a) = if m.attn_dev.is_some() && !mla {
                 (f32s(mb * s.n_embd)?, f32s(mb * s.n_embd)?)
             } else {
                 (f32s(1)?, f32s(1)?)
@@ -4836,6 +5121,7 @@ mod real {
                 kcache,
                 vcache,
                 kvq,
+                kvq_lat,
                 kvq_rot,
                 pi,
                 krot,
@@ -4862,6 +5148,8 @@ mod real {
                 kv_norm,
                 qk_low,
                 mla_selected,
+                attn_sc,
+                sel_dev: -1,
                 idx_kcache,
                 idx_kraw,
                 idx_q16,
@@ -5039,12 +5327,41 @@ mod real {
                     st.staging_alt = DeviceBuf::alloc(1)?;
                     st.max_batch = (chunk as u32).clamp(1, st.max_batch);
                     eprintln!(
-                        "pulsar: auto budget: {:.1}GB VRAM free -> expert cache {:.1}GB, staging {:.1}GB, prefill chunk {}",
-                        free as f64 / 1e9,
-                        dev_bytes as f64 / 1e9,
-                        staging_bytes as f64 / 1e9,
+                        "pulsar: auto budget: {:.1}GiB VRAM free -> expert cache {:.1}GiB, staging {:.1}GiB, prefill chunk {}",
+                        free as f64 / GIB,
+                        dev_bytes as f64 / GIB,
+                        staging_bytes as f64 / GIB,
                         st.max_batch,
                     );
+                    // A starved budget still "succeeds" - it just decodes at
+                    // a tenth of the speed (prefill chunk 4, sub-GB cache).
+                    // When the KV cache is the dominant eater on this card,
+                    // say so and name the remedy instead of leaving a
+                    // correct-looking line that hides the cause.
+                    let kv_here: usize = st
+                        .kcache
+                        .iter()
+                        .chain(st.vcache.iter())
+                        .map(|b| b.bytes())
+                        .sum();
+                    let kv_on_primary = m.attn_dev.map_or(true, |d| d == primary) && !dense_split;
+                    if kv_on_primary
+                        && (st.max_batch <= 16 || dev_bytes < (1 << 30))
+                        && kv_here > (free + kv_here) / 3
+                    {
+                        eprintln!(
+                            "pulsar: WARNING: KV cache ({:.1}GiB at ctx {}) is starving the expert budget; {}",
+                            kv_here as f64 / GIB,
+                            st.ctx,
+                            if (kv_ok && kvq == 0) || (kv_lat_ok && kvq_lat == 0) {
+                                "set PULSAR_KV=fp8 (~4x smaller) or lower --ctx"
+                            } else if kv_ok || kv_lat_ok {
+                                "lower --ctx (KV is already quantized)"
+                            } else {
+                                "lower --ctx (this arch's KV cannot be quantized yet)"
+                            },
+                        );
+                    }
                 }
             }
 
@@ -5285,6 +5602,9 @@ mod real {
                 // attention
                 kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, n_tok, eps)?;
                 let mut attn_output_w: &DeviceBuf = &l.attn_output;
+                // Mla runs its output projection inside the arm (per-layer
+                // owner device); the common tail below must not re-run it
+                let mut mla_attn_done = false;
                 match &l.attn {
                     // dsv4/qwen35 have their own graphs
                     Attn::Dsv4(_) | Attn::Qwen35(_) => {
@@ -5503,25 +5823,52 @@ mod real {
                             }
                         }
 
-                        // attn-GPU offload: hop the normed input over,
-                        // run the whole segment there. Blocking copies are
+                        // layer split: this layer's owner runs the
+                        // whole attention segment; hop the normed input
+                        // over when off-primary. Blocking copies are
                         // legacy-stream ordered on the issuing device, so
                         // producer kernels have landed before they run.
-                        if let Some(d) = self.attn_dev {
-                            kernels::copy_across(&mut st.normed_a, &st.normed, (n_tok * s.n_embd) as usize * 4)?;
-                            kernels::set_device(d)?;
+                        let a_dev = self.attn_layer_dev.get(il as usize).copied().unwrap_or(primary);
+                        let sci = st
+                            .attn_sc
+                            .iter()
+                            .position(|x| x.dev == a_dev)
+                            .ok_or("mla attn scratch missing for owner device")?;
+                        // DSA selection reuse crosses layers: when the live
+                        // list was written on a different owner, copy it
+                        // over before anything on this card reads it. The
+                        // planner keeps ranges contiguous, so this fires
+                        // once per boundary per chunk (~n_tok*topk*4 B).
+                        if st.sel_dev >= 0 && st.sel_dev != a_dev && st.idx_last_sel > 0 {
+                            if let Some(pi) = st.attn_sc.iter().position(|x| x.dev == st.sel_dev) {
+                                let bytes = (n_tok * st.idx_last_sel) as usize * 4;
+                                let (src_sc, dst_sc) = if pi < sci {
+                                    let (l_h, r_h) = st.attn_sc.split_at_mut(sci);
+                                    (&l_h[pi], &mut r_h[0])
+                                } else {
+                                    let (l_h, r_h) = st.attn_sc.split_at_mut(pi);
+                                    (&r_h[0], &mut l_h[sci])
+                                };
+                                kernels::copy_across(&mut dst_sc.mla_selected, &src_sc.mla_selected, bytes)?;
+                                st.sel_dev = a_dev;
+                            }
                         }
-                        let xin = if self.attn_dev.is_some() { &st.normed_a } else { &st.normed };
+                        let sc = &mut st.attn_sc[sci];
+                        if a_dev != primary {
+                            kernels::copy_across(&mut sc.normed_a, &st.normed, (n_tok * s.n_embd) as usize * 4)?;
+                            kernels::set_device(a_dev)?;
+                        }
+                        let xin = if a_dev != primary { &sc.normed_a } else { &st.normed };
 
                         let rope = s.rope_cfg();
                         let kv_raw_dim = s.n_kv_lora + s.qk_rope;
-                        kernels::matmul_q8_0(&mut st.q_rank, q_a_w, xin, s.n_embd, s.n_lora_q, n_tok)?;
-                        kernels::rms_norm(&mut st.q_rank_norm, &st.q_rank, q_a_norm, s.n_lora_q, n_tok, eps)?;
-                        kernels::matmul_q8_0(&mut st.q, q_b_w, &st.q_rank_norm, s.n_lora_q, s.n_head * s.qk_dim(), n_tok)?;
-                        kernels::mla_rope_tail(&mut st.q, n_tok, s.n_head, s.qk_dim(), s.qk_rope, pos0, &rope)?;
-                        kernels::matmul_q8_0(&mut st.kv_raw, kv_a_w, xin, s.n_embd, kv_raw_dim, n_tok)?;
-                        kernels::mla_kv_lora_rms_norm(&mut st.kv_norm, &st.kv_raw, kv_a_norm, n_tok, kv_raw_dim, s.n_kv_lora, eps)?;
-                        kernels::mla_store_compact_kv(&mut st.kcache[il], &mut st.vcache[il], &st.kv_norm, &st.kv_raw, pos0, n_tok, st.ctx, kv_raw_dim, s.n_kv_lora, s.qk_rope)?;
+                        kernels::matmul_q8_0(&mut sc.q_rank, q_a_w, xin, s.n_embd, s.n_lora_q, n_tok)?;
+                        kernels::rms_norm(&mut sc.q_rank_norm, &sc.q_rank, q_a_norm, s.n_lora_q, n_tok, eps)?;
+                        kernels::matmul_q8_0(&mut sc.q, q_b_w, &sc.q_rank_norm, s.n_lora_q, s.n_head * s.qk_dim(), n_tok)?;
+                        kernels::mla_rope_tail(&mut sc.q, n_tok, s.n_head, s.qk_dim(), s.qk_rope, pos0, &rope)?;
+                        kernels::matmul_q8_0(&mut sc.kv_raw, kv_a_w, xin, s.n_embd, kv_raw_dim, n_tok)?;
+                        kernels::mla_kv_lora_rms_norm(&mut sc.kv_norm, &sc.kv_raw, kv_a_norm, n_tok, kv_raw_dim, s.n_kv_lora, eps)?;
+                        kernels::mla_store_compact_kv(&mut st.kcache[il], &mut st.vcache[il], &sc.kv_norm, &sc.kv_raw, pos0, n_tok, st.ctx, kv_raw_dim, s.n_kv_lora, s.qk_rope, st.kvq_lat)?;
                         // DSA selection: within top_k every token sees the
                         // full range (bit-identical to the pre-indexer
                         // path). Beyond it, indexer layers score + top-k
@@ -5533,39 +5880,41 @@ mod real {
                         if let (Some(idx), true) = (indexer, is_idx_layer) {
                             // maintain this layer's indexer K cache (xin =
                             // the attn-device copy of normed under offload)
-                            kernels::matmul_q8_0(&mut st.idx_kraw, &idx.k, xin, s.n_embd, s.n_idx_dim, n_tok)?;
-                            kernels::idx_store_k(&st.idx_kraw, &idx.k_norm, &idx.k_norm_b, &mut st.idx_kcache[il], pos0, n_tok, st.ctx, s.n_idx_dim, s.qk_rope, s.rms_eps, &s.rope_cfg(), 0.0, 1.0)?;
+                            kernels::matmul_q8_0(&mut sc.idx_kraw, &idx.k, xin, s.n_embd, s.n_idx_dim, n_tok)?;
+                            kernels::idx_store_k(&sc.idx_kraw, &idx.k_norm, &idx.k_norm_b, &mut st.idx_kcache[il], pos0, n_tok, st.ctx, s.n_idx_dim, s.qk_rope, s.rms_eps, &s.rope_cfg(), 0.0, 1.0, (st.kvq_lat == 1) as u32)?;
                         }
                         let n_sel = if topk == 0 || visible <= topk {
-                            kernels::mla_fill_selected_range(&mut st.mla_selected, n_tok, pos0, visible, st.ctx)?;
+                            kernels::mla_fill_selected_range(&mut sc.mla_selected, n_tok, pos0, visible, st.ctx)?;
                             st.idx_last_sel = visible;
+                            st.sel_dev = a_dev;
                             visible
                         } else if is_idx_layer && indexer.is_some() {
                             let idx = indexer.as_ref().unwrap();
-                            kernels::matmul_q8_0(&mut st.idx_q, &idx.q_b, &st.q_rank_norm, s.n_lora_q, s.n_idx_head * s.n_idx_dim, n_tok)?;
-                            kernels::idx_rope0(&mut st.idx_q, n_tok, s.n_idx_head, s.n_idx_dim, s.qk_rope, pos0, &s.rope_cfg(), 0.0, 1.0)?;
+                            kernels::matmul_q8_0(&mut sc.idx_q, &idx.q_b, &sc.q_rank_norm, s.n_lora_q, s.n_idx_head * s.n_idx_dim, n_tok)?;
+                            kernels::idx_rope0(&mut sc.idx_q, n_tok, s.n_idx_head, s.n_idx_dim, s.qk_rope, pos0, &s.rope_cfg(), 0.0, 1.0)?;
                             // ds4 feeds proj the pre-norm residual (cur).
                             // Under attn offload cur is on the primary;
                             // borrow attn_out_a as the hop buffer - it is
                             // not written until the output projection.
-                            if self.attn_dev.is_some() {
-                                kernels::copy_across(&mut st.attn_out_a, &st.cur, (n_tok * s.n_embd) as usize * 4)?;
-                                kernels::matmul_f32(&mut st.idx_w, &idx.proj, &st.attn_out_a, s.n_embd, s.n_idx_head, n_tok)?;
+                            if a_dev != primary {
+                                kernels::copy_across(&mut sc.attn_out_a, &st.cur, (n_tok * s.n_embd) as usize * 4)?;
+                                kernels::matmul_f32(&mut sc.idx_w, &idx.proj, &sc.attn_out_a, s.n_embd, s.n_idx_head, n_tok)?;
                             } else {
-                                kernels::matmul_f32(&mut st.idx_w, &idx.proj, &st.cur, s.n_embd, s.n_idx_head, n_tok)?;
+                                kernels::matmul_f32(&mut sc.idx_w, &idx.proj, &st.cur, s.n_embd, s.n_idx_head, n_tok)?;
                             }
                             let scale = 1.0 / ((s.n_idx_dim * s.n_idx_head) as f32).sqrt();
                             if n_tok == 1 {
-                                kernels::idx_score_one(&mut st.idx_scores, &st.idx_q, &st.idx_w, &st.idx_kcache[il], visible, s.n_idx_head, s.n_idx_dim, scale)?;
-                                kernels::idx_topk(&mut st.mla_selected, &st.idx_scores, visible, topk)?;
+                                kernels::idx_score_one(&mut sc.idx_scores, &sc.idx_q, &sc.idx_w, &st.idx_kcache[il], visible, s.n_idx_head, s.n_idx_dim, scale, (st.kvq_lat == 1) as u32)?;
+                                kernels::idx_topk(&mut sc.mla_selected, &sc.idx_scores, visible, topk)?;
                             } else {
                                 // batch: every token in a post-boundary
                                 // chunk has >= top_k visible rows (the
                                 // forward_rows split guarantees it)
-                                kernels::idx_scores_batch(&mut st.idx_scores, &st.idx_q, &st.idx_w, &st.idx_kcache[il], Some(&mut st.idx_q16), visible, n_tok, pos0, s.n_idx_head, s.n_idx_dim, scale)?;
-                                kernels::idx_topk_batch(&mut st.mla_selected, &st.idx_scores, visible, n_tok, topk)?;
+                                kernels::idx_scores_batch(&mut sc.idx_scores, &sc.idx_q, &sc.idx_w, &st.idx_kcache[il], Some(&mut sc.idx_q16), visible, n_tok, pos0, s.n_idx_head, s.n_idx_dim, scale, (st.kvq_lat == 1) as u32)?;
+                                kernels::idx_topk_batch(&mut sc.mla_selected, &sc.idx_scores, visible, n_tok, topk)?;
                             }
                             st.idx_last_sel = topk;
+                            st.sel_dev = a_dev;
                             topk
                         } else {
                             // between indexer layers: reuse the last list
@@ -5574,19 +5923,23 @@ mod real {
                             }
                             st.idx_last_sel
                         };
-                        kernels::mla_qk_lowrank(&mut st.qk_low, &st.q, k_b_w, n_tok, s.n_head, s.n_kv_lora, s.qk_nope, s.qk_dim())?;
-                        kernels::mla_attention(&mut st.heads, &st.q, &st.qk_low, &st.kcache[il], &st.vcache[il], v_b_w, &st.mla_selected, n_tok, n_sel, st.ctx, s.n_head, s.n_kv_lora, s.qk_nope, s.qk_rope, s.value_mla, &rope)?;
+                        kernels::mla_qk_lowrank(&mut sc.qk_low, &sc.q, k_b_w, n_tok, s.n_head, s.n_kv_lora, s.qk_nope, s.qk_dim())?;
+                        kernels::mla_attention(&mut sc.heads, &sc.q, &sc.qk_low, &st.kcache[il], &st.vcache[il], v_b_w, &sc.mla_selected, n_tok, n_sel, st.ctx, s.n_head, s.n_kv_lora, s.qk_nope, s.qk_rope, s.value_mla, &rope, st.kvq_lat)?;
 
-                        // output projection on the attn GPU, hop back,
-                        // restore the primary for the ffn/expert half
-                        if self.attn_dev.is_some() {
-                            kernels::matmul_q8_0(&mut st.attn_out_a, attn_output_w, &st.heads, s.heads_dim(), s.n_embd, n_tok)?;
-                            kernels::copy_across(&mut st.attn_out, &st.attn_out_a, (n_tok * s.n_embd) as usize * 4)?;
+                        // output projection on the owner, hop back
+                        // when off-primary, restore the primary for the
+                        // ffn/expert half
+                        if a_dev != primary {
+                            kernels::matmul_q8_0(&mut sc.attn_out_a, attn_output_w, &sc.heads, s.heads_dim(), s.n_embd, n_tok)?;
+                            kernels::copy_across(&mut st.attn_out, &sc.attn_out_a, (n_tok * s.n_embd) as usize * 4)?;
                             kernels::set_device(primary)?;
+                        } else {
+                            kernels::matmul_q8_0(&mut st.attn_out, attn_output_w, &sc.heads, s.heads_dim(), s.n_embd, n_tok)?;
                         }
+                        mla_attn_done = true;
                     }
                 }
-                if self.attn_dev.is_none() {
+                if self.attn_dev.is_none() && !mla_attn_done {
                     kernels::matmul_q8_0(&mut st.attn_out, attn_output_w, &st.heads, heads_dim, s.n_embd, n_tok)?;
                     if let Some(ab) = &l.attn_bias {
                         kernels::add_bias_rows(&mut st.attn_out, &ab.out, s.n_embd, n_tok)?;

@@ -34,6 +34,58 @@ const WEBUI_HTML: &str = include_str!("../webui/index.html");
 #[cfg(target_os = "linux")]
 const FAVICON_SVG: &str = include_str!("../webui/favicon.svg");
 
+/// Sanity bound only - NOT a capability limit. The reachable ceiling is
+/// the checkpoint's own context_length (what the model was trained for)
+/// narrowed by ctx_fit (what this machine's VRAM holds). A fixed number
+/// here would cap a box that can do more: GLM-5.2 declares 1,048,576, and
+/// on hardware with the VRAM for it that is a legitimate request.
+const CTX_SANITY_MAX: u32 = 8_388_608;
+
+/// Largest context whose KV complex still fits VRAM, projected from the
+/// live cost per position (KV + rope tail + DSA indexer keys scale
+/// linearly in ctx). Resizing past this re-execs into a failed load, and
+/// since the re-exec REPLACES this process a failure leaves nothing
+/// serving - hence a guard at all.
+///
+/// `reclaimable` must include the resident expert TIERS, not just free
+/// VRAM: tiers are sized from whatever the KV leaves over, so at steady
+/// state free VRAM is near zero by construction and a resize simply
+/// rebuilds them smaller. Counting only free space made this report 14k
+/// on a box that had been serving 262144 minutes earlier.
+fn ctx_fit(ctx: u32, kv_bytes: usize, kv_compact: bool, reclaimable: usize) -> u32 {
+    if ctx == 0 || kv_bytes == 0 {
+        return CTX_SANITY_MAX;
+    }
+    // Project against the format the engine would ACTUALLY pick at the
+    // larger size, not the one running now: below ~2GB it keeps exact f32,
+    // above it switches to fp8 (~3.9x cheaper per position). Using the
+    // current f32 cost refused resizes that demonstrably load - measured
+    // from ctx 2048 (f32, 185KB/pos) it capped at 14k while 262144 (fp8,
+    // 48KB/pos) was running minutes earlier.
+    let mut per_pos = kv_bytes as f64 / ctx as f64;
+    if !kv_compact {
+        per_pos /= 3.9;
+    }
+    let room = kv_bytes as f64 + reclaimable as f64 * 0.85;
+    ((room / per_pos) as u32).clamp(512, CTX_SANITY_MAX)
+}
+
+/// KV storage format this process was launched with; "auto" when unset,
+/// which lets the engine's size-aware default pick (exact f32 while the
+/// projection is small, fp8 once it would starve the expert cache).
+#[cfg(target_os = "linux")]
+fn kv_format() -> String {
+    std::env::var("PULSAR_KV").unwrap_or_else(|_| "auto".into())
+}
+
+/// VRAM a resize can actually spend on KV: what is free now plus the
+/// resident expert tiers, which the next load re-sizes around the new KV.
+#[cfg(target_os = "linux")]
+fn reclaimable_vram(s: &engine::Stats) -> usize {
+    s.gpus.iter().map(|g| g.vram_free).sum::<usize>()
+        + s.tiers.iter().map(|t| t.bytes).sum::<usize>()
+}
+
 #[cfg(target_os = "linux")]
 fn run() -> engine::Result {
     use std::io::{BufRead, BufReader, Read, Write};
@@ -68,6 +120,17 @@ fn run() -> engine::Result {
         tokenizer::Tokenizer::from_gguf(&g)?
     };
     let markers = tokenizer::ChatMarkers::resolve(&tok)?;
+    // What the CHECKPOINT supports. Clients size their context control from
+    // this; whether a given value fits is a separate, per-machine question
+    // answered by ctx_fit.
+    let ctx_model_max: u64 = model
+        .gguf
+        .metadata
+        .iter()
+        .find(|(k, _)| k.ends_with(".context_length"))
+        .and_then(|(_, v)| v.as_u64())
+        .unwrap_or(CTX_SANITY_MAX as u64)
+        .min(CTX_SANITY_MAX as u64);
     let mut st = engine::State::new(&model, ctx)?;
     let default_temp = model
         .gguf
@@ -199,6 +262,27 @@ fn run() -> engine::Result {
                         "ctx": s.ctx,
                         "cpu_lane": cpu_lane_on(),
                         "mtp": mtp_on(),
+                        // reasoning controls the client can offer: the
+                        // vocabulary is per chat style, so the UI builds
+                        // its control from this instead of hardcoding one
+                        // ctx_max: what the CHECKPOINT supports (clients size
+                        // their context control from this, so it follows the
+                        // model rather than a hardcoded number). ctx_fit: the
+                        // largest ctx whose KV still fits VRAM, projected from
+                        // the live KV cost per position - past it the resize
+                        // would re-exec into a failed load.
+                        "ctx_max": ctx_model_max,
+                        "ctx_fit": ctx_fit(s.ctx, s.kv_bytes, s.kv_compact, reclaimable_vram(&s)),
+                        "kv_bytes": s.kv_bytes,
+                        "kv_format": kv_format(),
+                        "kv_compact": s.kv_compact,
+                        "kv_resolved": s.kv_resolved,
+                        "reasoning": {
+                            "capable": markers.reasoning_capable(),
+                            "levels": markers.reasoning_levels(),
+                            "default": markers.reasoning_default(),
+                            "thinking": markers.opens_thinking(),
+                        },
                         "n_layer": find_u(".block_count").unwrap_or(0),
                         "n_expert": find_u(".expert_count").unwrap_or(0),
                         "n_expert_used": find_u(".expert_used_count").unwrap_or(0),
@@ -315,7 +399,7 @@ fn run() -> engine::Result {
                         respond_json(&mut stream, 200, &serde_json::json!({"reloading": name}))?;
                         let _ = std::io::Write::flush(&mut stream);
                         eprintln!("pulsar-serve: switching model -> {name}, re-exec");
-                        let err = reexec(&target, cpu_lane_on(), None, mtp_on());
+                        let err = reexec(&target, cpu_lane_on(), None, mtp_on(), None);
                         eprintln!("pulsar-serve: re-exec failed: {err}");
                         std::process::exit(1);
                     }
@@ -328,7 +412,7 @@ fn run() -> engine::Result {
                     respond_json(&mut stream, 200, &serde_json::json!({"reloading": true, "cpu_lane": enabled}))?;
                     let _ = std::io::Write::flush(&mut stream);
                     eprintln!("pulsar-serve: CPU lane -> {enabled}, re-exec");
-                    let err = reexec(std::path::Path::new(&model_path), enabled, None, mtp_on());
+                    let err = reexec(std::path::Path::new(&model_path), enabled, None, mtp_on(), None);
                     eprintln!("pulsar-serve: re-exec failed: {err}");
                     std::process::exit(1);
                 }
@@ -340,22 +424,51 @@ fn run() -> engine::Result {
                     respond_json(&mut stream, 200, &serde_json::json!({"reloading": true, "mtp": enabled}))?;
                     let _ = std::io::Write::flush(&mut stream);
                     eprintln!("pulsar-serve: MTP -> {enabled}, re-exec");
-                    let err = reexec(std::path::Path::new(&model_path), cpu_lane_on(), None, enabled);
+                    let err = reexec(std::path::Path::new(&model_path), cpu_lane_on(), None, enabled, None);
                     eprintln!("pulsar-serve: re-exec failed: {err}");
                     std::process::exit(1);
+                }
+                // KV storage format: re-exec with a new PULSAR_KV. Everything
+                // downstream re-derives from it (KV bytes -> auto budget ->
+                // expert cache -> tier build), same as a context resize.
+                ("POST", "/kv") => {
+                    let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                    let want = req["format"].as_str().unwrap_or("auto").to_string();
+                    const KV_FORMATS: [&str; 8] =
+                        ["auto", "f32", "fp8", "fp16", "int8", "q8_0", "q4_0", "turbo4"];
+                    if !KV_FORMATS.contains(&want.as_str()) {
+                        respond_json(&mut stream, 400, &serde_json::json!({"error": {"message":
+                            format!("unknown KV format {want} (one of {KV_FORMATS:?})")}}))
+                    } else {
+                        respond_json(&mut stream, 200, &serde_json::json!({"reloading": true, "kv": want}))?;
+                        let _ = std::io::Write::flush(&mut stream);
+                        eprintln!("pulsar-serve: PULSAR_KV -> {want}, re-exec");
+                        let err = reexec(std::path::Path::new(&model_path), cpu_lane_on(), None, mtp_on(), Some(&want));
+                        eprintln!("pulsar-serve: re-exec failed: {err}");
+                        std::process::exit(1);
+                    }
                 }
                 // Resize the context window: re-exec the current model with a new
                 // --ctx (reallocates the KV cache, same as a model switch).
                 ("POST", "/ctx") => {
                     let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
                     let n = req["ctx"].as_u64().unwrap_or(0) as u32;
-                    if !(512..=262144).contains(&n) {
-                        respond_json(&mut stream, 400, &serde_json::json!({"error": {"message": "ctx out of range (512..262144)"}}))
+                    let fs = st.stats();
+                    let fit = ctx_fit(fs.ctx, fs.kv_bytes, fs.kv_compact, reclaimable_vram(&fs));
+                    if !(512..=ctx_model_max as u32).contains(&n) {
+                        respond_json(&mut stream, 400, &serde_json::json!({"error": {"message":
+                            format!("ctx out of range (512..{ctx_model_max}, the checkpoint's trained context)")}}))
+                    } else if n > fit {
+                        // Refuse rather than re-exec into an OOM: the re-exec
+                        // replaces this process, so a failed load leaves the
+                        // user with no server at all.
+                        respond_json(&mut stream, 400, &serde_json::json!({"error": {"message":
+                            format!("ctx {n} needs more KV than VRAM has free; largest that fits now is {fit}")}}))
                     } else {
                         respond_json(&mut stream, 200, &serde_json::json!({"reloading": true, "ctx": n}))?;
                         let _ = std::io::Write::flush(&mut stream);
                         eprintln!("pulsar-serve: ctx -> {n}, re-exec");
-                        let err = reexec(std::path::Path::new(&model_path), cpu_lane_on(), Some(n), mtp_on());
+                        let err = reexec(std::path::Path::new(&model_path), cpu_lane_on(), Some(n), mtp_on(), None);
                         eprintln!("pulsar-serve: re-exec failed: {err}");
                         std::process::exit(1);
                     }
@@ -455,7 +568,7 @@ fn cpu_name() -> String {
 /// Only returns (with an error) if exec fails. The model path is validated by
 /// the caller to be a .gguf inside the current model's directory.
 #[cfg(target_os = "linux")]
-fn reexec(newmodel: &std::path::Path, cpu_lane: bool, new_ctx: Option<u32>, mtp: bool) -> std::io::Error {
+fn reexec(newmodel: &std::path::Path, cpu_lane: bool, new_ctx: Option<u32>, mtp: bool, kv: Option<&str>) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     let args: Vec<String> = std::env::args().collect();
     let mut cmd = std::process::Command::new(&args[0]);
@@ -490,6 +603,13 @@ fn reexec(newmodel: &std::path::Path, cpu_lane: bool, new_ctx: Option<u32>, mtp:
         cmd.env("PULSAR_MTP", "1");
     } else {
         cmd.env_remove("PULSAR_MTP");
+    }
+    // KV storage format. None = keep whatever this process was given;
+    // Some("auto") = clear it so the engine's size-aware default decides.
+    match kv {
+        Some("auto") => { cmd.env_remove("PULSAR_KV"); }
+        Some(v) => { cmd.env("PULSAR_KV", v); }
+        None => {}
     }
     cmd.exec()
 }

@@ -4886,7 +4886,7 @@ static int mla_selftest_one(float freq_scale, float ext_factor,
                             float beta_fast, float beta_slow,
                             uint32_t kv_lora, uint32_t qk_rope,
                             uint32_t cache_cap, uint32_t n_prefill,
-                            const char *name) {
+                            uint32_t kvq, const char *name) {
     /* the host reference below keeps its per-head scratch on the stack;
      * these bound it. Exceeding them silently smashed the stack when the
      * dims first became parameters, so fail loudly instead. */
@@ -4953,6 +4953,127 @@ static int mla_selftest_one(float freq_scale, float ext_factor,
                 row[i + 1] = x0 * s + x1 * c;
             }
         }
+    }
+    /* the attention half of the reference runs AFTER the GPU phases: for
+     * quantized caches (kvq != 0) it must read what the store kernel
+     * actually wrote (dequantized), or the comparison would measure
+     * quantization error instead of kernel agreement. */
+
+    /* ---- GPU: prefill batch of n_prefill, then one decode token ---- */
+    void *q_d = NULL, *kvr_d = NULL, *wn_d = NULL, *kb_d = NULL, *vb_d = NULL;
+    void *kvn_d = NULL, *lora_d = NULL, *rope_d = NULL, *sel_d = NULL;
+    void *low_d = NULL, *heads_d = NULL;
+    float *gpu_heads = (float *)malloc((uint64_t)n_tok * n_head * value_dim * 4);
+    int ok = cuda_ok(cudaMalloc(&q_d, (uint64_t)n_tok * n_head * qk_dim * 4), "q") &&
+             cuda_ok(cudaMalloc(&kvr_d, (uint64_t)n_tok * kv_raw_dim * 4), "kvr") &&
+             cuda_ok(cudaMalloc(&wn_d, kv_lora * 4), "wn") &&
+             cuda_ok(cudaMalloc(&kb_d, kb_bytes), "kb") &&
+             cuda_ok(cudaMalloc(&vb_d, vb_bytes), "vb") &&
+             cuda_ok(cudaMalloc(&kvn_d, (uint64_t)n_tok * kv_lora * 4), "kvn") &&
+             cuda_ok(cudaMalloc(&lora_d, (uint64_t)cache_cap * mla_lat_stride(kvq, kv_lora)), "lora") &&
+             cuda_ok(cudaMalloc(&rope_d, (uint64_t)cache_cap * mla_lat_stride(kvq, qk_rope)), "rope") &&
+             cuda_ok(cudaMalloc(&sel_d, (uint64_t)n_tok * cache_cap * 4), "sel") &&
+             cuda_ok(cudaMalloc(&low_d, (uint64_t)n_tok * n_head * kv_lora * 4), "low") &&
+             cuda_ok(cudaMalloc(&heads_d, (uint64_t)n_tok * n_head * value_dim * 4), "heads") &&
+             cuda_ok(cudaMemcpy(q_d, q, (uint64_t)n_tok * n_head * qk_dim * 4, cudaMemcpyHostToDevice), "q h2d") &&
+             cuda_ok(cudaMemcpy(kvr_d, kv_raw, (uint64_t)n_tok * kv_raw_dim * 4, cudaMemcpyHostToDevice), "kvr h2d") &&
+             cuda_ok(cudaMemcpy(wn_d, w_norm, kv_lora * 4, cudaMemcpyHostToDevice), "wn h2d") &&
+             cuda_ok(cudaMemcpy(kb_d, k_b, kb_bytes, cudaMemcpyHostToDevice), "kb h2d") &&
+             cuda_ok(cudaMemcpy(vb_d, v_b, vb_bytes, cudaMemcpyHostToDevice), "vb h2d");
+
+    const struct { uint32_t pos0, n; } phase[2] = {
+        {0, n_prefill}, {n_prefill, 1},
+    };
+    for (int p = 0; ok && p < 2; p++) {
+        const uint32_t pos0 = phase[p].pos0, n = phase[p].n;
+        const uint32_t n_selected = pos0 + n;
+        float *qp = (float *)q_d + (uint64_t)pos0 * n_head * qk_dim;
+        float *kvp = (float *)kvr_d + (uint64_t)pos0 * kv_raw_dim;
+        float *kvnp = (float *)kvn_d + (uint64_t)pos0 * kv_lora;
+        float *lowp = (float *)low_d + (uint64_t)pos0 * n_head * kv_lora;
+        float *headsp = (float *)heads_d + (uint64_t)pos0 * n_head * value_dim;
+        ok = pulsar_mla_rope_tail(qp, n, n_head, qk_dim, qk_rope, pos0,
+                                  n_ctx_orig, freq_base, freq_scale,
+                                  ext_factor, attn_factor, beta_fast, beta_slow) &&
+             pulsar_mla_kv_lora_rms_norm(kvnp, kvp, wn_d, n, kv_raw_dim,
+                                         kv_lora, eps) &&
+             pulsar_mla_store_compact_kv(lora_d, rope_d, kvnp, kvp, pos0, n,
+                                         cache_cap, kv_raw_dim, kv_lora, qk_rope,
+                                         kvq) &&
+             pulsar_mla_fill_selected_range(sel_d, n, pos0, n_selected,
+                                            cache_cap) &&
+             pulsar_mla_qk_lowrank(lowp, qp, kb_d, n, n_head, kv_lora,
+                                   qk_nope, qk_dim) &&
+             pulsar_mla_attention(headsp, qp, lowp, lora_d, rope_d, vb_d,
+                                  sel_d, n, n_selected, cache_cap, n_head,
+                                  kv_lora, qk_nope, qk_rope, value_dim,
+                                  n_ctx_orig, freq_base, freq_scale,
+                                  ext_factor, attn_factor, beta_fast,
+                                  beta_slow, 1.0f, kvq);
+    }
+    ok = ok && cuda_ok(cudaDeviceSynchronize(), "sync") &&
+         cuda_ok(cudaMemcpy(gpu_heads, heads_d,
+                            (uint64_t)n_tok * n_head * value_dim * 4,
+                            cudaMemcpyDeviceToHost), "heads d2h");
+
+    /* pull the cache back and dequantize it over the exact host rows so
+     * the reference attention reads what the store kernel wrote. For
+     * kvq != 0 also bound the round-trip error against the exact rows -
+     * that is the store kernel's own check (without it a store that
+     * wrote garbage would propagate into a reference that agrees). */
+    if (ok) {
+        const uint64_t ls = mla_lat_stride(kvq, kv_lora);
+        const uint64_t rs = mla_lat_stride(kvq, qk_rope);
+        uint8_t *raw_l = (uint8_t *)malloc((uint64_t)cache_cap * ls);
+        uint8_t *raw_r = (uint8_t *)malloc((uint64_t)cache_cap * rs);
+        ok = cuda_ok(cudaMemcpy(raw_l, lora_d, (uint64_t)cache_cap * ls,
+                                cudaMemcpyDeviceToHost), "lora d2h") &&
+             cuda_ok(cudaMemcpy(raw_r, rope_d, (uint64_t)cache_cap * rs,
+                                cudaMemcpyDeviceToHost), "rope d2h");
+        float rt_max = 0.0f; /* round-trip error relative to row amax */
+        for (uint32_t which = 0; ok && which < 2; which++) {
+            const uint32_t dim = which == 0 ? kv_lora : qk_rope;
+            const uint64_t stride = which == 0 ? ls : rs;
+            const uint8_t *raw = which == 0 ? raw_l : raw_r;
+            float *h_rows = which == 0 ? h_kv_lora : h_k_rope;
+            for (uint32_t r = 0; r < n_tok; r++) {
+                const uint8_t *row = raw + (uint64_t)r * stride;
+                float amax = 0.0f;
+                for (uint32_t i = 0; i < dim; i++)
+                    amax = fmaxf(amax, fabsf(h_rows[(uint64_t)r * dim + i]));
+                for (uint32_t i = 0; i < dim; i++) {
+                    float v;
+                    if (kvq == 0u) {
+                        v = ((const float *)row)[i];
+                    } else if (kvq == 2u) {
+                        v = f16_to_f32_host(((const uint16_t *)row)[i]);
+                    } else {
+                        float sc_row;
+                        memcpy(&sc_row, row + dim, 4);
+                        v = e4m3_dec_common(row[i]) * sc_row;
+                    }
+                    if (kvq != 0u && amax > 0.0f) {
+                        rt_max = fmaxf(rt_max,
+                                       fabsf(v - h_rows[(uint64_t)r * dim + i]) / amax);
+                    }
+                    h_rows[(uint64_t)r * dim + i] = v;
+                }
+            }
+        }
+        free(raw_l);
+        free(raw_r);
+        if (ok && kvq != 0u) {
+            const float rt_tol = kvq == 1u ? 0.08f : 1e-3f;
+            if (rt_max > rt_tol) {
+                printf("mla-selftest %s: store round-trip error %.3e > %.1e\n",
+                       name, (double)rt_max, (double)rt_tol);
+                ok = 0;
+            }
+        }
+    }
+
+    /* ---- host reference attention over the (de)quantized cache ---- */
+    for (uint32_t t = 0; ok && t < n_tok; t++) {
         for (uint32_t h = 0; h < n_head; h++) {
             const float *qh = h_q_roped + ((uint64_t)t * n_head + h) * qk_dim;
             float low[MAX_LORA];
@@ -5000,62 +5121,6 @@ static int mla_selftest_one(float freq_scale, float ext_factor,
         }
     }
 
-    /* ---- GPU: prefill batch of n_prefill, then one decode token ---- */
-    void *q_d = NULL, *kvr_d = NULL, *wn_d = NULL, *kb_d = NULL, *vb_d = NULL;
-    void *kvn_d = NULL, *lora_d = NULL, *rope_d = NULL, *sel_d = NULL;
-    void *low_d = NULL, *heads_d = NULL;
-    float *gpu_heads = (float *)malloc((uint64_t)n_tok * n_head * value_dim * 4);
-    int ok = cuda_ok(cudaMalloc(&q_d, (uint64_t)n_tok * n_head * qk_dim * 4), "q") &&
-             cuda_ok(cudaMalloc(&kvr_d, (uint64_t)n_tok * kv_raw_dim * 4), "kvr") &&
-             cuda_ok(cudaMalloc(&wn_d, kv_lora * 4), "wn") &&
-             cuda_ok(cudaMalloc(&kb_d, kb_bytes), "kb") &&
-             cuda_ok(cudaMalloc(&vb_d, vb_bytes), "vb") &&
-             cuda_ok(cudaMalloc(&kvn_d, (uint64_t)n_tok * kv_lora * 4), "kvn") &&
-             cuda_ok(cudaMalloc(&lora_d, (uint64_t)cache_cap * kv_lora * 4), "lora") &&
-             cuda_ok(cudaMalloc(&rope_d, (uint64_t)cache_cap * qk_rope * 4), "rope") &&
-             cuda_ok(cudaMalloc(&sel_d, (uint64_t)n_tok * cache_cap * 4), "sel") &&
-             cuda_ok(cudaMalloc(&low_d, (uint64_t)n_tok * n_head * kv_lora * 4), "low") &&
-             cuda_ok(cudaMalloc(&heads_d, (uint64_t)n_tok * n_head * value_dim * 4), "heads") &&
-             cuda_ok(cudaMemcpy(q_d, q, (uint64_t)n_tok * n_head * qk_dim * 4, cudaMemcpyHostToDevice), "q h2d") &&
-             cuda_ok(cudaMemcpy(kvr_d, kv_raw, (uint64_t)n_tok * kv_raw_dim * 4, cudaMemcpyHostToDevice), "kvr h2d") &&
-             cuda_ok(cudaMemcpy(wn_d, w_norm, kv_lora * 4, cudaMemcpyHostToDevice), "wn h2d") &&
-             cuda_ok(cudaMemcpy(kb_d, k_b, kb_bytes, cudaMemcpyHostToDevice), "kb h2d") &&
-             cuda_ok(cudaMemcpy(vb_d, v_b, vb_bytes, cudaMemcpyHostToDevice), "vb h2d");
-
-    const struct { uint32_t pos0, n; } phase[2] = {
-        {0, n_prefill}, {n_prefill, 1},
-    };
-    for (int p = 0; ok && p < 2; p++) {
-        const uint32_t pos0 = phase[p].pos0, n = phase[p].n;
-        const uint32_t n_selected = pos0 + n;
-        float *qp = (float *)q_d + (uint64_t)pos0 * n_head * qk_dim;
-        float *kvp = (float *)kvr_d + (uint64_t)pos0 * kv_raw_dim;
-        float *kvnp = (float *)kvn_d + (uint64_t)pos0 * kv_lora;
-        float *lowp = (float *)low_d + (uint64_t)pos0 * n_head * kv_lora;
-        float *headsp = (float *)heads_d + (uint64_t)pos0 * n_head * value_dim;
-        ok = pulsar_mla_rope_tail(qp, n, n_head, qk_dim, qk_rope, pos0,
-                                  n_ctx_orig, freq_base, freq_scale,
-                                  ext_factor, attn_factor, beta_fast, beta_slow) &&
-             pulsar_mla_kv_lora_rms_norm(kvnp, kvp, wn_d, n, kv_raw_dim,
-                                         kv_lora, eps) &&
-             pulsar_mla_store_compact_kv(lora_d, rope_d, kvnp, kvp, pos0, n,
-                                         cache_cap, kv_raw_dim, kv_lora, qk_rope) &&
-             pulsar_mla_fill_selected_range(sel_d, n, pos0, n_selected,
-                                            cache_cap) &&
-             pulsar_mla_qk_lowrank(lowp, qp, kb_d, n, n_head, kv_lora,
-                                   qk_nope, qk_dim) &&
-             pulsar_mla_attention(headsp, qp, lowp, lora_d, rope_d, vb_d,
-                                  sel_d, n, n_selected, cache_cap, n_head,
-                                  kv_lora, qk_nope, qk_rope, value_dim,
-                                  n_ctx_orig, freq_base, freq_scale,
-                                  ext_factor, attn_factor, beta_fast,
-                                  beta_slow, 1.0f);
-    }
-    ok = ok && cuda_ok(cudaDeviceSynchronize(), "sync") &&
-         cuda_ok(cudaMemcpy(gpu_heads, heads_d,
-                            (uint64_t)n_tok * n_head * value_dim * 4,
-                            cudaMemcpyDeviceToHost), "heads d2h");
-
     float maxd = 0.0f, maxref = 0.0f;
     if (ok) {
         for (uint64_t i = 0; i < (uint64_t)n_tok * n_head * value_dim; i++) {
@@ -5088,10 +5153,14 @@ extern "C" int pulsar_mla_selftest(void) {
      * the correction path, both at toy dims; then GLM's real geometry
      * (kv_lora 512, qk_rope 64) with enough cached rows that the
      * warp-per-score loop iterates many times - the shape the toy cases
-     * cannot reach and the one the engine actually runs. */
-    return mla_selftest_one(1.0f, 0.0f, 0.0f, 0.0f, 64, 8, 16, 3, "plain") &&
-           mla_selftest_one(0.5f, 1.0f, 32.0f, 1.0f, 64, 8, 16, 3, "yarn") &&
-           mla_selftest_one(1.0f, 0.0f, 0.0f, 0.0f, 512, 64, 96, 24, "glm-shape");
+     * cannot reach and the one the engine actually runs. The fp16/fp8
+     * cases run the quantized latent store + attention pair against a
+     * reference that reads the same quantized rows. */
+    return mla_selftest_one(1.0f, 0.0f, 0.0f, 0.0f, 64, 8, 16, 3, 0, "plain") &&
+           mla_selftest_one(0.5f, 1.0f, 32.0f, 1.0f, 64, 8, 16, 3, 0, "yarn") &&
+           mla_selftest_one(1.0f, 0.0f, 0.0f, 0.0f, 512, 64, 96, 24, 0, "glm-shape") &&
+           mla_selftest_one(1.0f, 0.0f, 0.0f, 0.0f, 512, 64, 96, 24, 2, "glm-shape-fp16") &&
+           mla_selftest_one(1.0f, 0.0f, 0.0f, 0.0f, 512, 64, 96, 24, 1, "glm-shape-fp8");
 }
 #include "dsa_indexer.inc"
 #include "dsv4_kernels.inc"
