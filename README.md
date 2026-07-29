@@ -39,7 +39,11 @@ attention projections and every expert, MXFP4 routed experts), and
 layer every fourth and sliding-window 512 elsewhere, a per-head output
 gate, and per-layer-type RoPE — YaRN on the full-window layers, plain
 on the sliding ones; the imatrix IQ2_XXS build decodes faster than the
-Q4_K_M because more experts stay resident at 36GB). Reference
+Q4_K_M because more experts stay resident at 36GB), and
+**Ornith-397B** (a `qwen35moe` hybrid at 397B: Q2_K experts on a 512-way
+sigmoid-gated router with a shared expert, Gated DeltaNet linear
+attention as above; runs end-to-end on a single 32GB GPU after a load-site
+fix — see `docs/ornith-q2k-cuda-crash-fix.md`). Reference
 box: RTX 5060 Ti 16GB + RTX 4060 Ti 16GB, Ryzen 9900X, 30GB RAM, one
 Gen5 NVMe.
 
@@ -57,6 +61,7 @@ Gen5 NVMe.
 | GLM-5.2 | 744B | 40B | 211GB (ds4 recipe) | **2.7 tok/s** (2.8 w/ CPU lane) | 0.40 |
 | TML Inkling | 975B | 41B (6 + 2 shared) | 296GB (Q2_K_XL) | **1.6 tok/s** (1.75 w/ CPU lane) | – |
 | Kimi K2.7 Code† | ~1T | 32B | 339GB (Q2_K_XL) | **1.3 tok/s** | – |
+| Ornith-397B | 397B | ~38B (top-10 of 512 + shared) | 149GB (Q2_K exp + Q8_0) | **3.73 tok/s** (7.16 w/ CPU lane) | – |
 
 All figures are sustained warm decode at n=64, temp 0, second run onward.
 The resident tier is placed from the popularity census, which builds over
@@ -69,6 +74,13 @@ compute-bound, not streaming-bound.
 † Measured before the n=64 standardization and not yet re-run (model deleted
 to free disk); the sustained rate is likely a little lower than shown, for
 the same reason Hy3 reads 8.2 at n=32 against 6.0 at n=64.
+
+†† Ornith-397B was brought up on a different box (3090 + V100 32GB GPU, 128Gb),
+not the reference 2×16GB rig, and only a short cold-census 15-token run exists
+(`-p "The capital of France is" -n 15` → "Paris.", correct). A warm n=64
+decode figure is not reported until it is measured honestly. The 149GB gguf
+size is the experts-Q2_K / rest-Q8_0 mix from `pulsar-quant --map "_exps.=q2_k"
+--default q8_0`.
 
 ThinkingCap-27B is pulsar's first fully-dense arch and runs a different
 mode entirely: no streaming, no tiers - the model fits across both
@@ -401,6 +413,12 @@ than the disk one shard at a time) ·
 DeepSeek-V4-Flash (deepseek4): hyper-connection residual streams,
 streaming compressed KV + sink attention, indexer QAT top-k, token-id
 hash routing.
+Ornith-397B (qwen35moe at 397B): the largest qwen35-moe hybrid yet —
+Q2_K experts on a 512-way router, GDN linear attention, shared expert.
+Runs end-to-end after fixing three f32-reader load sites that the
+generic `upload()` path left as raw/reqantized bytes (conv1d, gate_inp,
+gate_inp_shexp); see `docs/ornith-q2k-cuda-crash-fix.md`. Warm decode
+bench pending.
 
 Also done, honestly measured: DFlash block-diffusion speculative
 decoding for Qwen3.6 (the lucebox recipe: a 515MB matched draft

@@ -3276,13 +3276,12 @@ mod real {
                         (exps("ffn_gate_exps.weight")?, exps("ffn_up_exps.weight")?, 0)
                     };
                     Ffn::Moe {
-                        // deepseek4 ships the router f16; matmul_f32
-                        // wants f32 (router precision drives selection)
-                        gate_inp: if dsv4_arch {
-                            upload_f16_as_f32(&file, &gguf, &t("ffn_gate_inp.weight"))?
-                        } else {
-                            upload(&file, &gguf, &t("ffn_gate_inp.weight"))?
-                        },
+                        // matmul_f32 wants f32 (router precision drives
+                        // selection). upload_as_f32 covers every ship format:
+                        // dsv4's f16, qwen35moe's q8_0, plain f32. The old
+                        // upload() branch returned raw q8_0 bytes for qwen35moe,
+                        // which matmul_f32 read past (8MB read on a 2MB buffer).
+                        gate_inp: upload_as_f32(&file, &gguf, &t("ffn_gate_inp.weight"))?,
                         // no bias tensor (qwen3moe) -> zeros: score = prob
                         probs_b: if gguf.tensor(&probs_b_name).is_some() {
                             upload(&file, &gguf, &probs_b_name)?
@@ -3593,7 +3592,10 @@ mod real {
                                 Some(Qwen35Gdn {
                                     wqkv: MatW::load(&file, &gguf, &t("attn_qkv.weight"))?,
                                     wz: MatW::load(&file, &gguf, &t("attn_gate.weight"))?,
-                                    conv: upload(&file, &gguf, &t("ssm_conv1d.weight"))?,
+                                    // conv kernel reads this as f32 [conv_dim][ssm_conv_k];
+                                    // upload() would quantize the F16 2D tensor to q8_0 bytes,
+                                    // which the conv kernel reads past (4x size mismatch) -> OOB.
+                                    conv: upload_as_f32(&file, &gguf, &t("ssm_conv1d.weight"))?,
                                     alpha_w: upload_as_f32(&file, &gguf, &t("ssm_alpha.weight"))?,
                                     beta_w: upload_as_f32(&file, &gguf, &t("ssm_beta.weight"))?,
                                     a: upload(&file, &gguf, &t("ssm_a"))?,
@@ -3604,8 +3606,10 @@ mod real {
                             },
                             // dense qwen35 has no shared expert (and so
                             // no shexp gate); the ffn half never reads it
+                            // matmul_f32 consumer (qwen35_row_sigmoid_scale
+                            // path): q8_0 here would be read as f32 and OOB.
                             shexp_gate: if gguf.tensor(&t("ffn_gate_inp_shexp.weight")).is_some() {
-                                upload(&file, &gguf, &t("ffn_gate_inp_shexp.weight"))?
+                                upload_as_f32(&file, &gguf, &t("ffn_gate_inp_shexp.weight"))?
                             } else {
                                 DeviceBuf::alloc(4)?
                             },
