@@ -2585,18 +2585,30 @@ mod real {
     }
 
     /// f16 tensor -> host f32 (deepseek4 ships router/HC/compressor
-    /// weights as f16; small ones convert to f32 for matmul_f32).
+    /// weights as f16; small ones convert to f32 for matmul_f32). F32
+    /// tensors pass through (unsloth UD-* ships the same aux weights f32).
     fn read_f16_as_f32(file: &VFile, g: &Gguf, name: &str) -> Result<Vec<f32>> {
         let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
-        if t.ty != TensorType::F16 {
-            return Err(format!("{name}: expected f16, got {:?}", t.ty).into());
+        let n = t.n_elements() as usize;
+        match t.ty {
+            TensorType::F16 => {
+                let mut buf = vec![0u8; n * 2];
+                file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+                Ok(buf
+                    .chunks_exact(2)
+                    .map(|c| requant::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect())
+            }
+            TensorType::F32 => {
+                let mut buf = vec![0u8; n * 4];
+                file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+                Ok(buf
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect())
+            }
+            other => Err(format!("{name}: expected f16/f32, got {other:?}").into()),
         }
-        let mut buf = vec![0u8; t.n_elements() as usize * 2];
-        file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
-        Ok(buf
-            .chunks_exact(2)
-            .map(|c| requant::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect())
     }
 
     fn upload_f16_as_f32(file: &VFile, g: &Gguf, name: &str) -> Result<DeviceBuf> {
@@ -2611,6 +2623,17 @@ mod real {
         match t.ty {
             TensorType::F32 => upload(file, g, name),
             TensorType::F16 => upload_f16_as_f32(file, g, name),
+            // unsloth UD-* ships the deepseek4 router (ffn_gate_inp) as
+            // BF16; matmul_f32 needs f32 host data. quant::row_to_f32
+            // already has the bf16->f32 decode.
+            TensorType::BF16 => {
+                let n = t.n_elements() as usize;
+                let mut buf = vec![0u8; n * 2];
+                file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+                let mut f = Vec::with_capacity(n);
+                quant::row_to_f32(TensorType::BF16, &buf, &mut f)?;
+                Ok(DeviceBuf::from_f32(&f)?)
+            }
             TensorType::Q4K => {
                 let n = t.n_elements() as usize;
                 let mut buf = vec![0u8; n / 256 * 144];
@@ -2638,25 +2661,34 @@ mod real {
     }
 
     /// f16 tensor -> q8_0 bytes (deepseek4's bigger f16 matmul weights
-    /// ride the q8_0 fast path; ~0.4% quantization noise).
+    /// ride the q8_0 fast path; ~0.4% quantization noise). Q8_0 tensors
+    /// pass through (unsloth UD-* ships the compressor/indexer projections
+    /// already q8_0; re-quantizing would be lossy AND wrong-layout).
     fn read_f16_as_q8(file: &VFile, g: &Gguf, name: &str) -> Result<Vec<u8>> {
         let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
-        if t.ty != TensorType::F16 {
-            return Err(format!("{name}: expected f16, got {:?}", t.ty).into());
-        }
         let n = t.n_elements() as usize;
-        let mut buf = vec![0u8; n * 2];
-        file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
-        let mut out = Vec::with_capacity(n / 32 * 34);
-        let mut f = [0f32; 256];
-        for blk in buf.chunks(512) {
-            let m = blk.len() / 2;
-            for (i, c) in blk.chunks_exact(2).enumerate() {
-                f[i] = requant::f16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+        match t.ty {
+            TensorType::F16 => {
+                let mut buf = vec![0u8; n * 2];
+                file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+                let mut out = Vec::with_capacity(n / 32 * 34);
+                let mut f = [0f32; 256];
+                for blk in buf.chunks(512) {
+                    let m = blk.len() / 2;
+                    for (i, c) in blk.chunks_exact(2).enumerate() {
+                        f[i] = requant::f16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+                    }
+                    requant::quantize_q8_0(&f[..m], &mut out);
+                }
+                Ok(out)
             }
-            requant::quantize_q8_0(&f[..m], &mut out);
+            TensorType::Q8_0 => {
+                let mut buf = vec![0u8; t.byte_size().ok_or_else(|| meta_err(name))? as usize];
+                file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+                Ok(buf)
+            }
+            other => Err(format!("{name}: expected f16/q8_0, got {other:?}").into()),
         }
-        Ok(out)
     }
 
     /// Big attention weights: VRAM while `vram_budget` lasts, then pinned
@@ -2694,12 +2726,9 @@ mod real {
             // the embedding table is read ~one row per token - pinned
             // host is free for it and returns ~1GB of VRAM to hot weights
             let token_embd = {
-                // deepseek4 ships the table f16; embed_q8_0 wants q8_0
-                let bytes = if shape.family == Family::Dsv4 {
-                    read_f16_as_q8(&file, &gguf, "token_embd.weight")?
-                } else {
-                    read_tensor_bytes(&file, &gguf, "token_embd.weight")?
-                };
+                // deepseek4 embd arrives F16 (antirez ds4 recipe) or Q5_K
+                // (unsloth UD-*); both convert to q8_0 for embed_q8_0.
+                let bytes = read_tensor_bytes(&file, &gguf, "token_embd.weight")?;
                 let mut buf = if matches!(shape.family, Family::Mla | Family::Dsv4) {
                     DeviceBuf::alloc_pinned(bytes.len())?
                 } else {
@@ -4677,6 +4706,31 @@ mod real {
             }
             std::fs::write(warm_path(&m.path), bytes)?;
             Ok(())
+        }
+
+        /// Total touch counts across the slab cache - a monotonic proxy for
+        /// inference volume since load. A long-running server uses the delta
+        /// between two calls to decide when the census is worth persisting.
+        pub fn census_touch_total(&self) -> u64 {
+            self.dev_cache.touch.values().map(|&(c, _)| c).sum()
+        }
+
+        /// Number of distinct slab offsets the census tracks. Useful for
+        /// reporting how large a persisted .warm file will be.
+        pub fn census_entry_count(&self) -> usize {
+            self.dev_cache.touch.len()
+        }
+
+        /// Advance the per-slab seed baseline to the current touch counts so
+        /// a long-running server that saves repeatedly records genuine
+        /// per-interval deltas instead of a monotonic running sum (the drift
+        /// save_warm's merge is designed to avoid). One-shot callers
+        /// (pulsar-cli) never need this; serve calls it after every periodic
+        /// save.
+        pub fn commit_warm_seeds(&mut self) {
+            for (&off, &(count, _)) in &self.dev_cache.touch {
+                self.warm_seeds.insert(off, count);
+            }
         }
 
         /// Load the popularity census: hottest **expert triples** into VRAM

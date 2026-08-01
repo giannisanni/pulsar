@@ -11,6 +11,9 @@ gguf = { path = "../gguf" }
 tokenizer = { path = "../tokenizer" }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
+# SIGINT handling for the shutdown warm-census save. Kept tiny on purpose:
+# it only flips an atomic flag; the accept loop does the actual work.
+ctrlc = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "process", "sync", "time", "io-util"] }
 # MCP client (gated behind --webui-mcp-proxy). streamable-http covers both
 # http and sse endpoints since rmcp 0.11 removed the standalone sse transport.

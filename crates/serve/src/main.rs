@@ -48,6 +48,20 @@ mod mcp;
 /// on hardware with the VRAM for it that is a legitimate request.
 const CTX_SANITY_MAX: u32 = 8_388_608;
 
+/// Warm census save cadence: persist once this many cumulative slab
+/// touches have accumulated since the last save. Touch volume, not wall
+/// clock - an idle server never churns the .warm file. A chat turn
+/// touches thousands of expert slabs, so 250k is roughly dozens of turns
+/// between saves on typical context sizes.
+const WARM_SAVE_TOUCHES: u64 = 250_000;
+
+/// Set by the SIGINT handler, polled by the accept loop, so the final
+/// warm save runs in normal context (a signal handler cannot touch the
+/// engine or the heap). SIGTERM is not intercepted - kill -9 or a
+/// supervisor stop loses the shutdown save, only the periodic one.
+static WARM_SHUTDOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Largest context whose KV complex still fits VRAM, projected from the
 /// live cost per position (KV + rope tail + DSA indexer keys scale
 /// linearly in ctx). Resizing past this re-execs into a failed load, and
@@ -168,6 +182,11 @@ fn run() -> engine::Result {
     let allowed_hosts = allowed_hosts(&host, port);
 
     let listener = std::net::TcpListener::bind((host.as_str(), port))?;
+    // Nonblocking accept so a shutdown request (Ctrl-C) is honored even
+    // while no connection is pending: the accept loop polls the flag and
+    // would otherwise sit in incoming() forever. The 10ms poll costs
+    // nothing on a single-user localhost server.
+    listener.set_nonblocking(true)?;
     eprintln!("pulsar-serve: listening on http://{host}:{port}  (web UI at /, API at /v1)");
     // Record this ctx as last-known-good: KV allocated and we are serving. A
     // resize that OOMs dies before reaching here, so PULSAR_CTX_STATE keeps the
@@ -199,9 +218,57 @@ fn run() -> engine::Result {
         }
     }
     let mut last_saved = hist.len();
+    // Warm census: count from the seeded baseline. load_warm seeds the
+    // touch map with the historical census counts, so starting the
+    // interval at zero would make the first request exceed any threshold
+    // and force a pointless save right after every restart. Start the
+    // counter at the seeded total so the first save waits for genuinely
+    // NEW touches.
+    // .warm census persistence. The engine seeds tiers + the slab cache from
+    // the census at load, but only pulsar-cli ever wrote it back - a long
+    // running server would freeze the hot set at whatever the last CLI run
+    // observed. Save periodically (token-touch volume, not wall clock, so an
+    // idle server never churns the file) and once at shutdown (SIGINT/SIGTERM)
+    // so a Ctrl-C'd session still contributes its learnings. The engine's
+    // merge semantics are per-run deltas (this_run = count - seed); repeated
+    // saves must advance the seed baseline, otherwise the same server's
+    // cumulative touches read as one giant run and the census drifts into a
+    // running sum. PULSAR_WARM_OFF=1 disables all writes (read-only census).
+    let mut warm_last_touch: u64 = st.census_touch_total();
+    let warm_enabled = std::env::var_os("PULSAR_WARM_OFF").is_none();
+    // Overridable for tests/tuning: a tiny value forces a save after every
+    // request; the default is tuned for real workloads.
+    let warm_interval: u64 = std::env::var("PULSAR_WARM_TOUCHES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(WARM_SAVE_TOUCHES);
+    if warm_enabled {
+        eprintln!(
+            "pulsar-serve: warm census write enabled (every {warm_interval} touches, +shutdown); \
+             PULSAR_WARM_OFF=1 to disable"
+        );
+    }
+    if let Err(e) = ctrlc::set_handler(move || {
+        // Signal handler must be async-signal-safe: no heap, no locks, no
+        // engine calls. Only set a flag; the accept loop polls it and does
+        // the real work (including the warm save) in normal context.
+        WARM_SHUTDOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+    }) {
+        eprintln!("pulsar-serve: ctrlc handler unavailable: {e} (warm shutdown save disabled)");
+    }
     for stream in listener.incoming() {
+        // Ctrl-C: finish the current request, then fall out of the loop
+        // and persist the census one last time.
+        if WARM_SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
         let mut stream = match stream {
             Ok(s) => s,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // nonblocking listener: nothing pending, poll again shortly
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
             Err(_) => continue,
         };
         // the accept loop is sequential: a half-open socket that never
@@ -765,6 +832,42 @@ fn run() -> engine::Result {
                     Err(e) => eprintln!("pulsar-serve: prefix save failed: {e}"),
                 }
             }
+        }
+        // Warm census: persist once enough expert-touch volume has
+        // accumulated since the last save, and advance the seed baseline
+        // so the next interval records genuine deltas (see save_warm).
+        if warm_enabled {
+            let total = st.census_touch_total();
+            if total >= warm_last_touch + warm_interval {
+                let t0 = std::time::Instant::now();
+                match st.save_warm(&model) {
+                    Ok(()) => {
+                        eprintln!(
+                            "pulsar-serve: warm census saved ({} entries, {:.2}s)",
+                            st.census_entry_count(), t0.elapsed().as_secs_f32()
+                        );
+                        st.commit_warm_seeds();
+                        warm_last_touch = total;
+                    }
+                    Err(e) => eprintln!("pulsar-serve: warm census save failed: {e}"),
+                }
+            }
+        }
+    }
+    // Shutdown: persist whatever the periodic saves have not captured yet.
+    // SIGINT arrives as a flag polled above; SIGTERM is not intercepted, so
+    // a supervisor stop loses this final save (only the periodic one). This
+    // block runs exactly once: the accept loop above always exits through
+    // the WARM_SHUTDOWN break.
+    if warm_enabled {
+        match st.save_warm(&model) {
+            Ok(()) => {
+                eprintln!(
+                    "pulsar-serve: shutdown warm census saved ({} entries)",
+                    st.census_entry_count()
+                );
+            }
+            Err(e) => eprintln!("pulsar-serve: shutdown warm census save failed: {e}"),
         }
     }
     Ok(())
