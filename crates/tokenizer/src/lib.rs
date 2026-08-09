@@ -228,9 +228,7 @@ impl ChatMarkers {
         if t.find_token("]~b]").is_some() {
             // MiniMax M3: ]~!b[ (bod) opens, ]~b]<role>\n starts a turn,
             // [e~[ + \n ends it; roles are plain text ("system"/"user"/
-            // "ai"). aux1 = <mm:think>: the assistant opener forces the
-            // thinking-enabled prefix - the adaptive branch (no prefix)
-            // greedily emits eos on the 2-bit quants.
+            // "ai")
             return Ok(ChatMarkers {
                 style: ChatStyle::MiniMax,
                 // the CLI seeds the context with bos - for M3 that seat
@@ -240,8 +238,8 @@ impl ChatMarkers {
                 eot: t.find_token("[e~["),
                 user: find("]~b]")?,
                 assistant: find("]~b]")?,
-                aux0: find("[e~[")?,
-                aux1: find("<mm:think>")?,
+                aux0: find("<mm:think>")?,
+                aux1: find("</mm:think>")?,
                 stops: t.stop_ids.clone(),
                 think: false,
                 reasoning: "medium",
