@@ -932,6 +932,11 @@ pub fn apply_chat_template_ex(
     let tmpl = strip_generation_tags(template);
 
     let mut env = minijinja::Environment::new();
+    // HuggingFace chat templates are written against Python's Jinja2, so they
+    // call methods like `"{}".format(x)`, `.strip()`, `.startswith(...)`.
+    // minijinja-contrib::pycompat implements that surface; without it, models
+    // such as Hy3 fail apply with "string has no method named format".
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     env.add_filter("tojson", filter_tojson);
     env.add_function("raise_exception", raise_exception);
 
@@ -1141,6 +1146,19 @@ mod tests {
         assert!(out.contains("<|im_start|>user"));
         assert!(out.contains("Hi"));
         assert!(out.contains("<|im_start|>assistant"));
+    }
+
+    #[test]
+    fn apply_python_str_format() {
+        // Hy3 (and other HF templates) use Python's str.format — the error
+        // that forced ChatMarkers fallback without pycompat.
+        let tmpl = r#"{% for message in messages %}{{ "<|{}|>".format(message['role']) }}{{ message['content'] }}{% endfor %}"#;
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "Hi".into(),
+        }];
+        let out = apply_chat_template(tmpl, &msgs, false, None, None, None).unwrap();
+        assert_eq!(out, "<|user|>Hi");
     }
 
     #[test]

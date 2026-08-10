@@ -10,7 +10,9 @@ gguf = { path = "../gguf" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # HF chat templates are Jinja; minijinja covers the subset instruct models need.
+# pycompat adds Python str methods (.format, .strip, …) that HF templates use.
 minijinja = { version = "2", features = ["json"] }
+minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
 # Sync HTTP for tokenizer_config.json + llama.cpp catalog fetches.
 ureq = { version = "2", default-features = true, features = ["tls"] }
 

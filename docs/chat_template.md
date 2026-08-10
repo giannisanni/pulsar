@@ -609,8 +609,12 @@ BPE-split.
 
 ## Limitations
 
-- minijinja is a **subset** of Jinja2. Exotic filters, macros with non-JSON
-  types, or Python-only helpers can fail apply.
+- minijinja is a **subset** of Jinja2. We register
+  `minijinja-contrib` **pycompat** so common Python string methods
+  (`.format`, `.strip`, `.startswith`, …) work — without that, templates
+  like Hy3 fail with `string has no method named format` and serve falls
+  back to ChatMarkers. Exotic filters, macros with non-JSON types, or
+  helpers outside pycompat can still fail apply.
 - `{% generation %}` blocks are stripped, not executed like llama.cpp/minja.
 - Tool-call replay in Jinja mode uses Pulsar’s `<tool_call>` text
   convention; models whose templates expect different tool XML need a
