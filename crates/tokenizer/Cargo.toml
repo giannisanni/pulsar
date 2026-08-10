@@ -7,3 +7,13 @@ description = "GPT-2 style byte-level BPE tokenizer built from GGUF metadata."
 
 [dependencies]
 gguf = { path = "../gguf" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# HF chat templates are Jinja; minijinja covers the subset instruct models need.
+minijinja = { version = "2", features = ["json"] }
+# Sync HTTP for tokenizer_config.json + llama.cpp catalog fetches.
+ureq = { version = "2", default-features = true, features = ["tls"] }
+
+[[bin]]
+name = "get-chat-template"
+path = "src/bin/get_chat_template.rs"

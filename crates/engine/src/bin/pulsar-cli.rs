@@ -208,6 +208,25 @@ fn run() -> engine::Result {
         model.shape.n_expert,
         model.shape.n_expert_used
     );
+    // Best-effort chat-template discovery (GGUF → HF base model → llama.cpp
+    // catalog). Used by --chat when PULSAR_JINJA_CHAT=1; always logged so
+    // operators see what would apply.
+    {
+        let opts = tokenizer::ChatTemplateOptions::default();
+        match tokenizer::get_chat_template_from_gguf(
+            &model.gguf,
+            Some(std::path::Path::new(&model_path)),
+            None,
+            &opts,
+        ) {
+            Ok(r) => eprintln!(
+                "pulsar: chat template from {} ({} bytes)",
+                r.source,
+                r.template.len()
+            ),
+            Err(e) => eprintln!("pulsar: chat template not resolved ({e})"),
+        }
+    }
 
     if chat {
         return run_chat(&model, &tok, ctx, system, temp, top_p, min_p, seed, n_predict);
