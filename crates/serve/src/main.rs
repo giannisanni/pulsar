@@ -41,6 +41,10 @@ const FAVICON_SVG: &str = include_str!("../webui/favicon.svg");
 #[cfg(target_os = "linux")]
 mod mcp;
 
+/// Multi-format tool-call parsers (generic JSON, Hy3 opensource, DeepSeek DSML).
+/// Always compiled so unit tests run on any OS.
+mod tool_calls;
+
 /// Sanity bound only - NOT a capability limit. The reachable ceiling is
 /// the checkpoint's own context_length (what the model was trained for)
 /// narrowed by ctx_fit (what this machine's VRAM holds). A fixed number
@@ -1504,36 +1508,7 @@ fn split_harmony(s: &str) -> (String, String) {
 }
 
 fn extract_tool_calls(text: &str) -> (String, Vec<(String, String)>) {
-    let mut clean = String::new();
-    let mut calls = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("<tool_call>") {
-        let (before, after) = rest.split_at(start);
-        clean.push_str(before);
-        let body = &after["<tool_call>".len()..];
-        let Some(end) = body.find("</tool_call>") else {
-            clean.push_str(after);
-            rest = "";
-            break;
-        };
-        let block = body[..end].trim();
-        match serde_json::from_str::<serde_json::Value>(block) {
-            Ok(v) if v["name"].is_string() => {
-                let args = if v["arguments"].is_null() {
-                    "{}".to_string()
-                } else {
-                    v["arguments"].to_string()
-                };
-                calls.push((v["name"].as_str().unwrap_or("").to_string(), args));
-            }
-            _ => {
-                clean.push_str(&after[..("<tool_call>".len() + end + "</tool_call>".len())]);
-            }
-        }
-        rest = &body[end + "</tool_call>".len()..];
-    }
-    clean.push_str(rest);
-    (clean.trim_end().to_string(), calls)
+    tool_calls::extract_tool_calls(text)
 }
 
 #[cfg(target_os = "linux")]
@@ -1573,6 +1548,7 @@ fn prefix_common(
     Ok(common)
 }
 
+#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)] // one call site; the request fields do not want a struct
 fn handle_chat(
     stream: &mut std::net::TcpStream,
@@ -1599,7 +1575,14 @@ fn handle_chat(
     let top_p = req["top_p"].as_f64().map(|v| v as f32).unwrap_or(1.0);
     let min_p = req["min_p"].as_f64().map(|v| v as f32).unwrap_or(0.0);
     let seed = req["seed"].as_u64().unwrap_or(42);
-    let streaming = req["stream"].as_bool().unwrap_or(false);
+    // MCP agentic loop is non-stream only. Force that when tools are enabled
+    // so DSML/Hy3 tool markup is never streamed into the chat bubble before
+    // extract_tool_calls can strip it.
+    let want_stream = req["stream"].as_bool().unwrap_or(false);
+    let streaming = want_stream
+        && !mcp
+            .map(|m| m.has_enabled_tools())
+            .unwrap_or(false);
 
     // Per-request reasoning control, accepting both conventions clients
     // actually send: OpenAI's top-level `reasoning_effort` and the
@@ -1870,9 +1853,9 @@ fn handle_chat(
                         send_err.set(true);
                     }
                 }
-                const MARK: &[u8] = b"<tool_call>";
-                if let Some(p) = bytes.windows(MARK.len()).position(|w| w == MARK) {
+                if let Some(p) = tool_calls::find_tool_open(&bytes) {
                     // stream the text before the call, then go silent
+                    // (covers generic JSON, Hy3 opensource, DeepSeek DSML)
                     bytes.truncate(p);
                     tool_phase.set(true);
                 }
@@ -1881,13 +1864,9 @@ fn handle_chat(
                     Err(e) => e.valid_up_to(),
                 };
                 if !tool_phase.get() {
-                    // hold back ONLY a tail that is itself a prefix of the
-                    // <tool_call> marker, so ordinary text streams immediately
-                    // instead of always lagging (and stalling) 10 bytes behind
-                    let hold = (1..MARK.len().min(bytes.len() + 1))
-                        .rev()
-                        .find(|&k| bytes.ends_with(&MARK[..k]))
-                        .unwrap_or(0);
+                    // hold back ONLY a tail that is itself a prefix of a
+                    // tool-open marker, so ordinary text streams immediately
+                    let hold = tool_calls::tool_open_holdback(&bytes);
                     valid = valid.min(bytes.len() - hold);
                 }
                 if valid > 0 && !send_err.get() {
@@ -2010,6 +1989,25 @@ fn handle_chat(
             }
             let full = String::from_utf8_lossy(&out).into_owned();
             let (c, this_calls) = extract_tool_calls(&full);
+            if !this_calls.is_empty() {
+                eprintln!(
+                    "pulsar-serve: {id}: extracted {} tool call(s): {}",
+                    this_calls.len(),
+                    this_calls
+                        .iter()
+                        .map(|(n, _)| n.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            } else if full.contains("DSML")
+                || full.contains("tool_calls:opensource")
+                || full.contains("<tool_call>")
+            {
+                eprintln!(
+                    "pulsar-serve: {id}: tool-like markup present but parse yielded 0 calls ({} bytes)",
+                    full.len()
+                );
+            }
             let (r, c2) = if markers.opens_thinking() {
                 split_open_think(&c)
             } else {

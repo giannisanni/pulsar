@@ -373,11 +373,68 @@ impl McpHub {
         out
     }
 
-    /// Run a tool by its namespaced name. Returns the textual/JSON result the
-    /// model sees inside `<tool_result>`. Never panics.
+    /// Map a model-emitted tool name onto an enabled `server__tool` id.
+    ///
+    /// Models often drop the server prefix (`search_searxng`) or invent a
+    /// short alias (`web_search`). Prefer exact match, then unique bare-tool
+    /// match, then unique substring match among enabled tools.
+    pub fn resolve_tool_name(&self, name: &str) -> String {
+        let name = name.trim();
+        if name.is_empty() {
+            return name.to_string();
+        }
+        let enabled: Vec<String> = self
+            .enabled_tools_as_openai()
+            .iter()
+            .filter_map(|v| v["function"]["name"].as_str().map(str::to_owned))
+            .collect();
+        if enabled.iter().any(|e| e == name) {
+            return name.to_string();
+        }
+        // Unique bare name (after last __)
+        let bare: Vec<&String> = enabled
+            .iter()
+            .filter(|e| e.rsplit_once("__").map(|(_, t)| t == name).unwrap_or(false))
+            .collect();
+        if bare.len() == 1 {
+            return bare[0].clone();
+        }
+        // Unique: enabled tool contains the emitted name (or vice versa)
+        let sub: Vec<&String> = enabled
+            .iter()
+            .filter(|e| {
+                let tool = e.rsplit_once("__").map(|(_, t)| t).unwrap_or(e.as_str());
+                tool.contains(name) || name.contains(tool)
+            })
+            .collect();
+        if sub.len() == 1 {
+            return sub[0].clone();
+        }
+        // Single enabled tool overall — only safe when the model had no choice
+        if enabled.len() == 1 {
+            return enabled[0].clone();
+        }
+        name.to_string()
+    }
+
+    /// Run a tool by its namespaced name (or a bare/alias name the model
+    /// emitted). Returns the textual/JSON result the model sees inside
+    /// `<tool_result>`. Never panics.
     pub fn dispatch_sync(&self, namespaced: &str, args: &str) -> String {
+        let resolved = self.resolve_tool_name(namespaced);
+        if resolved != namespaced {
+            eprintln!("pulsar-serve: mcp resolve {namespaced} -> {resolved}");
+        }
+        let namespaced = resolved.as_str();
         let Some((server, tool)) = namespaced.split_once("__") else {
-            return format!("error: malformed tool name {namespaced}");
+            return format!(
+                "error: malformed tool name {namespaced} (expected server__tool; known: {})",
+                self.enabled_tools_as_openai()
+                    .iter()
+                    .filter_map(|v| v["function"]["name"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         };
         let (client, timeout) = {
             let conns = self.conns.lock().unwrap();

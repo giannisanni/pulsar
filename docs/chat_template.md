@@ -616,9 +616,10 @@ BPE-split.
   back to ChatMarkers. Exotic filters, macros with non-JSON types, or
   helpers outside pycompat can still fail apply.
 - `{% generation %}` blocks are stripped, not executed like llama.cpp/minja.
-- Tool-call replay in Jinja mode uses Pulsar’s `<tool_call>` text
-  convention; models whose templates expect different tool XML need a
-  matching template.
+- Tool-call **emission** is multi-format: the MCP loop parses generic
+  JSON `<tool_call>`, Hy3 `<tool_call:opensource>`, and DeepSeek DSML
+  (`docs/mcp-server.md`). Replay into history still uses the generic
+  form when re-encoding past assistant turns.
 - Network fetches need outbound HTTPS; air-gapped boxes should rely on
   embedded templates, `--offline`, or a pre-seeded cache.
 - `pulsar-cli --chat` currently logs discovery but still encodes with
