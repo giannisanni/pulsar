@@ -613,7 +613,14 @@ BPE-split.
   `minijinja-contrib` **pycompat** so common Python string methods
   (`.format`, `.strip`, `.startswith`, …) work — without that, templates
   like Hy3 fail with `string has no method named format` and serve falls
-  back to ChatMarkers. Exotic filters, macros with non-JSON types, or
+  back to ChatMarkers. Our `tojson` filter also accepts Python's
+  `ensure_ascii=` kwarg. **GLM-5.2** ships
+  [zai-org/GLM-5.2 `chat_template.jinja`](https://huggingface.co/zai-org/GLM-5.2/raw/main/chat_template.jinja)
+  whose `tool_to_json` macro does
+  `{{ v | tojson(ensure_ascii=False) }}` (around line 12); without the
+  kwarg, apply fails with `too many arguments` and serve falls back to
+  ChatMarkers. Fixture + unit test:
+  `crates/tokenizer/tests/glm52_chat_template.jinja`. Exotic filters or
   helpers outside pycompat can still fail apply.
 - `{% generation %}` blocks are stripped, not executed like llama.cpp/minja.
 - Tool-call **emission** is multi-format: the MCP loop parses generic

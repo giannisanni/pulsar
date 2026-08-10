@@ -990,14 +990,52 @@ fn messages_to_value(messages: &[ChatMessage]) -> Json {
     )
 }
 
-fn filter_tojson(value: minijinja::Value) -> Result<String, minijinja::Error> {
-    // Prefer serde round-trip when the value is JSON-compatible.
-    match serde_json::to_value(&value) {
-        Ok(v) => serde_json::to_string(&v).map_err(|e| {
-            minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
-        }),
-        Err(_) => Ok(value.to_string()),
+/// HF/GLM templates call `{{ x|tojson(ensure_ascii=False) }}`. MiniJinja's
+/// built-in only accepts `indent`; leftover kwargs become "too many arguments".
+/// Accept and ignore Python's `ensure_ascii` (we always emit UTF-8 JSON).
+fn filter_tojson(
+    value: minijinja::Value,
+    indent: Option<minijinja::Value>,
+    kwargs: minijinja::value::Kwargs,
+) -> Result<minijinja::Value, minijinja::Error> {
+    let _ensure_ascii: Option<bool> = kwargs.get("ensure_ascii")?;
+    let indent = match indent {
+        Some(v) => Some(v),
+        None => kwargs.get("indent")?,
+    };
+    kwargs.assert_all_used()?;
+
+    let json = match indent {
+        None => serde_json::to_string(&value),
+        Some(ref val) => {
+            let spaces = match bool::try_from(val.clone()).ok() {
+                Some(true) => 2usize,
+                Some(false) => 0,
+                None => usize::try_from(val.clone()).unwrap_or(2),
+            };
+            if spaces == 0 {
+                serde_json::to_string(&value)
+            } else {
+                serde_json::to_string_pretty(&value)
+            }
+        }
     }
+    .map_err(|e| {
+        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
+    })?;
+
+    // HTML-safe escapes (same spirit as minijinja's builtins::tojson)
+    let mut rv = String::with_capacity(json.len());
+    for c in json.chars() {
+        match c {
+            '<' => rv.push_str("\\u003c"),
+            '>' => rv.push_str("\\u003e"),
+            '&' => rv.push_str("\\u0026"),
+            '\'' => rv.push_str("\\u0027"),
+            _ => rv.push(c),
+        }
+    }
+    Ok(minijinja::Value::from_safe_string(rv))
 }
 
 fn raise_exception(msg: String) -> Result<String, minijinja::Error> {
@@ -1162,6 +1200,79 @@ mod tests {
     }
 
     #[test]
+    fn apply_tojson_ensure_ascii_kwarg() {
+        // GLM-4.6 / GLM-5.x templates: `{{ tool | tojson(ensure_ascii=False) }}`
+        // used to fail with "too many arguments (in chat:12)".
+        let tmpl = r#"[gMASK]<sop>
+{%- if tools -%}
+<|system|>
+# Tools
+<tools>
+{% for tool in tools %}
+{{ tool | tojson(ensure_ascii=False) }}
+{% endfor %}
+</tools>
+{%- endif -%}
+{%- for message in messages -%}
+{%- if message['role'] == 'user' -%}<|user|>
+{{ message['content'] }}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}<|assistant|>
+{%- endif -%}"#;
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "Hi".into(),
+        }];
+        let tools = serde_json::json!([{
+            "name": "search",
+            "description": "web search",
+            "parameters": {"type": "object"}
+        }]);
+        let out = apply_chat_template_ex(
+            tmpl,
+            &msgs,
+            true,
+            None,
+            None,
+            Some(&tools),
+            None,
+        )
+        .expect("GLM-style tojson(ensure_ascii=False) must apply");
+        assert!(out.contains("[gMASK]<sop>"));
+        assert!(out.contains("<|user|>"));
+        assert!(out.contains("Hi"));
+        assert!(out.contains("search"));
+        assert!(out.contains("<|assistant|>"));
+    }
+
+    #[test]
+    fn apply_glm_namespace_last_user() {
+        // Minimal GLM pattern using namespace() for last_user_index.
+        let tmpl = r#"{%- set ns = namespace(last_user_index=-1) -%}
+{%- for m in messages -%}
+{%- if m.role == 'user' -%}{%- set ns.last_user_index = loop.index0 -%}{%- endif -%}
+{%- endfor -%}
+idx={{ ns.last_user_index }}
+{%- for m in messages -%}
+{{ m.role }}:{{ m.content }};
+{%- endfor -%}"#;
+        let msgs = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: "sys".into(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            },
+        ];
+        let out = apply_chat_template(tmpl, &msgs, false, None, None, None).unwrap();
+        assert!(out.contains("idx=1"), "out={out}");
+        assert!(out.contains("user:hi"));
+    }
+
+    #[test]
     fn hf_id_from_repo_url() {
         assert_eq!(
             hf_id_from_url("https://huggingface.co/Qwen/Qwen2.5-7B-Instruct"),
@@ -1178,5 +1289,48 @@ mod tests {
         assert!(looks_like_hf_id("Qwen/Qwen2.5-7B-Instruct"));
         assert!(!looks_like_hf_id("Qwen2.5 only"));
         assert!(!looks_like_hf_id("solo"));
+    }
+
+    /// Official zai-org/GLM-5.2 chat_template.jinja (line 12 is
+    /// `tojson(ensure_ascii=False)` inside tool_to_json).
+    #[test]
+    fn apply_official_glm52_template() {
+        let tmpl = include_str!("../tests/glm52_chat_template.jinja");
+        assert!(
+            tmpl.contains("tojson(ensure_ascii=False)"),
+            "fixture must match upstream GLM-5.2 template"
+        );
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "Hello".into(),
+        }];
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "web search",
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}
+            }
+        }]);
+        let extra = serde_json::json!({
+            "enable_thinking": false,
+            "reasoning_effort": "high"
+        });
+        let out = apply_chat_template_ex(
+            tmpl,
+            &msgs,
+            true,
+            None,
+            None,
+            Some(&tools),
+            Some(&extra),
+        )
+        .expect("official GLM-5.2 template must apply");
+        assert!(out.contains("[gMASK]<sop>"), "out starts wrong: {}", &out[..out.len().min(80)]);
+        assert!(out.contains("<|user|>Hello") || out.contains("<|user|>\nHello") || out.contains("<|user|>Hello"), "out={out}");
+        assert!(out.contains("<|assistant|>"));
+        assert!(out.contains("search"), "tools section missing: {out}");
+        // enable_thinking false → empty think opener
+        assert!(out.contains("<think></think>") || out.ends_with("<think>") || out.contains("<|assistant|><think>"));
     }
 }
