@@ -23,6 +23,70 @@ pub const TOOL_OPEN_MARKERS: &[&[u8]] = &[
     b"<|DSML|",
 ];
 
+/// True when a Jinja template (or free text) uses DeepSeek DSML tool markup.
+pub fn is_dsml_template(template: &str) -> bool {
+    template.contains("DSML") || template.contains("｜DSML｜") || template.contains("|DSML|")
+}
+
+/// Render one or more tool calls as a DeepSeek DSML block (fullwidth pipes).
+/// Used when replaying assistant history so V4 keeps the dialect it emits.
+pub fn format_dsml_tool_calls(calls: &[(String, String)]) -> String {
+    let mut s = String::from("<｜DSML｜tool_calls>\n");
+    for (name, args_json) in calls {
+        s.push_str("<｜DSML｜invoke name=\"");
+        s.push_str(name);
+        s.push_str("\">\n");
+        if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(args_json) {
+            for (k, v) in map {
+                match v {
+                    serde_json::Value::String(val) => {
+                        s.push_str("<｜DSML｜parameter name=\"");
+                        s.push_str(&k);
+                        s.push_str("\" string=\"true\">");
+                        s.push_str(&val);
+                        s.push_str("</｜DSML｜parameter>\n");
+                    }
+                    other => {
+                        s.push_str("<｜DSML｜parameter name=\"");
+                        s.push_str(&k);
+                        s.push_str("\">");
+                        s.push_str(&other.to_string());
+                        s.push_str("</｜DSML｜parameter>\n");
+                    }
+                }
+            }
+        } else if !args_json.is_empty() && args_json != "{}" {
+            s.push_str("<｜DSML｜parameter name=\"arguments\" string=\"true\">");
+            s.push_str(args_json);
+            s.push_str("</｜DSML｜parameter>\n");
+        }
+        s.push_str("</｜DSML｜invoke>\n");
+    }
+    s.push_str("</｜DSML｜tool_calls>");
+    s
+}
+
+/// DeepSeek V4 tool-result turn (as a user message content), matching the
+/// HF template examples: `<tool_result>…</tool_result>` without an id attr.
+pub fn format_dsml_tool_result(content: &str) -> String {
+    format!("<tool_result>{content}</tool_result>")
+}
+
+/// Generic JSON tool_call block (Qwen / Hermes / ChatMarkers default).
+pub fn format_generic_tool_calls(calls: &[(String, String)]) -> String {
+    let mut s = String::new();
+    for (name, args) in calls {
+        s.push_str(&format!(
+            "\n<tool_call>\n{{\"name\": \"{name}\", \"arguments\": {args}}}\n</tool_call>"
+        ));
+    }
+    s
+}
+
+pub fn format_generic_tool_result(call_id: &str, content: &str) -> String {
+    format!("<tool_result id=\"{call_id}\">\n{content}\n</tool_result>")
+}
+
 /// Split assistant text into (visible content without tool markup, parsed calls).
 pub fn extract_tool_calls(text: &str) -> (String, Vec<(String, String)>) {
     // Normalize DSML delimiters so fullwidth and ASCII pipes share one path.
@@ -570,5 +634,24 @@ done"#;
     fn find_tool_open_dsml_utf8() {
         let s = "hi <｜DSML｜tool_calls>".as_bytes();
         assert!(find_tool_open(s).is_some());
+    }
+
+    #[test]
+    fn dsml_replay_roundtrip() {
+        let calls = vec![(
+            "search".into(),
+            r#"{"query":"Max Verstappen 2026"}"#.into(),
+        )];
+        let rendered = format_dsml_tool_calls(&calls);
+        let (clean, parsed) = extract_tool_calls(&rendered);
+        assert!(clean.is_empty());
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "search");
+        assert!(parsed[0].1.contains("Max Verstappen"));
+        assert!(is_dsml_template(&rendered));
+        assert_eq!(
+            format_dsml_tool_result("hello"),
+            "<tool_result>hello</tool_result>"
+        );
     }
 }

@@ -1293,28 +1293,48 @@ fn encode_messages_jinja(
     enable_thinking: Option<bool>,
     reasoning_effort: Option<&str>,
 ) -> Result<Vec<u32>, String> {
+    // DeepSeek V4's embedded template speaks DSML; replaying Hermes-style
+    // <tool_call> JSON + id= tool_result leaves the model unable to continue
+    // after MCP dispatch → empty final content in the web UI.
+    let dsml = tool_calls::is_dsml_template(&template.template);
     let mut chat_msgs: Vec<tokenizer::ChatMessage> = Vec::new();
     for msg in messages {
         let role = msg["role"].as_str().unwrap_or("user").to_string();
         let mut content = message_text_of(&msg["content"]);
         if role == "assistant" {
             if let Some(calls) = msg["tool_calls"].as_array() {
-                for c in calls {
-                    let f = &c["function"];
-                    content.push_str(&format!(
-                        "\n<tool_call>\n{{\"name\": {}, \"arguments\": {}}}\n</tool_call>",
-                        f["name"],
-                        f["arguments"].as_str().unwrap_or("{}")
-                    ));
+                let pairs: Vec<(String, String)> = calls
+                    .iter()
+                    .filter_map(|c| {
+                        let f = &c["function"];
+                        let name = f["name"].as_str()?.to_string();
+                        let args = f["arguments"].as_str().unwrap_or("{}").to_string();
+                        Some((name, args))
+                    })
+                    .collect();
+                if !pairs.is_empty() {
+                    if dsml {
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        content.push_str(&tool_calls::format_dsml_tool_calls(&pairs));
+                    } else {
+                        content.push_str(&tool_calls::format_generic_tool_calls(&pairs));
+                    }
                 }
             }
         }
         if role == "tool" {
-            let id = msg["tool_call_id"].as_str().unwrap_or("");
-            content = format!("<tool_result id=\"{id}\">\n{content}\n</tool_result>");
+            let body = if dsml {
+                tool_calls::format_dsml_tool_result(&content)
+            } else {
+                let id = msg["tool_call_id"].as_str().unwrap_or("");
+                tool_calls::format_generic_tool_result(id, &content)
+            };
+            // DeepSeek V4 examples feed tool results as a user turn.
             chat_msgs.push(tokenizer::ChatMessage {
                 role: "user".into(),
-                content,
+                content: body,
             });
             continue;
         }
@@ -1421,25 +1441,43 @@ fn encode_messages(
                 ids.extend(m.render_user(tok, &content));
             }
             "assistant" => {
-                // replay past tool calls in the same syntax the model emits
+                // replay past tool calls in the dialect this family emits
                 if let Some(calls) = msg["tool_calls"].as_array() {
-                    for c in calls {
-                        let f = &c["function"];
-                        content.push_str(&format!(
-                            "\n<tool_call>\n{{\"name\": {}, \"arguments\": {}}}\n</tool_call>",
-                            f["name"],
-                            f["arguments"].as_str().unwrap_or("{}")
-                        ));
+                    let pairs: Vec<(String, String)> = calls
+                        .iter()
+                        .filter_map(|c| {
+                            let f = &c["function"];
+                            Some((
+                                f["name"].as_str()?.to_string(),
+                                f["arguments"].as_str().unwrap_or("{}").to_string(),
+                            ))
+                        })
+                        .collect();
+                    if !pairs.is_empty() {
+                        // DeepSeek markers in vocab → DSML replay
+                        let dsml = tok.find_token("<｜User｜>").is_some()
+                            || tok.find_token("<｜DSML｜tool_calls>").is_some();
+                        if dsml {
+                            if !content.is_empty() {
+                                content.push('\n');
+                            }
+                            content.push_str(&tool_calls::format_dsml_tool_calls(&pairs));
+                        } else {
+                            content.push_str(&tool_calls::format_generic_tool_calls(&pairs));
+                        }
                     }
                 }
                 ids.extend(m.render_assistant_history(tok, &content));
             }
             "tool" => {
                 let id = msg["tool_call_id"].as_str().unwrap_or("");
-                ids.extend(m.render_user(
-                    tok,
-                    &format!("<tool_result id=\"{id}\">\n{content}\n</tool_result>"),
-                ));
+                let dsml = tok.find_token("<｜User｜>").is_some();
+                let body = if dsml {
+                    tool_calls::format_dsml_tool_result(&content)
+                } else {
+                    tool_calls::format_generic_tool_result(id, &content)
+                };
+                ids.extend(m.render_user(tok, &body));
             }
             _ => {}
         }
@@ -1946,6 +1984,7 @@ fn handle_chat(
         let mut prompt_len = prompt.len();
         let mut last_finish = "stop";
         let mut prev_calls: Vec<(String, String)> = Vec::new();
+        let mut empty_nudge_used = false;
         for turn in 0..MAX_TURNS {
             let tp = encode(&msgs);
             if tp.len() as u32 + 2 >= st.ctx() {
@@ -2017,6 +2056,20 @@ fn handle_chat(
             reasoning = r;
             calls = this_calls;
             if calls.is_empty() {
+                // DeepSeek often ends a tool-only turn with empty clean text;
+                // after MCP results it may EOS without a final answer if the
+                // history dialect was wrong, or still need one nudge.
+                if clean.trim().is_empty() && turn > 0 && !empty_nudge_used {
+                    empty_nudge_used = true;
+                    eprintln!(
+                        "pulsar-serve: {id}: empty final after tools (turn {turn}); nudging once"
+                    );
+                    msgs.push(serde_json::json!({
+                        "role": "user",
+                        "content": "Based on the tool results above, give a concise final answer now. Do not call tools again.",
+                    }));
+                    continue;
+                }
                 last_finish = "stop";
                 break;
             }
@@ -2064,6 +2117,30 @@ fn handle_chat(
             }
             last_finish = "tool_calls";
             prev_calls = calls.to_vec();
+        }
+        // Never leave the web UI with (empty) after a successful tool loop:
+        // prefer reasoning text, else surface the last tool payload.
+        if clean.trim().is_empty() {
+            if !reasoning.trim().is_empty() {
+                clean = std::mem::take(&mut reasoning);
+            } else {
+                let tool_texts: Vec<String> = msgs
+                    .iter()
+                    .rev()
+                    .filter(|m| m["role"].as_str() == Some("tool"))
+                    .filter_map(|m| m["content"].as_str().map(str::to_owned))
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                if !tool_texts.is_empty() {
+                    eprintln!(
+                        "pulsar-serve: {id}: final content still empty; returning last tool result(s)"
+                    );
+                    clean = tool_texts.join("\n\n");
+                }
+            }
         }
         let mut message = serde_json::json!({"role": "assistant", "content": clean});
         if !reasoning.is_empty() {

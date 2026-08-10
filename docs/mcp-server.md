@@ -124,6 +124,11 @@ Non-stream branch of `handle_chat` only (`main.rs`, `MAX_TURNS = 8`). The stream
    Bare or alias names (`search_searxng`, `web_search`) are rewritten to an
    enabled `server__tool` id by `McpHub::resolve_tool_name` when the match is
    unique (or when only one tool is enabled).
+
+   **DeepSeek V4 / DSML history:** after dispatch, tool turns are re-fed as
+   `<tool_result>…</tool_result>` user content and prior assistant calls are
+   replayed as DSML (not Hermes JSON). Replaying the generic form left the
+   model unable to continue and the web UI showed `(empty)`.
 3. For each call, `mcp.dispatch_sync(name, args)`:
    - splits on the first `__` → `(server, tool)`,
    - checks `allow`/`deny` (deny wins; a non-empty `allow` not containing the tool denies it; otherwise permitted),
