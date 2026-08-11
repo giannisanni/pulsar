@@ -114,8 +114,11 @@ Non-stream branch of `handle_chat` only (`main.rs`, `MAX_TURNS = 8`). The stream
 2. Generate. The model emits tool-call markup; `extract_tool_calls` (in
    `tool_calls.rs`) returns `(clean_text, Vec<(name, args_json)>)`. Accepted
    formats:
-   - **Generic JSON** (what the `# Tools` system prompt teaches):  
+   - **Generic JSON** (what the `# Tools` system prompt teaches for most families):  
      `<tool_call>{"name":"SearchTool__search_searxng","arguments":{…}}</tool_call>`
+   - **Poolside Laguna XML** (native; ChatMarkers injects a matching `### Tools` +
+     `<available_tools>` block so the model actually fires):  
+     `<tool_call>SearchTool__search_searxng<arg_key>query</arg_key><arg_value>…</arg_value></tool_call>`
    - **Hy3 opensource** (native Jinja / chat template):  
      `<tool_calls:opensource><tool_call:opensource>NAME<tool_sep:opensource>…arg_key/arg_value…</tool_call:opensource></tool_calls:opensource>`
    - **DeepSeek DSML** (fullwidth `｜`):  
@@ -129,6 +132,13 @@ Non-stream branch of `handle_chat` only (`main.rs`, `MAX_TURNS = 8`). The stream
    `<tool_result>…</tool_result>` user content and prior assistant calls are
    replayed as DSML (not Hermes JSON). Replaying the generic form left the
    model unable to continue and the web UI showed `(empty)`.
+
+   **Laguna / Poolside history:** tool turns use `<tool_response>…</tool_response>`
+   and assistant calls are replayed as arg_key/arg_value XML. Teaching Hermes
+   JSON in the system prompt is enough for the model to skip tools entirely
+   (harness overfitting — see Poolside’s Laguna S 2.1 notes). Prefer
+   `--jinja-chat` so the official GGUF template’s `<available_tools>` block is
+   used; ChatMarkers already mirrors that dialect when Jinja is off.
 3. For each call, `mcp.dispatch_sync(name, args)`:
    - splits on the first `__` → `(server, tool)`,
    - checks `allow`/`deny` (deny wins; a non-empty `allow` not containing the tool denies it; otherwise permitted),
