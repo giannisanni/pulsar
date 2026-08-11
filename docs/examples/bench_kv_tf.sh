@@ -20,10 +20,13 @@
 #
 # Env: MODEL (required) · PROMPT | PROMPT_FILE · FMTS (default all six)
 #      + same GPU-select vars as runpulsar.sh / bench_kv.sh
+#      (no forced PULSAR_ATTN_GPU; PULSAR_FORCE_ATTN=1 to opt in)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
+# shellcheck source=pulsar_gpu_lib.sh
+source "$(cd "$(dirname "$0")" && pwd)/pulsar_gpu_lib.sh"
 
 CLI="${PULSAR_CLI:-$ROOT/target/release/pulsar-cli}"
 [ -x "$CLI" ] || { echo "build first: cargo build --release -p engine" >&2; exit 1; }
@@ -31,6 +34,9 @@ CLI="${PULSAR_CLI:-$ROOT/target/release/pulsar-cli}"
 MODEL="${MODEL:?set MODEL= to a GQA/Qwen35 family gguf (NOT glm-dsa/GLM-5.2)}"
 FMTS="${FMTS:-f32 fp8 fp16 int8 q8_0 q4_0}"
 MIN_VRAM_MB="${PULSAR_MIN_VRAM_MB:-8192}"
+
+ATTN_FAMILY="$(resolve_attn_family "$MODEL")"
+echo "model family for ATTN: $ATTN_FAMILY${GGUF_ARCH:+ (general.architecture=$GGUF_ARCH)}"
 
 # Long-ish default prompt → enough positions for statistics (~120 tokens).
 # For serious validation, point PROMPT_FILE at a real corpus paragraph.
@@ -136,19 +142,48 @@ if [ -n "${PULSAR_GPU:-}" ]; then
   echo "PULSAR_GPU set — auto-pick skipped (honoring your roles)"
   export CUDA_DEVICE_ORDER=PCI_BUS_ID
   [ -z "${CUDA_VISIBLE_DEVICES:-}" ] && { CUDA_VISIBLE_DEVICES="$(IFS=','; echo "${CAND_IDX[*]}")"; export CUDA_VISIBLE_DEVICES; }
+  ATTN_DECISION_NOTE="manual roles; family=$ATTN_FAMILY${GGUF_ARCH:+ arch=$GGUF_ARCH}"
 else
   export CUDA_DEVICE_ORDER=PCI_BUS_ID
-  if [ -n "${ATTN_PHYS:-}" ]; then
-    export CUDA_VISIBLE_DEVICES="${STREAM_PHYS},${ATTN_PHYS}"
-    export PULSAR_GPU=0; export PULSAR_ATTN_GPU=1
+  # Stream primary = local 0; when ATTN on, local 1 = fattest free secondary.
+  export PULSAR_GPU=0
+  unset PULSAR_ATTN_GPU
+  _force_attn="$(should_force_attn "$ATTN_FAMILY" "$n_cand")"
+  if [ "$n_cand" -ge 2 ]; then
+    if [ "$_force_attn" -eq 1 ] && [ -n "${ATTN_PHYS:-}" ]; then
+      CVD="${STREAM_PHYS},${ATTN_PHYS}"
+      for ((i = 0; i < n_cand; i++)); do
+        [ "$i" -eq "$STREAM_I" ] && continue
+        [ "${CAND_IDX[$i]}" = "$ATTN_PHYS" ] && continue
+        CVD="${CVD},${CAND_IDX[$i]}"
+      done
+      export CUDA_VISIBLE_DEVICES="$CVD"
+      export PULSAR_ATTN_GPU=1
+    else
+      CVD="$STREAM_PHYS"
+      for ((i = 0; i < n_cand; i++)); do
+        [ "$i" -eq "$STREAM_I" ] && continue
+        CVD="${CVD},${CAND_IDX[$i]}"
+      done
+      export CUDA_VISIBLE_DEVICES="$CVD"
+    fi
   else
-    export CUDA_VISIBLE_DEVICES="${STREAM_PHYS}"; export PULSAR_GPU=0; unset PULSAR_ATTN_GPU
+    export CUDA_VISIBLE_DEVICES="${STREAM_PHYS}"
   fi
+  ATTN_DECISION_NOTE="$(attn_policy_note "$ATTN_FAMILY" "$_force_attn" "${GGUF_ARCH:-}")"
 fi
 export PULSAR_CACHE_GB="$CACHE_GB"
+_attn_offload_on=0
+if [ -n "${PULSAR_ATTN_GPU:-}" ] \
+  && [[ "${PULSAR_ATTN_GPU}" != "off" && "${PULSAR_ATTN_GPU}" != "-1" ]]; then
+  _attn_offload_on=1
+fi
 if [ -n "$ATTN_VRAM_USER" ]; then
   [[ "$ATTN_VRAM_USER" == "off" || "$ATTN_VRAM_USER" == "0" ]] && unset PULSAR_ATTN_VRAM_GB || export PULSAR_ATTN_VRAM_GB="$ATTN_VRAM_USER"
-elif [ -z "${MANUAL:-}" ] && [ -n "${ATTN_PHYS:-}" ]; then
+elif [ "$_attn_offload_on" -eq 1 ] && [ -n "${ATTN_PHYS:-}" ] && [ -n "${ATTN_I:-}" ]; then
+  export PULSAR_ATTN_VRAM_GB=$(( (${CAND_FREE[$ATTN_I]} + 512) / 1024 / 2 ))
+elif { [ "$ATTN_FAMILY" = "mla" ] || [ "$ATTN_FAMILY" = "k3" ]; } \
+  && [ -n "${ATTN_PHYS:-}" ] && [ -n "${ATTN_I:-}" ]; then
   export PULSAR_ATTN_VRAM_GB=$(( (${CAND_FREE[$ATTN_I]} + 512) / 1024 / 2 ))
 else
   unset PULSAR_ATTN_VRAM_GB
@@ -158,7 +193,8 @@ if [[ "$CPU" == "off" || "$CPU" == "0" ]]; then unset PULSAR_CPU; else export PU
 export PULSAR_CPU_STEAL="$CPU_STEAL"
 
 echo
-echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES  PULSAR_GPU=$PULSAR_GPU  PULSAR_ATTN_GPU=${PULSAR_ATTN_GPU:-unset}  PULSAR_CPU=${PULSAR_CPU:-off}"
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES  PULSAR_GPU=$PULSAR_GPU  PULSAR_ATTN_GPU=${PULSAR_ATTN_GPU:-unset}"
+echo "ATTN policy: ${ATTN_DECISION_NOTE:-n/a}  PULSAR_CPU=${PULSAR_CPU:-off}"
 echo "PULSAR_KV will cycle: $FMTS"
 echo "model: $MODEL"
 echo

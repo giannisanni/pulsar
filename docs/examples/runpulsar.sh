@@ -13,14 +13,18 @@
 # Env overrides:
 #   PULSAR_MIN_VRAM_MB     min total VRAM to be a candidate (default 8192)
 #   PULSAR_GPU / PULSAR_ATTN_GPU / CUDA_VISIBLE_DEVICES
-#                          if PULSAR_GPU is pre-set with CUDA_VISIBLE_DEVICES, auto-pick is skipped
+#                          if PULSAR_GPU is pre-set, auto-pick is skipped (manual roles)
+#   PULSAR_FORCE_ATTN      auto (default) | 1 | 0
+#                          auto: GGUF arch → MLA/K3 + ≥2 GPUs set ATTN=1;
+#                          GQA never auto (Laguna matmul_q8_0). 1=always force;
+#                          0=never (MLA uses multi-card planner only)
 #   PULSAR_CACHE_GB, PULSAR_ATTN_VRAM_GB (or =off), PULSAR_ATTN_TIER_RESERVE_GB
 #   PULSAR_CPU, PULSAR_CPU_STEAL
 #   MODEL, PROMPT, N
 #   MODE                   generate (default) | chat | serve
 #                          generate: one-shot -p PROMPT -n N
 #                          chat:      pulsar-cli --chat (multi-turn, KV retained;
-#                                     pass --system "..." via args)
+#                                     pass --system "..." / --jinja-chat via args)
 #                          serve:     pulsar-serve --port PORT --host HOST
 #                                     (build first: cargo build --release -p serve)
 #   PORT, HOST             serve mode endpoint (default 11435 / 127.0.0.1)
@@ -28,6 +32,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
+# shellcheck source=pulsar_gpu_lib.sh
+source "$(cd "$(dirname "$0")" && pwd)/pulsar_gpu_lib.sh"
 
 MODEL="${MODEL:-/home/cesar/models/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf}"
 PROMPT="${PROMPT:-The capital of France is}"
@@ -36,6 +42,10 @@ MIN_VRAM_MB="${PULSAR_MIN_VRAM_MB:-8192}"
 MODE="${MODE:-generate}"
 PORT="${PORT:-11435}"
 HOST="${HOST:-127.0.0.1}"
+
+# Family detection for ATTN policy (before GPU pick so logs are early).
+ATTN_FAMILY="$(resolve_attn_family "$MODEL")"
+echo "model family for ATTN: $ATTN_FAMILY${GGUF_ARCH:+ (general.architecture=$GGUF_ARCH)}"
 
 # ---- host expert cache (auto from MemAvailable) ----
 if [ -n "${PULSAR_CACHE_GB:-}" ]; then
@@ -255,23 +265,55 @@ if [ -n "${PULSAR_GPU:-}" ]; then
     export CUDA_VISIBLE_DEVICES
     echo "CUDA_VISIBLE_DEVICES unset — defaulting to capable cards: $CUDA_VISIBLE_DEVICES"
   fi
+  ATTN_DECISION_NOTE="manual roles (PULSAR_GPU set); family=$ATTN_FAMILY${GGUF_ARCH:+ arch=$GGUF_ARCH}"
 else
   export CUDA_DEVICE_ORDER=PCI_BUS_ID
-  if [ -n "$ATTN_PHYS" ]; then
-    # Remap: local 0 = stream primary, local 1 = attn
-    export CUDA_VISIBLE_DEVICES="${STREAM_PHYS},${ATTN_PHYS}"
-    export PULSAR_GPU=0
-    export PULSAR_ATTN_GPU=1
+  # Stream primary = local 0. When ATTN is enabled, local 1 = fattest free
+  # secondary (ATTN_PHYS); remaining candidates follow for expert tiers.
+  export PULSAR_GPU=0
+  unset PULSAR_ATTN_GPU
+  _force_attn="$(should_force_attn "$ATTN_FAMILY" "$n_cand")"
+  if [ "$n_cand" -ge 2 ]; then
+    if [ "$_force_attn" -eq 1 ] && [ -n "${ATTN_PHYS:-}" ]; then
+      CVD="${STREAM_PHYS},${ATTN_PHYS}"
+      for ((i = 0; i < n_cand; i++)); do
+        [ "$i" -eq "$STREAM_I" ] && continue
+        [ "${CAND_IDX[$i]}" = "$ATTN_PHYS" ] && continue
+        CVD="${CVD},${CAND_IDX[$i]}"
+      done
+      export CUDA_VISIBLE_DEVICES="$CVD"
+      export PULSAR_ATTN_GPU=1
+    else
+      CVD="$STREAM_PHYS"
+      for ((i = 0; i < n_cand; i++)); do
+        [ "$i" -eq "$STREAM_I" ] && continue
+        CVD="${CVD},${CAND_IDX[$i]}"
+      done
+      export CUDA_VISIBLE_DEVICES="$CVD"
+    fi
   else
     export CUDA_VISIBLE_DEVICES="${STREAM_PHYS}"
-    export PULSAR_GPU=0
-    unset PULSAR_ATTN_GPU
   fi
+  ATTN_DECISION_NOTE="$(attn_policy_note "$ATTN_FAMILY" "$_force_attn" "${GGUF_ARCH:-}")"
 fi
 
 export PULSAR_CACHE_GB="$CACHE_GB"
 
-# ---- PULSAR_ATTN_VRAM_GB: user override or auto for dual-GPU ----
+# ---- PULSAR_ATTN_VRAM_GB: user override, forced ATTN, or MLA/K3 multi-GPU ----
+_attn_offload_on=0
+if [ -n "${PULSAR_ATTN_GPU:-}" ] \
+  && [[ "${PULSAR_ATTN_GPU}" != "off" && "${PULSAR_ATTN_GPU}" != "-1" ]]; then
+  _attn_offload_on=1
+fi
+# MLA/K3 multi-GPU: engine auto-offloads; still apply a stack budget on the
+# fattest secondary so upload_attn has a sensible cap.
+_mla_auto_budget=0
+if [ "$_attn_offload_on" -eq 0 ] \
+  && { [ "$ATTN_FAMILY" = "mla" ] || [ "$ATTN_FAMILY" = "k3" ]; } \
+  && [ -n "${ATTN_PHYS:-}" ] && [ -n "${ATTN_FREE:-}" ]; then
+  _mla_auto_budget=1
+fi
+
 if [ -n "$ATTN_VRAM_USER" ]; then
   if [[ "$ATTN_VRAM_USER" == "off" || "$ATTN_VRAM_USER" == "0" ]]; then
     unset PULSAR_ATTN_VRAM_GB
@@ -280,16 +322,23 @@ if [ -n "$ATTN_VRAM_USER" ]; then
     export PULSAR_ATTN_VRAM_GB="$ATTN_VRAM_USER"
     ATTN_VRAM_NOTE=" (user override)"
   fi
-elif [ -z "${MANUAL:-}" ] && [ -n "${ATTN_PHYS:-}" ] && [ -n "${ATTN_FREE:-}" ]; then
-  # Dual-GPU: balance resident MLA stack vs residual expert tier on attn card.
+elif [ "$_attn_offload_on" -eq 1 ] && [ -n "${ATTN_PHYS:-}" ] && [ -n "${ATTN_FREE:-}" ]; then
   ATTN_VRAM_GB="$(calc_attn_vram_gb "$ATTN_FREE")"
   export PULSAR_ATTN_VRAM_GB="$ATTN_VRAM_GB"
   _free_g=$(( (ATTN_FREE + 512) / 1024 ))
   ATTN_VRAM_NOTE=" (auto: ~${_free_g}G free on attn → budget ${ATTN_VRAM_GB}G stack, leave rest for expert tier)"
+elif [ "$_mla_auto_budget" -eq 1 ]; then
+  ATTN_VRAM_GB="$(calc_attn_vram_gb "$ATTN_FREE")"
+  export PULSAR_ATTN_VRAM_GB="$ATTN_VRAM_GB"
+  _free_g=$(( (ATTN_FREE + 512) / 1024 ))
+  ATTN_VRAM_NOTE=" (auto ${ATTN_FAMILY}: ~${_free_g}G free on largest secondary → budget ${ATTN_VRAM_GB}G; engine plans layer split)"
 else
-  # Single GPU or manual topology: let the engine default (family-specific).
   unset PULSAR_ATTN_VRAM_GB
-  ATTN_VRAM_NOTE=" (engine default; set PULSAR_ATTN_VRAM_GB to override)"
+  if [ -n "${ATTN_DECISION_NOTE:-}" ]; then
+    ATTN_VRAM_NOTE=" (${ATTN_DECISION_NOTE})"
+  else
+    ATTN_VRAM_NOTE=" (engine default; set PULSAR_ATTN_VRAM_GB to override)"
+  fi
 fi
 
 unset PULSAR_TIERS 2>/dev/null || true
@@ -310,15 +359,26 @@ else
   echo "selected topology:"
   echo "  STREAM primary  physical GPU $STREAM_PHYS  $STREAM_NAME  (free ${STREAM_FREE} MiB, cc ${CAND_CC[$STREAM_I]}, PCIe score ${CAND_PCIE[$STREAM_I]})"
   if [ -n "${ATTN_PHYS:-}" ]; then
-    echo "  ATTN secondary  physical GPU $ATTN_PHYS  $ATTN_NAME  (free ${ATTN_FREE} MiB)"
+    if [ -n "${PULSAR_ATTN_GPU:-}" ] && [[ "${PULSAR_ATTN_GPU}" != "off" && "${PULSAR_ATTN_GPU}" != "-1" ]]; then
+      echo "  ATTN secondary  physical GPU $ATTN_PHYS  $ATTN_NAME  (free ${ATTN_FREE} MiB) — attention offload (PULSAR_ATTN_GPU=$PULSAR_ATTN_GPU)"
+    elif [ "$ATTN_FAMILY" = "primary" ]; then
+      echo "  TIER secondary  physical GPU $ATTN_PHYS  $ATTN_NAME  (free ${ATTN_FREE} MiB) — expert tiers only (attn stays on primary for this arch)"
+    else
+      echo "  extra GPU(s)    physical GPU $ATTN_PHYS  $ATTN_NAME  (free ${ATTN_FREE} MiB) — expert tiers (attn offload not auto-enabled for family=$ATTN_FAMILY)"
+    fi
   else
-    echo "  ATTN secondary  (none — single capable GPU; Pulsar runs single-device)"
+    echo "  secondary GPU   (none — single capable GPU; Pulsar runs single-device)"
   fi
 fi
 echo
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "PULSAR_GPU=$PULSAR_GPU"
-echo "PULSAR_ATTN_GPU=${PULSAR_ATTN_GPU:-unset}"
+if [ -n "${PULSAR_ATTN_GPU:-}" ]; then
+  echo "PULSAR_ATTN_GPU=$PULSAR_ATTN_GPU"
+else
+  echo "PULSAR_ATTN_GPU=unset"
+fi
+echo "ATTN policy: ${ATTN_DECISION_NOTE:-manual topology or single GPU}"
 echo "PULSAR_CACHE_GB=$PULSAR_CACHE_GB${AUTO_CACHE_NOTE:-}"
 echo "PULSAR_DEV_CACHE_GB=${PULSAR_DEV_CACHE_GB:-solved by engine (free VRAM − staging − reserve)}"
 echo "PULSAR_ATTN_VRAM_GB=${PULSAR_ATTN_VRAM_GB:-unset}${ATTN_VRAM_NOTE}"

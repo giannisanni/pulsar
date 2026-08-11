@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Quick PULSAR_KV sweep: tok/s + greedy-id quality diff vs f32 baseline.
 #
-# GPU auto-selection is lifted verbatim from runpulsar.sh (denylist + compute-cap
-# + PCIe scoring + free-VRAM attn pick + auto CACHE_GB / ATTN_VRAM). Keep the
-# two in sync if you touch the topology logic.
+# GPU auto-selection matches runpulsar.sh (denylist + compute-cap + PCIe scoring
+# + multi-GPU visibility without forced PULSAR_ATTN_GPU; PULSAR_FORCE_ATTN=1 to
+# opt in). Keep topology logic in sync with runpulsar.sh.
 #
 # PULSAR_KV only touches GQA / Qwen35 family models. MLA (glm-dsa / GLM-5.2)
 # and Dsv4 keep their own caches and ignore it — this script warns if a format
@@ -21,6 +21,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
+# shellcheck source=pulsar_gpu_lib.sh
+source "$(cd "$(dirname "$0")" && pwd)/pulsar_gpu_lib.sh"
 
 CLI="${PULSAR_CLI:-$ROOT/target/release/pulsar-cli}"
 [ -x "$CLI" ] || { echo "build first: cargo build --release -p engine" >&2; exit 1; }
@@ -30,6 +32,9 @@ PROMPT="${PROMPT:-List the first eight Fibonacci numbers, then explain each in o
 N="${N:-512}"
 FMTS="${FMTS:-f32 fp8 fp16 int8 q8_0 q4_0}"
 MIN_VRAM_MB="${PULSAR_MIN_VRAM_MB:-8192}"
+
+ATTN_FAMILY="$(resolve_attn_family "$MODEL")"
+echo "model family for ATTN: $ATTN_FAMILY${GGUF_ARCH:+ (general.architecture=$GGUF_ARCH)}"
 
 # ---- host expert cache (auto from MemAvailable) ----
 if [ -n "${PULSAR_CACHE_GB:-}" ]; then
@@ -204,20 +209,50 @@ if [ -n "${PULSAR_GPU:-}" ]; then
     export CUDA_VISIBLE_DEVICES
     echo "CUDA_VISIBLE_DEVICES unset — defaulting to capable cards: $CUDA_VISIBLE_DEVICES"
   fi
+  ATTN_DECISION_NOTE="manual roles (PULSAR_GPU set); family=$ATTN_FAMILY${GGUF_ARCH:+ arch=$GGUF_ARCH}"
 else
   export CUDA_DEVICE_ORDER=PCI_BUS_ID
-  if [ -n "$ATTN_PHYS" ]; then
-    export CUDA_VISIBLE_DEVICES="${STREAM_PHYS},${ATTN_PHYS}"
-    export PULSAR_GPU=0
-    export PULSAR_ATTN_GPU=1
+  # Stream primary = local 0; when ATTN on, local 1 = fattest free secondary.
+  export PULSAR_GPU=0
+  unset PULSAR_ATTN_GPU
+  _force_attn="$(should_force_attn "$ATTN_FAMILY" "$n_cand")"
+  if [ "$n_cand" -ge 2 ]; then
+    if [ "$_force_attn" -eq 1 ] && [ -n "${ATTN_PHYS:-}" ]; then
+      CVD="${STREAM_PHYS},${ATTN_PHYS}"
+      for ((i = 0; i < n_cand; i++)); do
+        [ "$i" -eq "$STREAM_I" ] && continue
+        [ "${CAND_IDX[$i]}" = "$ATTN_PHYS" ] && continue
+        CVD="${CVD},${CAND_IDX[$i]}"
+      done
+      export CUDA_VISIBLE_DEVICES="$CVD"
+      export PULSAR_ATTN_GPU=1
+    else
+      CVD="$STREAM_PHYS"
+      for ((i = 0; i < n_cand; i++)); do
+        [ "$i" -eq "$STREAM_I" ] && continue
+        CVD="${CVD},${CAND_IDX[$i]}"
+      done
+      export CUDA_VISIBLE_DEVICES="$CVD"
+    fi
   else
     export CUDA_VISIBLE_DEVICES="${STREAM_PHYS}"
-    export PULSAR_GPU=0
-    unset PULSAR_ATTN_GPU
   fi
+  ATTN_DECISION_NOTE="$(attn_policy_note "$ATTN_FAMILY" "$_force_attn" "${GGUF_ARCH:-}")"
 fi
 
 export PULSAR_CACHE_GB="$CACHE_GB"
+
+_attn_offload_on=0
+if [ -n "${PULSAR_ATTN_GPU:-}" ] \
+  && [[ "${PULSAR_ATTN_GPU}" != "off" && "${PULSAR_ATTN_GPU}" != "-1" ]]; then
+  _attn_offload_on=1
+fi
+_mla_auto_budget=0
+if [ "$_attn_offload_on" -eq 0 ] \
+  && { [ "$ATTN_FAMILY" = "mla" ] || [ "$ATTN_FAMILY" = "k3" ]; } \
+  && [ -n "${ATTN_PHYS:-}" ] && [ -n "${ATTN_FREE:-}" ]; then
+  _mla_auto_budget=1
+fi
 
 if [ -n "$ATTN_VRAM_USER" ]; then
   if [[ "$ATTN_VRAM_USER" == "off" || "$ATTN_VRAM_USER" == "0" ]]; then
@@ -227,14 +262,23 @@ if [ -n "$ATTN_VRAM_USER" ]; then
     export PULSAR_ATTN_VRAM_GB="$ATTN_VRAM_USER"
     ATTN_VRAM_NOTE=" (user override)"
   fi
-elif [ -z "${MANUAL:-}" ] && [ -n "${ATTN_PHYS:-}" ] && [ -n "${ATTN_FREE:-}" ]; then
+elif [ "$_attn_offload_on" -eq 1 ] && [ -n "${ATTN_PHYS:-}" ] && [ -n "${ATTN_FREE:-}" ]; then
   ATTN_VRAM_GB="$(calc_attn_vram_gb "$ATTN_FREE")"
   export PULSAR_ATTN_VRAM_GB="$ATTN_VRAM_GB"
   _free_g=$(( (ATTN_FREE + 512) / 1024 ))
   ATTN_VRAM_NOTE=" (auto: ~${_free_g}G free on attn → budget ${ATTN_VRAM_GB}G stack)"
+elif [ "$_mla_auto_budget" -eq 1 ]; then
+  ATTN_VRAM_GB="$(calc_attn_vram_gb "$ATTN_FREE")"
+  export PULSAR_ATTN_VRAM_GB="$ATTN_VRAM_GB"
+  _free_g=$(( (ATTN_FREE + 512) / 1024 ))
+  ATTN_VRAM_NOTE=" (auto ${ATTN_FAMILY}: ~${_free_g}G free on largest secondary → budget ${ATTN_VRAM_GB}G)"
 else
   unset PULSAR_ATTN_VRAM_GB
-  ATTN_VRAM_NOTE=" (manual topology — engine default; set PULSAR_ATTN_VRAM_GB to override)"
+  if [ -n "${ATTN_DECISION_NOTE:-}" ]; then
+    ATTN_VRAM_NOTE=" (${ATTN_DECISION_NOTE})"
+  else
+    ATTN_VRAM_NOTE=" (engine default; set PULSAR_ATTN_VRAM_GB to override)"
+  fi
 fi
 
 unset PULSAR_TIERS 2>/dev/null || true
@@ -255,7 +299,11 @@ else
   echo "selected topology:"
   echo "  STREAM primary  physical GPU $STREAM_PHYS  $STREAM_NAME  (free ${STREAM_FREE} MiB, cc ${CAND_CC[$STREAM_I]}, PCIe score ${CAND_PCIE[$STREAM_I]})"
   if [ -n "${ATTN_PHYS:-}" ]; then
-    echo "  ATTN secondary  physical GPU $ATTN_PHYS  $ATTN_NAME  (free ${ATTN_FREE} MiB)"
+    if [ -n "${PULSAR_ATTN_GPU:-}" ] && [[ "${PULSAR_ATTN_GPU}" != "off" && "${PULSAR_ATTN_GPU}" != "-1" ]]; then
+      echo "  ATTN secondary  physical GPU $ATTN_PHYS  $ATTN_NAME  (free ${ATTN_FREE} MiB) — forced (PULSAR_ATTN_GPU=$PULSAR_ATTN_GPU)"
+    else
+      echo "  extra GPU(s)    physical GPU $ATTN_PHYS  $ATTN_NAME  (free ${ATTN_FREE} MiB) — tiers / MLA auto-attn (no forced ATTN)"
+    fi
   else
     echo "  ATTN secondary  (none — single capable GPU; Pulsar runs single-device)"
   fi
@@ -264,6 +312,7 @@ echo
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "PULSAR_GPU=$PULSAR_GPU"
 echo "PULSAR_ATTN_GPU=${PULSAR_ATTN_GPU:-unset}"
+echo "ATTN policy: ${ATTN_DECISION_NOTE:-manual or single GPU}"
 echo "PULSAR_CACHE_GB=$PULSAR_CACHE_GB${AUTO_CACHE_NOTE:-}"
 echo "PULSAR_ATTN_VRAM_GB=${PULSAR_ATTN_VRAM_GB:-unset}${ATTN_VRAM_NOTE}"
 echo "PULSAR_KV will cycle: $FMTS"
