@@ -277,12 +277,10 @@ CXX=g++-12 cargo build --release -p engine
 
 # or: OpenAI-compatible server with a built-in web UI at /
 cargo build --release -p serve
-./target/release/pulsar-serve -m /path/to/model.gguf --port 11435
+./target/release/pulsar-serve -m /path/to/model.gguf --host 127.0.0.1 --port 11435 --ctx 8192
 # open http://127.0.0.1:11435/  in a browser for the chat UI
-# MCP tool-use (opt-in): connect the model to MCP servers (stdio + http),
-# managed from the web UI sidebar, persisted to ./mcp.json:
-#   pulsar-serve -m model.gguf --port 11435 --webui-mcp-proxy [--mcp-config FILE]
-# see docs/mcp-server.md for the config format, routes, and the agentic loop
+# optional: --jinja-chat  |  --webui-mcp-proxy [--mcp-config FILE]
+# see “pulsar-serve flags” below and docs/mcp-server.md / docs/chat_template.md
 # or hit the API directly:
 curl http://127.0.0.1:11435/v1/chat/completions -d '{
   "messages": [{"role": "user", "content": "Hello!"}],
@@ -312,23 +310,67 @@ active from token one. The real census replaces the seed on exit;
 `PULSAR_NO_HOTLIST=1` restores the plain cold start. Idea borrowed from
 the static streaming hotlists in antirez's ds4 (MIT).
 
-### CLI flags
+### `pulsar-cli` flags
+
+One-shot generation (`-p` / `--tokens`) or interactive chat (`--chat`).
+Linux + CUDA only.
 
 | flag | meaning |
 |---|---|
-| `-m FILE` | model gguf (required) |
-| `-p TEXT` | prompt (tokenized, BOS prepended) |
-| `--chat` | interactive multi-turn chat (KV retained; ChatMarkers by default) |
-| `--jinja-chat` | with `--chat`: opt-in Jinja encoding (same resolve path as serve) |
-| `--system TEXT` | system prompt for chat mode |
-| `--temp F` / `--top-p F` / `--min-p F` / `--seed N` | sampling (chat defaults to the gguf's `general.sampling.*`; one-shot defaults to greedy) |
-| `--no-bos` | don't prepend BOS |
+| `-m FILE` | model GGUF (required) |
+| `-p TEXT` | prompt text (BOS prepended unless `--no-bos`) |
+| `-f` / `--prompt-file PATH` | read prompt from file (long prompts) |
 | `--tokens 1,2,3` | feed exact token ids instead of text |
-| `-n N` | tokens to generate (default 16) |
+| `-n N` | tokens to generate (default 16; chat uses ≥1024 if `-n` ≤ 16) |
 | `--ctx N` | context size (default 2048) |
+| `--bos` / `--no-bos` | force / suppress BOS on one-shot prompts |
+| `--chat` | interactive multi-turn chat (KV retained; **ChatMarkers** by default) |
+| `--jinja-chat` | with `--chat`: opt-in Jinja (embed → cache → HF → catalog; same as serve) |
+| `--system TEXT` | system prompt for `--chat` |
+| `--temp F` | sampling temperature (chat: gguf `general.sampling.temp` or 0.9; one-shot greedy unless set) |
+| `--top-p F` | nucleus sampling (chat default from gguf or 1.0) |
+| `--min-p F` | min-p sampling (default 0) |
+| `--seed N` | RNG seed (default 42) |
 | `--dump-logits FILE` | write next-token logits as JSON and exit |
-| `--teacher-force` | per-position top-5 JSONL along the given ids |
-| `--decode-consistency N` | decode N steps, fresh-prefill the same sequence, compare logits |
+| `--teacher-force` | per-position top-5 JSONL along the given prompt ids |
+| `--decode-consistency N` | decode N steps, fresh-prefill same sequence, compare logits |
+
+Also used via env on CLI: `PULSAR_DFLASH` (draft GGUF for speculative decode),
+`PULSAR_MTP` / `PULSAR_NGRAM`, `PULSAR_JINJA_CHAT`, `PULSAR_OFFLINE`,
+`PULSAR_DEBUG_CHAT` / `PULSAR_DEBUG_IDS`, `PULSAR_PROFILE` — see
+[Tuning knobs](#tuning-knobs-env-vars).
+
+### `pulsar-serve` flags
+
+OpenAI-compatible HTTP server + web UI. Linux + CUDA only.
+
+| flag | meaning |
+|---|---|
+| `-m FILE` | model GGUF (required) |
+| `--host ADDR` | bind address (default `127.0.0.1`) |
+| `--port N` | listen port (default `11435`) |
+| `--ctx N` | context size (default 8192) |
+| `--jinja-chat` | opt-in Jinja chat encoding (embed → cache → HF → catalog) |
+| `--webui-mcp-proxy` | enable MCP tool-use (web UI sidebar + agentic loop) |
+| `--mcp-config FILE` | MCP servers JSON path (default `./mcp.json` next to cwd) |
+| `--prefix-file PATH` | optional prefix / system context file |
+
+Env for serve: `PULSAR_JINJA_CHAT`, `PULSAR_OFFLINE`, `PULSAR_ALLOWED_HOSTS`,
+`PULSAR_CTX_STATE`, `PULSAR_NO_PREFIX_CACHE`, plus engine knobs below.
+MCP details: [docs/mcp-server.md](docs/mcp-server.md).
+
+### `get-chat-template` flags
+
+No GPU. Resolve / dump a Jinja template (HF id, `.gguf`, or free-form name).
+
+| flag | meaning |
+|---|---|
+| `MODEL_ID` or `MODEL.gguf` | positional: what to resolve (required) |
+| `VARIANT` | optional second positional (e.g. `tool_use`) |
+| `--save PATH` | write template to PATH instead of stdout |
+| `--meta` | source / model_id / size on **stderr**; template on **stdout** |
+| `--offline` | embedded GGUF + local cache only (no HF / catalog) |
+| `-h` / `--help` | usage |
 
 ### Chat templates
 
@@ -380,27 +422,89 @@ ChatMarkers for that request/turn. Full reference:
 
 ### Tuning knobs (env vars)
 
-Everything auto-configures; these override.
+Everything auto-configures; these override. Shared by `pulsar-cli` and
+`pulsar-serve` unless noted.
+
+#### Device / placement
 
 | var | default | what |
 |---|---|---|
 | `PULSAR_GPU` | measured | CUDA index of the expert-streaming (primary) GPU |
-| `PULSAR_ATTN_GPU` | auto (MLA) | attention GPU by CUDA index. MLA models auto-offload (`off` disables); GQA models are opt-in by index: a capacity shuffle that loses on 2 GPUs at short context, pays on 3+ GPUs or long context |
-| `PULSAR_KV` | f32 | GQA K/V storage format. One of `fp8` (e4m3 + per-row scale, ~3.9× smaller KV), `fp16` (IEEE half, ~2.0×), `int8` (int8 + per-row scale, ~4.0×), `q8_0` (32-wide blocks, ~3.8×), `q4_0` (32-wide blocks, ~7.6×), `turbo8` (q8_0 + rotation, ~3.8×), `turbo4` (q4_0 + rotation, ~7.6×). Lossy, hence opt-in: the default f32 keeps decode bit-exact. Runs on any GPU (storage format, no special hardware needed). MLA/Dsv4 keep their own caches. `turbo<4\|8>` (aliases `rotq<4\|8>`, `turboq<4\|8>`) fold a fixed orthogonal rotation into K (pre-append) and Q (pre-attention) so per-32-block outliers spread across the block instead of dominating blockmax `d` — decode-invariant: `(Q@Πᵀ)·(K@Πᵀ)ᵀ = Q@Kᵀ` since ΠᵀΠ=I; V is untouched. Measured on Hy3 with a clean 100% f32-vs-f32 noise floor (`PULSAR_CPU=off`): turbo8 89% / turbo4 86-88% top-1 vs q8_0 64-67% / q4_0 58-64%. Speed is context-dependent, since the rotation costs a fixed two matmuls per layer while the smaller cache saves attention traffic that grows with context: at ctx 512 turbo runs ~7% under f32, at ctx 8192 turbo4 runs ~3% over it. Prefer `turbo4` for long context, where it is the only format reaching ~7.6x at usable quality |
-| `PULSAR_TIERS` | on | `off` disables resident expert tiers (also the bit-exact single-device path) |
-| `PULSAR_CACHE_GB` | measured | host RAM budget for the expert LFU cache (solved from MemAvailable) |
-| `PULSAR_DEV_CACHE_GB` | solved | VRAM hot-expert pool: measured free VRAM minus staging + reserve |
-| `PULSAR_ATTN_VRAM_GB` | all that fits | attn VRAM budget (single-GPU MLA: default 6) |
-| `PULSAR_BATCH` | solved | prefill chunk: largest whose worst-case expert staging fits a third of free VRAM |
-| `PULSAR_NO_PREFETCH` | unset | set to disable the cross-layer prefetcher |
-| `PULSAR_PROFILE` | unset | print per-stage wall-time profile |
-| `PULSAR_JINJA_CHAT` | unset | `1` = same as `--jinja-chat` on serve and `pulsar-cli --chat` (opt-in Jinja; may use network) |
-| `PULSAR_TEMPLATE_CACHE` | platform cache | directory for downloaded `.jinja` chat templates |
-| `PULSAR_OFFLINE` | unset | with Jinja: block HF/catalog (embed + cache only) |
-| `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` | unset | Bearer token for gated HuggingFace `tokenizer_config.json` downloads |
+| `PULSAR_ATTN_GPU` | auto (MLA/K3) | attention GPU by CUDA index. MLA/K3 auto-offload (`off` / `-1` disables); **GQA is opt-in by index** (capacity shuffle) |
+| `PULSAR_ATTN_VRAM_GB` | solved (MLA ~5–6) | attn VRAM budget when packing weights |
+| `PULSAR_ATTN_HOST` | unset | `1` = keep attention weights in pinned host memory |
+| `PULSAR_SPLIT` | auto | multi-GPU layer split: `N` = N leading layers on primary; `off` = single card |
+| `PULSAR_UNIFIED` | auto | unified-memory policy (platform-dependent) |
+| `PULSAR_NO_PINNED` | unset | set = use pageable host allocs instead of pinned |
+| `PULSAR_QUIET` | unset | set = less device / topology chatter at load |
+| `PULSAR_CUDA_ARCH` | auto | build-time NVCC arch list (`kernels` crate) |
 
-¹ defaults shift with the detected topology: attn offload frees pinned
-RAM (host cache 12→22) and primary VRAM (dev cache →8).
+#### KV cache / memory
+
+| var | default | what |
+|---|---|---|
+| `PULSAR_KV` | `f32` (serve UI may show `auto`) | GQA K/V storage: `f32`, `fp8`, `fp16`, `int8`, `q8_0`, `q4_0`, `turbo8`, `turbo4` (aliases `rotq*` / `turboq*`). Lossy formats are opt-in so default decode stays bit-exact. **MLA / Dsv4:** latent KV only honors `f32` \| `fp8` \| `fp16` (`turbo*` is GQA-only). `auto` may pick `fp8` when f32 KV would not fit. Prefer `turbo4` for long GQA context |
+| `PULSAR_CACHE_GB` | measured | host RAM budget for the expert LFU cache |
+| `PULSAR_DEV_CACHE_GB` | solved | VRAM hot-expert pool (free VRAM − staging − reserve) |
+| `PULSAR_BATCH` | solved | prefill chunk size (largest expert-union fit) |
+| `PULSAR_TIERS` | on | `off` = no resident expert tiers (single-device bit-exact path) |
+| `PULSAR_NO_HOTLIST` | unset | set = skip built-in family hotlist seed on cold start |
+| `PULSAR_NO_PREFETCH` | unset | set = disable cross-layer expert prefetcher |
+| `PULSAR_NO_ASYNC_H2D` | unset | set = blocking expert H2D (debug / fallback) |
+| `PULSAR_H2D_PREFETCH` | unset | set = extra H2D prefetch aggressiveness |
+
+#### CPU expert lane
+
+| var | default | what |
+|---|---|---|
+| `PULSAR_CPU` | unset | `1` or `N` = host-cache-hit MoE on CPU (`N` worker threads) |
+| `PULSAR_CPU_STEAL` | on | `0` = do not steal VRAM-resident experts onto the CPU lane |
+| `PULSAR_CPU_CAP` | unset | max experts per step on the CPU lane |
+| `PULSAR_CPU_B` | solved | CPU-lane batch / packing bound |
+| `PULSAR_CPU_VERIFY` | unset | set = dump CPU-vs-GPU lane checks (debug) |
+
+#### Speculation / drafts
+
+| var | default | what |
+|---|---|---|
+| `PULSAR_MTP` | unset | `1` = MTP / nextn speculative decode when the GGUF has a nextn block (greedy) |
+| `PULSAR_MTP_DEPTH` | 3 | draft chain depth for MTP |
+| `PULSAR_NGRAM` | unset | draft-free n-gram speculation depth (greedy; disables some serve prefix-cache paths) |
+| `PULSAR_DFLASH` | unset | path to DFlash draft GGUF (CLI speculative path) |
+| `PULSAR_GRAPHS` | on | `0` = disable CUDA graphs where supported (e.g. Qwen3.5) |
+
+#### Chat templates (serve + CLI chat)
+
+| var | default | what |
+|---|---|---|
+| `PULSAR_JINJA_CHAT` | unset | `1` = same as `--jinja-chat` (opt-in Jinja; may use network) |
+| `PULSAR_OFFLINE` | unset | with Jinja: embed + cache only (no HF / llama.cpp catalog) |
+| `PULSAR_TEMPLATE_CACHE` | platform cache | directory for downloaded `.jinja` templates |
+| `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` | unset | Bearer for gated HuggingFace `tokenizer_config.json` |
+| `PULSAR_DEBUG_CHAT` | unset | log rendered Jinja prompt text |
+| `PULSAR_DEBUG_IDS` | unset | log prompt token id sequences |
+
+#### Serve-only
+
+| var | default | what |
+|---|---|---|
+| `PULSAR_ALLOWED_HOSTS` | localhost-ish | comma-separated Host allowlist for the HTTP server |
+| `PULSAR_CTX_STATE` | unset | path for persisted context / session state |
+| `PULSAR_NO_PREFIX_CACHE` | unset | set = disable multi-request prefix KV reuse |
+
+#### Profiling / debug (operator)
+
+| var | default | what |
+|---|---|---|
+| `PULSAR_PROFILE` | unset | set = print per-stage wall-time profile |
+| `PULSAR_MTP_DEBUG` / `PULSAR_MTP_TIMING` | unset | MTP accept / timing logs |
+| `PULSAR_DFLASH_DEBUG` | unset | DFlash draft debug |
+| `PULSAR_NO_DEEP_BATCH` | unset | Dsv4: restore exact single-step prefill |
+| `PULSAR_NO_GROUPED` | unset | disable grouped MoE matmul path |
+| `PULSAR_LANE_DBG` / `PULSAR_ROUTER_HIST` / `PULSAR_L2_TRACE` | unset | low-level routing / layer traces |
+
+¹ Defaults shift with topology: attn offload frees pinned RAM and primary
+VRAM for larger host / dev expert caches.
 
 ### Tests
 
