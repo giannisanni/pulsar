@@ -2663,11 +2663,14 @@ mod real {
     /// ride the q8_0 fast path; ~0.4% quantization noise). Q8_0 tensors
     /// pass through (unsloth UD-* ships the compressor/indexer projections
     /// already q8_0; re-quantizing would be lossy AND wrong-layout).
+    /// BF16 decodes like f16 but with the other exponent bias: newer
+    /// unsloth UD-Q8_K_XL deepseek4 shards carry attn_compressor_kv as
+    /// BF16, and reading those bytes as f16 is silent garbage.
     fn read_f16_as_q8(file: &VFile, g: &Gguf, name: &str) -> Result<Vec<u8>> {
         let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
         let n = t.n_elements() as usize;
         match t.ty {
-            TensorType::F16 => {
+            TensorType::F16 | TensorType::BF16 => {
                 let mut buf = vec![0u8; n * 2];
                 file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
                 let mut out = Vec::with_capacity(n / 32 * 34);
@@ -2675,7 +2678,12 @@ mod real {
                 for blk in buf.chunks(512) {
                     let m = blk.len() / 2;
                     for (i, c) in blk.chunks_exact(2).enumerate() {
-                        f[i] = requant::f16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+                        let bits = u16::from_le_bytes([c[0], c[1]]);
+                        f[i] = if t.ty == TensorType::BF16 {
+                            quant::bf16_to_f32(bits)
+                        } else {
+                            requant::f16_to_f32(bits)
+                        };
                     }
                     requant::quantize_q8_0(&f[..m], &mut out);
                 }
@@ -2686,7 +2694,7 @@ mod real {
                 file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
                 Ok(buf)
             }
-            other => Err(format!("{name}: expected f16/q8_0, got {other:?}").into()),
+            other => Err(format!("{name}: expected f16/bf16/q8_0, got {other:?}").into()),
         }
     }
 
