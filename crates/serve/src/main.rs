@@ -1413,7 +1413,7 @@ fn handle_chat(
     let temp = req["temperature"].as_f64().map(|v| v as f32).unwrap_or(default_temp);
     let top_p = req["top_p"].as_f64().map(|v| v as f32).unwrap_or(1.0);
     let min_p = req["min_p"].as_f64().map(|v| v as f32).unwrap_or(0.0);
-    let seed = req["seed"].as_u64().unwrap_or(42);
+    let seed = req["seed"].as_u64().unwrap_or(rand::random::<u64>());
     let streaming = req["stream"].as_bool().unwrap_or(false);
 
     // Per-request reasoning control, accepting both conventions clients

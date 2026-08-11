@@ -12,6 +12,7 @@ tokenizer = { path = "../tokenizer" }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "process", "sync", "time", "io-util"] }
+rand = { version = "0.10.2" }
 # MCP client (gated behind --webui-mcp-proxy). streamable-http covers both
 # http and sse endpoints since rmcp 0.11 removed the standalone sse transport.
 rmcp = { version = "3", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
