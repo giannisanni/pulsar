@@ -102,9 +102,22 @@ fn run() -> engine::Result {
     let mut prefix_file: Option<String> = None;
     let mut webui_mcp_proxy = false;
     let mut mcp_config: Option<String> = None;
-    // Prefer Jinja chat template (GGUF/HF/llama.cpp catalog) over ChatMarkers.
-    let mut jinja_chat = std::env::var_os("PULSAR_JINJA_CHAT")
-        .is_some_and(|v| v != "0" && !v.is_empty());
+    // Jinja chat encoding is **opt-in only** (`--jinja-chat` / PULSAR_JINJA_CHAT).
+    // ChatMarkers stay the default so carefully-tuned families do not regress.
+    // With Jinja on, resolution is GGUF embed → cache → HF → llama.cpp catalog
+    // (network blocked only by PULSAR_OFFLINE).
+    let mut jinja_chat = match std::env::var("PULSAR_JINJA_CHAT") {
+        Ok(v) if v == "0"
+            || v.is_empty()
+            || v.eq_ignore_ascii_case("false")
+            || v.eq_ignore_ascii_case("off") =>
+        {
+            false
+        }
+        Ok(_) => true,
+        Err(_) => false,
+    };
+    let env_offline = std::env::var_os("PULSAR_OFFLINE").is_some();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut need = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -119,7 +132,6 @@ fn run() -> engine::Result {
             "--webui-mcp-proxy" => webui_mcp_proxy = true,
             "--mcp-config" => mcp_config = Some(need("--mcp-config")?),
             "--jinja-chat" => jinja_chat = true,
-            "--no-jinja-chat" => jinja_chat = false,
             other => return Err(format!("unknown arg {other}").into()),
         }
     }
@@ -135,10 +147,12 @@ fn run() -> engine::Result {
         let (_, g) = engine::parse_header(std::path::Path::new(&model_path))?;
         tokenizer::Tokenizer::from_gguf(&g)?
     };
-    // Auto-discover chat template: GGUF embedded → cache → HF (base model
-    // for quants) → llama.cpp models/templates catalog.
-    let chat_template = {
-        let opts = tokenizer::ChatTemplateOptions::default();
+    // Resolve a chat template only when Jinja is requested. Default ChatMarkers
+    // path never touches the network. With --jinja-chat: embed → cache → HF →
+    // llama.cpp catalog (unless PULSAR_OFFLINE).
+    let chat_template = if jinja_chat {
+        let mut opts = tokenizer::ChatTemplateOptions::default();
+        opts.offline = env_offline;
         match tokenizer::get_chat_template_from_gguf(
             &model.gguf,
             Some(std::path::Path::new(&model_path)),
@@ -158,35 +172,48 @@ fn run() -> engine::Result {
                 Some(r)
             }
             Err(e) => {
-                eprintln!("pulsar-serve: chat template not resolved ({e}); ChatMarkers only");
+                eprintln!(
+                    "pulsar-serve: chat template not resolved ({e}){}",
+                    if env_offline {
+                        " (PULSAR_OFFLINE: embed or local cache only)"
+                    } else {
+                        ""
+                    }
+                );
                 None
             }
         }
+    } else {
+        None
     };
     let markers = match tokenizer::ChatMarkers::resolve(&tok) {
         Ok(m) => m,
         Err(e) => {
-            if chat_template.is_some() {
-                eprintln!(
-                    "pulsar-serve: ChatMarkers unresolved ({e}); forcing --jinja-chat"
-                );
-                jinja_chat = true;
-                tokenizer::ChatMarkers::jinja_fallback(&tok)?
+            // Last resort: if the operator opted into Jinja and we have a
+            // template, serve with stops-only markers. Never auto-enable Jinja
+            // without --jinja-chat.
+            if jinja_chat {
+                if chat_template.is_some() {
+                    eprintln!(
+                        "pulsar-serve: ChatMarkers unresolved ({e}); Jinja encoding with fallback markers"
+                    );
+                    tokenizer::ChatMarkers::jinja_fallback(&tok)?
+                } else {
+                    return Err(format!(
+                        "ChatMarkers unresolved ({e}) and no Jinja template available \
+                         (embed tokenizer.chat_template, warm the cache, or allow network)"
+                    )
+                    .into());
+                }
             } else {
-                return Err(e.into());
+                return Err(format!(
+                    "ChatMarkers unresolved ({e}); pass --jinja-chat if this model needs its HF/GGUF template"
+                )
+                .into());
             }
         }
     };
-    // Use the resolved template when asked, or when it came embedded in the
-    // GGUF (authoritative). Hardcoded ChatMarkers stay the default for
-    // HF/catalog-fetched templates so carefully-tuned styles do not regress.
-    if !jinja_chat {
-        if let Some(ref r) = chat_template {
-            if matches!(r.source, tokenizer::ChatTemplateSource::GgufEmbedded) {
-                jinja_chat = true;
-            }
-        }
-    }
+    let mut jinja_chat = jinja_chat;
     if jinja_chat {
         if chat_template.is_some() {
             eprintln!("pulsar-serve: using Jinja chat template for /v1/chat/completions");
@@ -196,6 +223,8 @@ fn run() -> engine::Result {
             );
             jinja_chat = false;
         }
+    } else {
+        eprintln!("pulsar-serve: ChatMarkers encoding (pass --jinja-chat to use GGUF/HF Jinja templates)");
     }
     // What the CHECKPOINT supports. Clients size their context control from
     // this; whether a given value fits is a separate, per-machine question
@@ -1642,6 +1671,16 @@ fn handle_chat(
     if let Some(b) = req["chat_template_kwargs"]["enable_thinking"].as_bool() {
         req_markers.set_think(b);
     }
+    // Jinja templates carry their own defaults when the client omits the
+    // kwarg. Laguna's official template defaults enable_thinking=true and
+    // opens with `<assistant><think>` — align markers so stream/non-stream
+    // split treats the reply as open-think (otherwise `</think>` leaks into
+    // content: e.g. `NAT</think>NAT`). Web UI omits the field when the
+    // thinking checkbox is on ("let checkpoint decide").
+    let enable_thinking = req["chat_template_kwargs"]["enable_thinking"].as_bool();
+    if jinja_chat && enable_thinking.is_none() && req_markers.is_laguna() {
+        req_markers.set_think(true);
+    }
     let markers = &req_markers;
 
     // Merge client-supplied tools with any enabled MCP tools (namespaced
@@ -1655,7 +1694,15 @@ fn handle_chat(
         }
     }
     let tools = if tools_vec.is_empty() { None } else { Some(tools_vec) };
-    let enable_thinking = req["chat_template_kwargs"]["enable_thinking"].as_bool();
+    // When Jinja + Laguna and client omitted the kwarg, pass true so apply
+    // matches opens_thinking / stream split (template default is true).
+    let enable_thinking = enable_thinking.or_else(|| {
+        if jinja_chat && markers.is_laguna() {
+            Some(true)
+        } else {
+            None
+        }
+    });
     let reasoning_effort = req["reasoning_effort"].as_str().map(|s| s.to_string());
     let encode = |msgs: &[serde_json::Value]| {
         encode_messages_auto(

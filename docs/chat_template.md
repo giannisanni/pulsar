@@ -6,9 +6,16 @@ Pulsar formats multi-turn chat in two ways:
 2. **Jinja** — HuggingFace-style templates resolved at load time and rendered
    with minijinja
 
-This document is the full reference: discovery, caching, how `pulsar-serve`
-applies a template on every request, how to verify a converted GGUF, CLI
-tooling, library API, env vars, limitations, and troubleshooting.
+This document is the full reference: discovery, caching, how **`pulsar-serve`**
+and **`pulsar-cli --chat`** apply templates, how to verify a converted GGUF,
+the `get-chat-template` tool, library API, env vars, limitations, and
+troubleshooting.
+
+**Policy (both binaries):** ChatMarkers are the default and never phone
+home. Jinja is **opt-in only** via `--jinja-chat` / `PULSAR_JINJA_CHAT=1`.
+There is no `--fetch-template` and no `--no-jinja-chat`: with Jinja on,
+resolution rolls over embed → cache → HF → llama.cpp catalog unless
+`PULSAR_OFFLINE=1`.
 
 ## Code map
 
@@ -19,7 +26,7 @@ tooling, library API, env vars, limitations, and troubleshooting.
 | ChatMarkers (per-family render) | `ChatMarkers` in `crates/tokenizer/src/lib.rs` |
 | CLI binary | `crates/tokenizer/src/bin/get_chat_template.rs` → `get-chat-template` |
 | serve load + per-request encode | `crates/serve/src/main.rs` |
-| CLI load log (discovery only) | `crates/engine/src/bin/pulsar-cli.rs` |
+| CLI chat (`--chat` / `--jinja-chat`) | `crates/engine/src/bin/pulsar-cli.rs` |
 
 Upstream references:
 
@@ -58,11 +65,13 @@ Thinking / reasoning effort is controlled on the markers object
 ChatMarkers layouts are bit-tuned for stop sets, empty-think openers, and
 harmony channels. A downloaded Jinja template can diverge in whitespace or
 optional blocks — that is why HF/catalog templates do **not** auto-enable
-Jinja for known families (see [When serve uses Jinja](#when-serve-uses-jinja)).
+Jinja for known families (see [When Jinja is used](#when-jinja-is-used)).
 
-If `ChatMarkers::resolve` fails but a Jinja template was found, serve
-installs `ChatMarkers::jinja_fallback` (stops / eos only) and forces Jinja
-encoding. Render methods on that fallback must not be used.
+If `ChatMarkers::resolve` fails and the operator passed `--jinja-chat` with
+a resolved template, serve/CLI install `ChatMarkers::jinja_fallback`
+(stops / eos only) so generation can still stop correctly. Render methods
+on that fallback must not be used. Without `--jinja-chat`, resolve failure
+is a hard error.
 
 ### 2. Jinja
 
@@ -71,8 +80,8 @@ rendered with **minijinja**, then tokenized with `encode_with_specials`
 (longest-match special vocab entries, BPE on the gaps).
 
 Apply is best-effort: templates that rely on full Jinja2 or llama.cpp
-`{% generation %}` blocks may fail; serve logs the error and falls back to
-ChatMarkers for that request.
+`{% generation %}` blocks may fail; serve/CLI log the error and fall back
+to ChatMarkers for that request or turn.
 
 **Context variables** passed into the template:
 
@@ -204,7 +213,116 @@ Each candidate id is resolved independently until one yields a template.
 
 ---
 
-## How `pulsar-serve` uses the template
+## How serve and CLI use the template
+
+### Policy (opt-in; shared)
+
+| mode | encoding | network |
+|---|---|---|
+| default (no `--jinja-chat`) | ChatMarkers only | **none** (CLI may offline-peek for a load log) |
+| `--jinja-chat` / `PULSAR_JINJA_CHAT=1` | Jinja if template resolves | embed → cache → HF → llama.cpp catalog |
+| `--jinja-chat` + `PULSAR_OFFLINE=1` | Jinja offline only | embed + local cache only |
+
+GGUF-embedded templates are **not** auto-enabled. Opt in with `--jinja-chat`
+so carefully-tuned ChatMarkers stay the default for known families. There
+is no separate fetch flag: Jinja on implies the full rollover path.
+
+Applies to:
+
+| binary | flag surface |
+|---|---|
+| `pulsar-serve` | `--jinja-chat` / `PULSAR_JINJA_CHAT` |
+| `pulsar-cli` | `--chat --jinja-chat` / `PULSAR_JINJA_CHAT` (only affects `--chat`) |
+
+### Jinja modes chart
+
+```text
+                         ┌──────────────────────────────────────┐
+                         │  Opt into model HF/GGUF Jinja layout? │
+                         └──────────────────┬───────────────────┘
+                                            │
+                     no                     │                    yes
+            ┌───────────────────────────────┴───────────────────────────────┐
+            ▼                                                               ▼
+    DEFAULT — ChatMarkers                                      --jinja-chat
+    (no flag / PULSAR_JINJA_CHAT unset)                        or PULSAR_JINJA_CHAT=1
+            │                                                               │
+            ▼                                                               ▼
+    Hardcoded family markers                                      Resolve template
+    Hy3 · ChatML · Laguna · GLM · …                               (first hit wins)
+    Encoding: ChatMarkers                                                  │
+    Network: NEVER                                                ┌────────┴────────┐
+            │                                                     │                 │
+            │                                          no PULSAR_OFFLINE     PULSAR_OFFLINE=1
+            │                                                     │                 │
+            │                                                     ▼                 ▼
+            │                                            Full rollover        Offline only
+            │                                            1. GGUF embed        1. GGUF embed
+            │                                            2. local cache       2. local cache
+            │                                            3. HuggingFace       (no HF / catalog)
+            │                                            4. llama.cpp catalog
+            │                                                     │                 │
+            │                                                     └────────┬────────┘
+            │                                                              │
+            │                                               found? ────────┼─── missing?
+            │                                                  yes         │      no
+            │                                                   │          │      │
+            │                                                   ▼          │      ▼
+            │                                          Encoding: Jinja     │  warn + ChatMarkers
+            │                                          minijinja →         │
+            │                                          encode_with_specials│
+            │                                                   │          │
+            └───────────────────────┬───────────────────────────┘          │
+                                    │                                      │
+                                    ▼                                      │
+                           Stop / EOG always from                          │
+                           ChatMarkers / stop_ids  ◄───────────────────────┘
+                           (Jinja builds the *prompt* only)
+```
+
+| Mode | How | Encoding | Network | Template sources |
+|---|---|---|---|---|
+| **ChatMarkers (default)** | no flag | hardcoded markers | none | n/a |
+| **Jinja online** | `--jinja-chat` | Jinja if resolved | after local miss | embed → cache → HF → catalog |
+| **Jinja offline** | `--jinja-chat` + `PULSAR_OFFLINE=1` | Jinja if resolved | blocked | embed → cache only |
+| **Jinja requested, no template** | flag on, resolve fails | ChatMarkers fallback | attempted (unless offline) | — |
+| **Apply error mid-request** | Jinja on, bad apply | ChatMarkers for that request/turn | already resolved | same template |
+
+```sh
+# A — ChatMarkers (default, no network)
+./target/release/pulsar-serve -m model.gguf
+./target/release/pulsar-cli -m model.gguf --chat
+
+# B — Jinja online (embed → cache → HF → catalog)
+./target/release/pulsar-serve -m model.gguf --jinja-chat
+./target/release/pulsar-cli -m model.gguf --chat --jinja-chat
+
+# C — Jinja offline (embed + cache only)
+PULSAR_OFFLINE=1 ./target/release/pulsar-serve -m model.gguf --jinja-chat
+PULSAR_OFFLINE=1 ./target/release/pulsar-cli -m model.gguf --chat --jinja-chat
+```
+
+**Thinking** (orthogonal, per request when Jinja is on):
+
+```text
+--jinja-chat on
+      │
+      ├─ chat_template_kwargs.enable_thinking: false  → template “thinking off” branch
+      ├─ enable_thinking: true                        → template “thinking on” branch
+      └─ omitted                                      → template default
+            (Laguna official default = true → opens <assistant><think>)
+```
+
+Policy reminders:
+
+| Rule | Meaning |
+|---|---|
+| No `--fetch-template` | Jinja on **is** the network rollover switch |
+| No auto-Jinja from GGUF embed | Always opt-in |
+| No `--no-jinja-chat` | Default is already ChatMarkers |
+| Stops | Never from Jinja; always markers / `stop_ids` |
+| CLI multi-turn Jinja | Full re-prefill each turn |
+| CLI multi-turn ChatMarkers | Incremental KV across turns |
 
 ### Startup (once per process)
 
@@ -212,39 +330,26 @@ Each candidate id is resolved independently until one yields a template.
 load GGUF + tokenizer
         │
         ▼
-get_chat_template_from_gguf(model.gguf, path)
-        │
-        ├─ Ok(r)  → chat_template = Some(r)
-        │           log: "chat template from {source} ({bytes}…)"
-        └─ Err(e) → chat_template = None
-                    log: "chat template not resolved; ChatMarkers only"
+if --jinja-chat:
+    get_chat_template_from_gguf(
+        offline = PULSAR_OFFLINE
+        // else: embed → cache → HF → llama.cpp catalog
+    )
+    if template found → jinja_chat = true
+    else             → warn; fall back to ChatMarkers
+else:
+    chat_template = None  // no network; no embedded auto-on
+    // CLI may still offline-peek and log "available …; pass --jinja-chat"
+    log: ChatMarkers encoding
         │
         ▼
 ChatMarkers::resolve(tok)
-        │
-        ├─ Ok(m)  → markers = m
-        └─ Err + template present
-                  → jinja_chat = true
-                    markers = jinja_fallback(tok)   // stops only
-        │
-        ▼
-if !jinja_chat && source == GgufEmbedded → jinja_chat = true
-if jinja_chat && template present
-        → log: "using Jinja chat template for /v1/chat/completions"
-if jinja_chat && no template
-        → log warning; jinja_chat = false
+  // stops for generate; full encode when Jinja off
+  // on failure + jinja template → jinja_fallback (stops only)
 ```
 
-Flags at parse time:
-
-| flag / env | effect |
-|---|---|
-| `PULSAR_JINJA_CHAT` non-empty and not `0` | `jinja_chat = true` before args |
-| `--jinja-chat` | force on |
-| `--no-jinja-chat` | force off (wins over auto-embedded) |
-
 The resolved Jinja **string** stays in memory for the life of the process.
-It is not re-fetched per request.
+It is not re-fetched per request / turn.
 
 ### Per request: `POST /v1/chat/completions`
 
@@ -318,36 +423,58 @@ Client:  { "messages": [{"role":"user","content":"Hello"}] }
 | Web UI chat | Yes — same endpoint |
 | MCP agentic re-encode turns | Yes — same `encode` path |
 | Stop / EOG detection | Markers / `stop_ids` only |
-| `pulsar-cli --chat` | Discovery **logged**; encoding still ChatMarkers today |
+| `pulsar-cli --chat` | ChatMarkers default; `--jinja-chat` same resolve + apply path |
+| `pulsar-cli -p` / `--tokens` | No chat formatting (raw prompt / ids) |
 | `get-chat-template` | Resolve / dump only (no inference) |
+
+### `pulsar-cli --chat` specifics
+
+| mode | multi-turn behavior |
+|---|---|
+| ChatMarkers (default) | Incremental turns; KV retained across user turns |
+| `--jinja-chat` | Full history re-rendered each turn (re-prefill from `pos=0`) so assistant history is template-faithful |
+| Jinja apply error | log + ChatMarkers for **that** turn |
 
 ---
 
-## When serve uses Jinja
+## When Jinja is used
 
 | condition | behavior |
 |---|---|
-| GGUF embeds `tokenizer.chat_template` | Jinja **on** by default |
-| `ChatMarkers::resolve` fails but a template was found | Jinja **on** (fallback markers for stops) |
-| `--jinja-chat` or `PULSAR_JINJA_CHAT=1` | Jinja **on** if a template exists |
-| Template only from HF / catalog (not embedded) | Jinja **off** unless forced (protects ChatMarkers parity) |
-| `--no-jinja-chat` | force ChatMarkers even with an embedded template |
-| Jinja apply error at request time | log + ChatMarkers for **that** request |
+| default (no flags) | ChatMarkers; no network resolve |
+| `--jinja-chat` | Jinja **on**; embed → cache → HF → llama.cpp catalog |
+| `--jinja-chat` + `PULSAR_OFFLINE=1` | Jinja offline only (embed + cache) |
+| Jinja apply error | log + ChatMarkers for **that** request (serve) or turn (CLI) |
 
 Startup log examples:
 
 ```text
-pulsar-serve: chat template from gguf:tokenizer.chat_template (7646 bytes, model_id=…)
+# default serve
+pulsar-serve: ChatMarkers encoding (pass --jinja-chat to use GGUF/HF Jinja templates)
+```
+
+```text
+# default CLI --chat (offline peek only)
+pulsar: chat template available offline from gguf:tokenizer.chat_template (7646 bytes); pass --jinja-chat to use it
+pulsar chat: … ChatMarkers encoding; empty line or Ctrl-D exits
+```
+
+```text
+# --jinja-chat with embedded template
+pulsar-serve: chat template from gguf:tokenizer.chat_template (7646 bytes, …)
 pulsar-serve: using Jinja chat template for /v1/chat/completions
 ```
 
 ```text
-pulsar-serve: chat template from huggingface:Qwen/Qwen2.5-7B-Instruct (2507 bytes, model_id=…)
-# (no "using Jinja" line unless --jinja-chat)
+# --jinja-chat, no embed — rolls over to HF/catalog
+pulsar-serve: chat template from huggingface:Qwen/Qwen2.5-7B-Instruct (2507 bytes, …)
+pulsar-serve: using Jinja chat template for /v1/chat/completions
 ```
 
 ```text
-pulsar-serve: chat template not resolved (…); ChatMarkers only
+# CLI with Jinja
+pulsar: chat template from gguf:tokenizer.chat_template (7646 bytes)
+pulsar chat: … Jinja encoding; empty line or Ctrl-D exits
 ```
 
 ```text
@@ -368,7 +495,7 @@ python3 scripts/gguf_dump.py /path/to/model.gguf \
 | result | meaning |
 |---|---|
 | `tokenizer.chat_template = {%- …` (long Jinja) | **Embedded** — convert ships a template |
-| key missing | not embedded; Pulsar may still fetch via base model / catalog |
+| key missing | not embedded; with `--jinja-chat` Pulsar may still resolve via base model / catalog |
 
 Example (embedded):
 
@@ -400,28 +527,42 @@ cargo build --release -p tokenizer --bin get-chat-template
 ### 3. Serve / CLI load logs (what will inference use?)
 
 ```sh
+# default — ChatMarkers (no Jinja)
 ./target/release/pulsar-serve -m /path/to/model.gguf
+./target/release/pulsar-cli -m /path/to/model.gguf --chat
+
+# opt-in Jinja
+./target/release/pulsar-serve -m /path/to/model.gguf --jinja-chat
+./target/release/pulsar-cli -m /path/to/model.gguf --chat --jinja-chat
 ```
 
-Look for `chat template from …` and optionally
-`using Jinja chat template for /v1/chat/completions`.
+With `--jinja-chat`, look for `chat template from …` and:
+- serve: `using Jinja chat template for /v1/chat/completions`
+- CLI: `Jinja encoding` in the chat banner
+
+Without the flag, serve logs `ChatMarkers encoding`; CLI may offline-peek
+with `available offline …; pass --jinja-chat to use it`.
 
 ### 4. Debug a live request (rendered text + ids)
 
 ```sh
 PULSAR_DEBUG_CHAT=1 PULSAR_DEBUG_IDS=1 \
-  ./target/release/pulsar-serve -m /path/to/model.gguf
+  ./target/release/pulsar-serve -m /path/to/model.gguf --jinja-chat
+
+PULSAR_DEBUG_CHAT=1 PULSAR_DEBUG_IDS=1 \
+  ./target/release/pulsar-cli -m /path/to/model.gguf --chat --jinja-chat
 ```
 
-Then call `/v1/chat/completions`. Logs show the Jinja string and token ids.
+Serve: call `/v1/chat/completions`. CLI: type a chat turn. Logs show the
+Jinja string and (with `PULSAR_DEBUG_IDS`) token ids.
 
 ### Decision table
 
 | question | how |
 |---|---|
 | Did convert embed a template? | `gguf_dump` or `get-chat-template --offline --meta` → `gguf:…` |
-| Will serve **use** Jinja for this file? | load log `using Jinja…` (embedded auto-on) |
-| Is encoding ChatMarkers instead? | no Jinja line, or `--no-jinja-chat`, or apply failure fallback |
+| Will serve/CLI **use** Jinja for this file? | only with `--jinja-chat` and a resolved template (embed/cache/HF/catalog) |
+| Is encoding ChatMarkers instead? | default, or no `--jinja-chat`, or apply failure fallback |
 
 ---
 
@@ -459,15 +600,15 @@ cargo build --release -p tokenizer --bin get-chat-template
 
 ---
 
-## Environment variables and serve flags
+## Environment variables and flags
 
 | var | default | meaning |
 |---|---|---|
-| `PULSAR_JINJA_CHAT` | unset | force Jinja encoding when a template is resolved (`0` / empty = off) |
+| `PULSAR_JINJA_CHAT` | unset | `1` = opt-in Jinja on serve and `pulsar-cli --chat` (may use network) |
 | `PULSAR_TEMPLATE_CACHE` | platform cache | download cache root (see below) |
-| `PULSAR_OFFLINE` | unset | skip HF and catalog HTTP (embedded + cache only) |
+| `PULSAR_OFFLINE` | unset | with Jinja: embed + cache only (no HF/catalog) |
 | `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` | unset | Bearer for gated HF `tokenizer_config.json` |
-| `PULSAR_DEBUG_CHAT` | unset | log rendered Jinja prompt text each request |
+| `PULSAR_DEBUG_CHAT` | unset | log rendered Jinja prompt text |
 | `PULSAR_DEBUG_IDS` | unset | log prompt token id sequences |
 
 Platform cache default (if `PULSAR_TEMPLATE_CACHE` unset):
@@ -478,21 +619,26 @@ Platform cache default (if `PULSAR_TEMPLATE_CACHE` unset):
 | Windows | `%LOCALAPPDATA%\pulsar\chat-templates` |
 | fallback | `$TMP/pulsar-chat-templates` |
 
-Serve flags:
+Flags (serve and CLI share the same meaning):
 
 | flag | meaning |
 |---|---|
-| `--jinja-chat` | same as `PULSAR_JINJA_CHAT=1` |
-| `--no-jinja-chat` | never use Jinja for encoding |
+| `--jinja-chat` | opt-in Jinja; resolve embed → cache → HF → llama.cpp catalog |
+| *(removed)* `--fetch-template` | not needed — Jinja on implies network rollover |
+| *(removed)* `--no-jinja-chat` | not needed — default is already ChatMarkers |
 
 ```sh
-# force Jinja for HF/catalog-resolved templates
-PULSAR_JINJA_CHAT=1 ./target/release/pulsar-serve -m model.gguf
-# or
-./target/release/pulsar-serve -m model.gguf --jinja-chat
+# default: ChatMarkers, no network
+./target/release/pulsar-serve -m model.gguf
+./target/release/pulsar-cli -m model.gguf --chat
 
-# keep ChatMarkers even when GGUF embeds a template
-./target/release/pulsar-serve -m model.gguf --no-jinja-chat
+# Jinja: embed → cache → HF → catalog
+./target/release/pulsar-serve -m model.gguf --jinja-chat
+./target/release/pulsar-cli -m model.gguf --chat --jinja-chat
+
+# Jinja offline only
+PULSAR_OFFLINE=1 ./target/release/pulsar-serve -m model.gguf --jinja-chat
+PULSAR_OFFLINE=1 ./target/release/pulsar-cli -m model.gguf --chat --jinja-chat
 ```
 
 ---
@@ -628,9 +774,12 @@ BPE-split.
   (`docs/mcp-server.md`). Replay into history still uses the generic
   form when re-encoding past assistant turns.
 - Network fetches need outbound HTTPS; air-gapped boxes should rely on
-  embedded templates, `--offline`, or a pre-seeded cache.
-- `pulsar-cli --chat` currently logs discovery but still encodes with
-  ChatMarkers (serve is the Jinja consumer).
+  embedded templates, `PULSAR_OFFLINE` / `get-chat-template --offline`, or
+  a pre-seeded cache.
+- `pulsar-cli --chat --jinja-chat` uses the same opt-in resolve path as
+  serve. Default `--chat` stays ChatMarkers. Jinja multi-turn re-prefills
+  each turn so history matches the template (less incremental than
+  ChatMarkers KV reuse).
 - HF/catalog templates do not auto-enable Jinja on known families (avoids
   regressing carefully-tuned ChatMarkers).
 
@@ -642,8 +791,10 @@ BPE-split.
 |---|---|
 | `chat template not resolved` | `tokenizer.chat_template` missing? `general.name` / `base_model` / filename? network? `HF_TOKEN`? |
 | `401 gated model` | accept license on HF; set `HF_TOKEN` |
-| `using Jinja` never printed | template only from HF/catalog → pass `--jinja-chat`; or `--no-jinja-chat` forced off |
-| Jinja apply fails every request | `PULSAR_DEBUG_CHAT=1`; dump with `get-chat-template`; try `--no-jinja-chat` |
+| `using Jinja` never printed / still ChatMarkers | default is ChatMarkers; pass `--jinja-chat` (CLI also needs `--chat`) |
+| `unknown arg --jinja-chat` | rebuild `pulsar-cli` / `pulsar-serve` from current main |
+| `unknown arg --fetch-template` | flag removed; use `--jinja-chat` alone |
+| Jinja apply fails every request | `PULSAR_DEBUG_CHAT=1`; dump with `get-chat-template`; omit `--jinja-chat` to stay on ChatMarkers |
 | Wrong chat format / bad stops | embedded template vs ChatMarkers mismatch; try the other path |
 | Stale template | delete under `PULSAR_TEMPLATE_CACHE` and re-fetch |
 | Offline resolve fails | convert did not embed `tokenizer.chat_template`; re-convert with template or seed cache |
@@ -656,27 +807,33 @@ BPE-split.
 # Build tools
 cargo build --release -p tokenizer --bin get-chat-template
 cargo build --release -p serve
+cargo build --release -p engine --bin pulsar-cli
 
 # Does this GGUF embed a template?
 python3 scripts/gguf_dump.py model.gguf | rg chat_template
 ./target/release/get-chat-template model.gguf --offline --meta
 
-# Serve with embedded template (Jinja auto-on)
+# Default ChatMarkers (no network)
 ./target/release/pulsar-serve -m model.gguf --port 11435
+./target/release/pulsar-cli -m model.gguf --chat
 
-# Force / block Jinja
+# Opt-in Jinja (embed → cache → HF → catalog)
 ./target/release/pulsar-serve -m model.gguf --jinja-chat
-./target/release/pulsar-serve -m model.gguf --no-jinja-chat
+./target/release/pulsar-cli -m model.gguf --chat --jinja-chat
+
+# Jinja offline only
+PULSAR_OFFLINE=1 ./target/release/pulsar-serve -m model.gguf --jinja-chat
+PULSAR_OFFLINE=1 ./target/release/pulsar-cli -m model.gguf --chat --jinja-chat
 
 # Debug one completion
 PULSAR_DEBUG_CHAT=1 PULSAR_DEBUG_IDS=1 \
-  ./target/release/pulsar-serve -m model.gguf
+  ./target/release/pulsar-serve -m model.gguf --jinja-chat
 ```
 
 ---
 
 ## Related
 
-- README: Quick start, “Chat templates”, tuning knobs
+- README: Quick start, “Chat templates”, CLI flags, tuning knobs
 - `docs/mcp-server.md` — tool injection on `/v1/chat/completions` (orthogonal
   to which encode path formats messages)

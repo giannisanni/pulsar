@@ -2,6 +2,7 @@
 //!
 //!   pulsar-cli -m model.gguf -p "text" -n 32 [--ctx 2048] [--no-bos]
 //!   pulsar-cli -m model.gguf --chat [--system "..."] [--temp 0.9]
+//!   pulsar-cli -m model.gguf --chat --jinja-chat [--system "..."]
 //!   pulsar-cli -m model.gguf --tokens 120000,16883,11 -n 32
 //!
 //! -p tokenizes raw text (BOS prepended unless --no-bos); --tokens feeds
@@ -9,6 +10,9 @@
 //! --chat is an interactive multi-turn loop with the KV cache retained
 //! across turns; sampling defaults come from the gguf's
 //! general.sampling.* metadata unless --temp/--top-p are given.
+//! --jinja-chat (or PULSAR_JINJA_CHAT=1) opts into Jinja encoding for
+//! --chat: resolve embed → cache → HF → llama.cpp catalog (network
+//! blocked only by PULSAR_OFFLINE).
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -42,6 +46,30 @@ fn print_utf8_prefix(buf: &mut Vec<u8>) {
     }
 }
 
+/// Encode a multi-turn history through a resolved Jinja template.
+#[cfg(target_os = "linux")]
+fn encode_chat_jinja(
+    tok: &tokenizer::Tokenizer,
+    template: &tokenizer::ResolvedChatTemplate,
+    messages: &[tokenizer::ChatMessage],
+) -> Result<Vec<u32>, String> {
+    let bos = tok.bos_id.and_then(|id| tok.token_str(id));
+    let eos = tok.eos_id.and_then(|id| tok.token_str(id));
+    let rendered = tokenizer::apply_chat_template(
+        &template.template,
+        messages,
+        true,
+        bos,
+        eos,
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    if std::env::var_os("PULSAR_DEBUG_CHAT").is_some() {
+        eprintln!("pulsar chat: jinja prompt:\n{rendered}");
+    }
+    Ok(tok.encode_with_specials(&rendered))
+}
+
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn run_chat(
@@ -54,10 +82,26 @@ fn run_chat(
     min_p: f32,
     seed: u64,
     max_tokens: usize,
+    chat_template: Option<&tokenizer::ResolvedChatTemplate>,
 ) -> engine::Result {
     use std::io::BufRead;
 
-    let markers = tokenizer::ChatMarkers::resolve(tok)?;
+    let markers = match tokenizer::ChatMarkers::resolve(tok) {
+        Ok(m) => m,
+        Err(e) => {
+            if chat_template.is_some() {
+                eprintln!(
+                    "pulsar chat: ChatMarkers unresolved ({e}); Jinja encoding with fallback markers"
+                );
+                tokenizer::ChatMarkers::jinja_fallback(tok)?
+            } else {
+                return Err(format!(
+                    "ChatMarkers unresolved ({e}); pass --jinja-chat if this model needs its HF/GGUF template"
+                )
+                .into());
+            }
+        }
+    };
     // sampling defaults from the gguf's own metadata (Hy3 ships 0.9/1.0)
     let meta_f = |k: &str, d: f32| {
         model.gguf.metadata.get(k).and_then(gguf::Value::as_f32).unwrap_or(d)
@@ -68,13 +112,33 @@ fn run_chat(
 
     let mut st = engine::State::new(model, ctx)?;
     let max_tokens = if max_tokens <= 16 { 1024 } else { max_tokens };
+    let jinja = chat_template.is_some();
     eprintln!(
-        "pulsar chat: temp {temp} top-p {top_p} seed {seed}; ctx {ctx}; empty line or Ctrl-D exits"
+        "pulsar chat: temp {temp} top-p {top_p} seed {seed}; ctx {ctx}; {}encoding; empty line or Ctrl-D exits",
+        if jinja { "Jinja " } else { "ChatMarkers " }
     );
 
     let stdin = std::io::stdin();
     let mut pos = 0u32;
     let mut first = true;
+    // Full message history for Jinja re-render each turn (correct multi-turn).
+    let mut history: Vec<tokenizer::ChatMessage> = Vec::new();
+    if let Some(sys) = system.as_ref() {
+        if jinja {
+            history.push(tokenizer::ChatMessage {
+                role: "system".into(),
+                content: sys.clone(),
+            });
+        }
+    } else if jinja {
+        if let Some(dflt) = markers.default_system() {
+            history.push(tokenizer::ChatMessage {
+                role: "system".into(),
+                content: dflt,
+            });
+        }
+    }
+
     loop {
         eprint!("\n> ");
         let mut line = String::new();
@@ -86,17 +150,52 @@ fn run_chat(
             break;
         }
 
-        let mut ids = Vec::new();
-        if first {
-            ids.extend(markers.prologue());
-            ids.extend(markers.prologue_effort(tok));
-            let dflt = markers.default_system();
-            if let Some(sys) = system.as_deref().or(dflt.as_deref()) {
-                ids.extend(markers.render_system(tok, sys));
+        let ids = if let Some(tmpl) = chat_template {
+            history.push(tokenizer::ChatMessage {
+                role: "user".into(),
+                content: line.to_string(),
+            });
+            match encode_chat_jinja(tok, tmpl, &history) {
+                Ok(ids) => {
+                    // Full re-prefill each turn so assistant history is
+                    // template-faithful (token stream may not match a pure
+                    // incremental append of the prior generation).
+                    pos = 0;
+                    ids
+                }
+                Err(e) => {
+                    eprintln!(
+                        "pulsar chat: jinja apply failed ({e}); falling back to ChatMarkers for this turn"
+                    );
+                    history.pop(); // drop the user we just pushed
+                    let mut ids = Vec::new();
+                    if first {
+                        ids.extend(markers.prologue());
+                        ids.extend(markers.prologue_effort(tok));
+                        let dflt = markers.default_system();
+                        if let Some(sys) = system.as_deref().or(dflt.as_deref()) {
+                            ids.extend(markers.render_system(tok, sys));
+                        }
+                        first = false;
+                    }
+                    ids.extend(markers.render_user_turn(tok, line));
+                    ids
+                }
             }
-            first = false;
-        }
-        ids.extend(markers.render_user_turn(tok, line));
+        } else {
+            let mut ids = Vec::new();
+            if first {
+                ids.extend(markers.prologue());
+                ids.extend(markers.prologue_effort(tok));
+                let dflt = markers.default_system();
+                if let Some(sys) = system.as_deref().or(dflt.as_deref()) {
+                    ids.extend(markers.render_system(tok, sys));
+                }
+                first = false;
+            }
+            ids.extend(markers.render_user_turn(tok, line));
+            ids
+        };
         if std::env::var_os("PULSAR_DEBUG_IDS").is_some() {
             eprintln!("pulsar chat: turn ids {ids:?}");
         }
@@ -107,6 +206,7 @@ fn run_chat(
         }
 
         let mut bytes = Vec::new();
+        let mut reply = String::new();
         pos = engine::generate(
             model,
             &mut st,
@@ -126,10 +226,50 @@ fn run_chat(
                     eprint!("[{id}]");
                 }
                 bytes.extend_from_slice(&tok.decode(&[id]));
-                print_utf8_prefix(&mut bytes);
+                // Mirror print_utf8_prefix into `reply` for Jinja history.
+                let valid_len = match std::str::from_utf8(&bytes) {
+                    Ok(s) => {
+                        if chat_template.is_some() {
+                            reply.push_str(s);
+                        }
+                        bytes.len()
+                    }
+                    Err(e) => {
+                        let n = e.valid_up_to();
+                        if n > 0 {
+                            if chat_template.is_some() {
+                                reply.push_str(std::str::from_utf8(&bytes[..n]).unwrap_or(""));
+                            }
+                        }
+                        n
+                    }
+                };
+                if valid_len > 0 {
+                    use std::io::Write;
+                    let out = std::io::stdout();
+                    let mut lock = out.lock();
+                    lock.write_all(&bytes[..valid_len]).ok();
+                    lock.flush().ok();
+                    bytes.drain(..valid_len);
+                }
             },
         )?;
+        // Flush any remaining incomplete multi-byte sequence as lossy text.
+        if !bytes.is_empty() {
+            let tail = String::from_utf8_lossy(&bytes);
+            if chat_template.is_some() {
+                reply.push_str(&tail);
+            }
+            print!("{tail}");
+            bytes.clear();
+        }
         println!();
+        if chat_template.is_some() {
+            history.push(tokenizer::ChatMessage {
+                role: "assistant".into(),
+                content: reply,
+            });
+        }
     }
     st.save_warm(model)?;
     Ok(())
@@ -152,6 +292,19 @@ fn run() -> engine::Result {
     let mut top_p = None;
     let mut min_p = 0.0f32;
     let mut seed = 42u64;
+    // Jinja encoding is opt-in only (same policy as pulsar-serve).
+    let mut jinja_chat = match std::env::var("PULSAR_JINJA_CHAT") {
+        Ok(v) if v == "0"
+            || v.is_empty()
+            || v.eq_ignore_ascii_case("false")
+            || v.eq_ignore_ascii_case("off") =>
+        {
+            false
+        }
+        Ok(_) => true,
+        Err(_) => false,
+    };
+    let env_offline = std::env::var_os("PULSAR_OFFLINE").is_some();
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -178,6 +331,7 @@ fn run() -> engine::Result {
             "--top-p" => top_p = Some(need("--top-p")?.parse::<f32>()?),
             "--min-p" => min_p = need("--min-p")?.parse::<f32>()?,
             "--seed" => seed = need("--seed")?.parse::<u64>()?,
+            "--jinja-chat" => jinja_chat = true,
             other => return Err(format!("unknown arg {other}").into()),
         }
     }
@@ -208,28 +362,75 @@ fn run() -> engine::Result {
         model.shape.n_expert,
         model.shape.n_expert_used
     );
-    // Best-effort chat-template discovery (GGUF → HF base model → llama.cpp
-    // catalog). Used by --chat when PULSAR_JINJA_CHAT=1; always logged so
-    // operators see what would apply.
-    {
-        let opts = tokenizer::ChatTemplateOptions::default();
+    // Template resolution: with --jinja-chat, full rollover (embed → cache →
+    // HF → llama.cpp catalog) unless PULSAR_OFFLINE. Without Jinja, offline
+    // peek only so a normal CLI load never phones home.
+    let chat_template = {
+        let mut opts = tokenizer::ChatTemplateOptions::default();
+        opts.offline = if jinja_chat { env_offline } else { true };
         match tokenizer::get_chat_template_from_gguf(
             &model.gguf,
             Some(std::path::Path::new(&model_path)),
             None,
             &opts,
         ) {
-            Ok(r) => eprintln!(
-                "pulsar: chat template from {} ({} bytes)",
-                r.source,
-                r.template.len()
-            ),
-            Err(e) => eprintln!("pulsar: chat template not resolved ({e})"),
+            Ok(r) => {
+                if jinja_chat {
+                    eprintln!(
+                        "pulsar: chat template from {} ({} bytes{})",
+                        r.source,
+                        r.template.len(),
+                        r.model_id
+                            .as_ref()
+                            .map(|id| format!(", model_id={id}"))
+                            .unwrap_or_default()
+                    );
+                } else {
+                    eprintln!(
+                        "pulsar: chat template available offline from {} ({} bytes); pass --jinja-chat to use it",
+                        r.source,
+                        r.template.len()
+                    );
+                }
+                Some(r)
+            }
+            Err(e) => {
+                if jinja_chat {
+                    eprintln!(
+                        "pulsar: chat template not resolved ({e}){}",
+                        if env_offline {
+                            " (PULSAR_OFFLINE: embed or local cache only)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                None
+            }
         }
-    }
+    };
+    let chat_template = if jinja_chat {
+        if chat_template.is_none() {
+            eprintln!("pulsar: --jinja-chat set but no template available; ChatMarkers encoding");
+        }
+        chat_template
+    } else {
+        None
+    };
 
     if chat {
-        return run_chat(&model, &tok, ctx, system, temp, top_p, min_p, seed, n_predict);
+        return run_chat(
+            &model,
+            &tok,
+            ctx,
+            system,
+            temp,
+            top_p,
+            min_p,
+            seed,
+            n_predict,
+            chat_template.as_ref(),
+        );
     }
 
     let prompt_ids: Vec<u32> = match (tokens_arg, prompt) {

@@ -468,16 +468,24 @@ impl ChatMarkers {
 
     /// True when the assistant opener leaves a reasoning block OPEN, so
     /// generation starts inside it and the first `</think>` closes it.
-    /// GLM with thinking on is the only such style: `<think>` is the last
-    /// PROMPT token, never a generated one, so a consumer that waits for an
-    /// opening tag would route the whole reply to reasoning.
+    /// GLM and Laguna (Jinja / markers with thinking on) put `<think>` as
+    /// the last PROMPT token, never a generated one — a consumer that waits
+    /// for an opening tag would route the whole reply to reasoning.
     pub fn opens_thinking(&self) -> bool {
-        self.style == ChatStyle::Glm && self.think
+        matches!(self.style, ChatStyle::Glm | ChatStyle::Laguna) && self.think
     }
 
     /// Whether this style has a reasoning mode a caller can steer.
     pub fn reasoning_capable(&self) -> bool {
-        matches!(self.style, ChatStyle::Glm | ChatStyle::Harmony)
+        matches!(
+            self.style,
+            ChatStyle::Glm | ChatStyle::Harmony | ChatStyle::Laguna
+        )
+    }
+
+    /// poolside Laguna (`<assistant>` / `<think>` role tags).
+    pub fn is_laguna(&self) -> bool {
+        self.style == ChatStyle::Laguna
     }
 
     /// The effort levels this style understands, weakest first. Clients
@@ -842,7 +850,7 @@ fn looks_like_special_token(t: &str) -> bool {
         return false;
     }
     // Chat / control markers across the families pulsar serves.
-    t.starts_with("<|")
+    if t.starts_with("<|")
         || t.starts_with("<｜")
         || t.starts_with("<start_")
         || t.starts_with("<end_")
@@ -854,7 +862,28 @@ fn looks_like_special_token(t: &str) -> bool {
         || t == "</think>"
         || t == "<think:opensource>"
         || t == "</think:opensource>"
-        || (t.starts_with('<') && t.ends_with('>') && t.chars().any(|c| c == '_' || c == '/'))
+    {
+        return true;
+    }
+    // Laguna BOS uses CJK angle brackets: 〈|EOS|〉 (not ASCII <>).
+    if (t.starts_with('〈') && t.ends_with('〉')) || t.contains("|EOS|") {
+        return true;
+    }
+    // Angle-bracket control tags: <assistant>, <user>, <system>,
+    // </assistant>, <tool_call>, <tool_response>, … — not only those with
+    // `_`/`/` (the old filter missed Laguna open tags, so Jinja prompts
+    // BPE-split `<assistant>` and the model spewed garbage like `NAT</think>NAT`).
+    if t.starts_with('<') && t.ends_with('>') {
+        let inner = &t[1..t.len() - 1];
+        if !inner.is_empty()
+            && inner.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | ':' | '|' | '.' | '-')
+            })
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn string_array(g: &Gguf, key: &'static str) -> Result<Vec<String>, Error> {
@@ -1909,6 +1938,36 @@ fn pretokenize_glm4(s: &[u8]) -> Vec<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn laguna_role_tags_look_like_specials() {
+        // Open tags have no `_`/`/` — old filter missed them and Jinja
+        // BPE-split `<assistant>` (serve showed garbage like NAT</think>NAT).
+        for t in [
+            "<assistant>",
+            "</assistant>",
+            "<user>",
+            "</user>",
+            "<system>",
+            "</system>",
+            "<think>",
+            "</think>",
+            "<tool_call>",
+            "</tool_call>",
+            "<tool_response>",
+            "</tool_response>",
+            "〈|EOS|〉",
+        ] {
+            assert!(
+                looks_like_special_token(t),
+                "expected special: {t:?}"
+            );
+        }
+        // Ordinary words must stay out of the longest-match table.
+        assert!(!looks_like_special_token("assistant"));
+        assert!(!looks_like_special_token("hi"));
+        assert!(!looks_like_special_token("<>"));
+    }
 
     #[test]
     fn kimi_k2_han_runs_and_inline_contractions() {

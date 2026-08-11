@@ -272,6 +272,8 @@ CXX=g++-12 cargo build --release -p engine
 
 # or: interactive chat (multi-turn, KV cache retained across turns)
 ./target/release/pulsar-cli -m /path/to/model.gguf --chat
+# opt-in Jinja (embed → cache → HF → catalog; block network with PULSAR_OFFLINE=1)
+./target/release/pulsar-cli -m /path/to/model.gguf --chat --jinja-chat
 
 # or: OpenAI-compatible server with a built-in web UI at /
 cargo build --release -p serve
@@ -316,7 +318,8 @@ the static streaming hotlists in antirez's ds4 (MIT).
 |---|---|
 | `-m FILE` | model gguf (required) |
 | `-p TEXT` | prompt (tokenized, BOS prepended) |
-| `--chat` | interactive multi-turn chat (KV retained) |
+| `--chat` | interactive multi-turn chat (KV retained; ChatMarkers by default) |
+| `--jinja-chat` | with `--chat`: opt-in Jinja encoding (same resolve path as serve) |
 | `--system TEXT` | system prompt for chat mode |
 | `--temp F` / `--top-p F` / `--min-p F` / `--seed N` | sampling (chat defaults to the gguf's `general.sampling.*`; one-shot defaults to greedy) |
 | `--no-bos` | don't prepend BOS |
@@ -329,53 +332,50 @@ the static streaming hotlists in antirez's ds4 (MIT).
 
 ### Chat templates
 
-Chat formatting has two paths:
+Same policy for **`pulsar-serve`** and **`pulsar-cli --chat`**.
 
-1. **ChatMarkers** (default for known families) — hardcoded special-token
-   layouts for Hy3, Kimi, ChatML/Qwen, Gemma, MiniMax, Inkling, DeepSeek,
-   GLM, Laguna, Harmony (gpt-oss), Kimi K3. Carefully tuned for thinking
-   modes and stop sets.
-2. **Jinja** — HuggingFace-style templates, resolved automatically and
-   applied with minijinja when available.
+Two encoding paths:
 
-**Resolution order** (first hit wins), same idea as
-[llama.cpp's `get_chat_template.py`](https://github.com/ggml-org/llama.cpp/blob/master/scripts/get_chat_template.py)
-plus the curated
-[models/templates](https://github.com/ggml-org/llama.cpp/tree/master/models/templates)
-catalog:
+1. **ChatMarkers** (**default**) — hardcoded special-token layouts for Hy3,
+   Kimi, ChatML/Qwen, Gemma, MiniMax, Inkling, DeepSeek, GLM, Laguna,
+   Harmony (gpt-oss), Kimi K3. Carefully tuned for thinking modes and stop
+   sets. Used unless you opt in. **No network.**
+2. **Jinja** — HuggingFace-style templates via minijinja. **Opt-in only**
+   via `--jinja-chat` or `PULSAR_JINJA_CHAT=1`, even when the GGUF embeds
+   `tokenizer.chat_template`. There is no separate `--fetch-template`
+   flag: opting into Jinja is enough to allow network rollover.
+
+**Template resolution** (only when `--jinja-chat`; first hit wins):
 
 1. Embedded `tokenizer.chat_template` in the GGUF header
-2. Local disk cache (`$PULSAR_TEMPLATE_CACHE` or the platform cache dir)
-3. HuggingFace `tokenizer_config.json` for the model id
-4. llama.cpp `models/templates/*.jinja` on GitHub
+2. Local disk cache (`$PULSAR_TEMPLATE_CACHE` / platform cache)
+3. HuggingFace `tokenizer_config.json` (quant base-model walk)
+4. llama.cpp `models/templates` catalog on GitHub
 
-**Quantized GGUFs** often lack a usable template of their own. Candidates
-are built from `general.base_model.*`, `general.name` /
-`general.basename` / `general.organization` / `general.finetune`, and the
-filename after stripping quant suffixes (`Q4_K_M`, `IQ2_XXS`,
-`UD-Q2_K_XL`, shard `-00001-of-000NN`, …), then each candidate is tried
-against HF and the catalog.
-
-| when Jinja is used | |
-|---|---|
-| GGUF embeds `tokenizer.chat_template` | auto (llama.cpp semantics) |
-| `ChatMarkers` cannot resolve the vocab | auto if a template was found |
-| `--jinja-chat` or `PULSAR_JINJA_CHAT=1` | force when a template is available |
-| `--no-jinja-chat` | keep ChatMarkers even if GGUF embeds one |
+Without `--jinja-chat`, neither binary resolves beyond an offline peek
+(CLI load log only). With Jinja on, steps 3–4 run unless
+`PULSAR_OFFLINE=1` (then embed + cache only).
 
 ```sh
-# dump / save a template (no GPU required)
+# dump / save a template (standalone tool; may use network unless --offline)
 ./target/release/get-chat-template Qwen/Qwen2.5-7B-Instruct --meta
 ./target/release/get-chat-template /path/to/model-Q4_K_M.gguf --save out.jinja
 
-# serve with Jinja encoding (HF/catalog-fetched templates)
-PULSAR_JINJA_CHAT=1 ./target/release/pulsar-serve -m model.gguf
-# or:  pulsar-serve -m model.gguf --jinja-chat
+# default ChatMarkers (no network)
+./target/release/pulsar-serve -m model.gguf
+./target/release/pulsar-cli -m model.gguf --chat
+
+# Jinja: embed → cache → HF → llama.cpp catalog
+./target/release/pulsar-serve -m model.gguf --jinja-chat
+./target/release/pulsar-cli -m model.gguf --chat --jinja-chat
+
+# Jinja offline only (embed + local cache)
+PULSAR_OFFLINE=1 ./target/release/pulsar-serve -m model.gguf --jinja-chat
+PULSAR_OFFLINE=1 ./target/release/pulsar-cli -m model.gguf --chat --jinja-chat
 ```
 
-Gated HF repos need `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`). Set
-`PULSAR_OFFLINE=1` to skip the network (embedded + cache only). Apply
-failures log a warning and fall back to ChatMarkers. Full reference:
+Gated HF repos need `HF_TOKEN`. Apply failures log and fall back to
+ChatMarkers for that request/turn. Full reference:
 [docs/chat_template.md](docs/chat_template.md).
 
 ### Tuning knobs (env vars)
@@ -394,9 +394,9 @@ Everything auto-configures; these override.
 | `PULSAR_BATCH` | solved | prefill chunk: largest whose worst-case expert staging fits a third of free VRAM |
 | `PULSAR_NO_PREFETCH` | unset | set to disable the cross-layer prefetcher |
 | `PULSAR_PROFILE` | unset | print per-stage wall-time profile |
-| `PULSAR_JINJA_CHAT` | unset | set to force Jinja chat encoding when a template is resolved (serve also has `--jinja-chat` / `--no-jinja-chat`) |
+| `PULSAR_JINJA_CHAT` | unset | `1` = same as `--jinja-chat` on serve and `pulsar-cli --chat` (opt-in Jinja; may use network) |
 | `PULSAR_TEMPLATE_CACHE` | platform cache | directory for downloaded `.jinja` chat templates |
-| `PULSAR_OFFLINE` | unset | set to skip HF / llama.cpp catalog network fetches |
+| `PULSAR_OFFLINE` | unset | with Jinja: block HF/catalog (embed + cache only) |
 | `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` | unset | Bearer token for gated HuggingFace `tokenizer_config.json` downloads |
 
 ¹ defaults shift with the detected topology: attn offload frees pinned
@@ -478,10 +478,9 @@ split-gguf loading · MTP + draft-free n-gram speculation (built,
 measured honestly: net-slower until the host cache outruns the disk;
 `PULSAR_MTP=1` / `PULSAR_NGRAM=n` to experiment) · style-aware chat
 templates (Hy3/Kimi/ChatML/Gemma/MiniMax/Inkling/DeepSeek/GLM/Laguna/Harmony/K3)
-plus automatic Jinja discovery (`get-chat-template`: GGUF embedded → cache →
-HuggingFace `tokenizer_config.json` with quant base-model walk → llama.cpp
-`models/templates` catalog; serve uses embedded templates by default and
-`--jinja-chat` / `PULSAR_JINJA_CHAT=1` for HF/catalog) · int8
+plus opt-in Jinja chat templates on serve and CLI (`--jinja-chat`; embed →
+cache → HF → llama.cpp catalog; no separate fetch flag; `get-chat-template`
+CLI) · int8
 tensor-core prefill (dense GEMM + grouped MoE) · MiniMax M3, Qwen3,
 Gemma 4, TML Inkling forward graphs · opt-in fp8 e4m3 KV cache
 (`PULSAR_KV=fp8`) · TurboQuant rotated block-KV (`PULSAR_KV=turbo4|turbo8`,
