@@ -64,3 +64,31 @@ fn find_tool_open_markers() {
     let dsml = "x<｜DSML｜tool_calls>".as_bytes();
     assert!(tool_calls::find_tool_open(dsml).is_some());
 }
+
+#[test]
+fn poolside_laguna_xml() {
+    let t = r#"I'll look that up.
+<tool_call>SearchTool__search_searxng<arg_key>query</arg_key><arg_value>NATO members</arg_value><arg_key>limit</arg_key><arg_value>10</arg_value></tool_call>"#;
+    let (clean, calls) = extract_tool_calls(t);
+    assert_eq!(clean, "I'll look that up.");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "SearchTool__search_searxng");
+    let v: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+    assert_eq!(v["query"], "NATO members");
+    assert_eq!(v["limit"], 10);
+}
+
+#[test]
+fn poolside_format_roundtrip() {
+    let calls = vec![(
+        "terminal".into(),
+        r#"{"cmd":"uname -a"}"#.into(),
+    )];
+    let s = tool_calls::format_poolside_tool_calls(&calls);
+    assert!(s.contains("<tool_call>terminal"));
+    assert!(s.contains("<arg_key>cmd</arg_key>"));
+    let (clean, parsed) = extract_tool_calls(&s);
+    assert!(clean.is_empty());
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].0, "terminal");
+}

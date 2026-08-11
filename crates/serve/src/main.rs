@@ -1324,10 +1324,10 @@ fn encode_messages_jinja(
     enable_thinking: Option<bool>,
     reasoning_effort: Option<&str>,
 ) -> Result<Vec<u32>, String> {
-    // DeepSeek V4's embedded template speaks DSML; replaying Hermes-style
-    // <tool_call> JSON + id= tool_result leaves the model unable to continue
-    // after MCP dispatch → empty final content in the web UI.
+    // DeepSeek V4 speaks DSML; Poolside Laguna speaks arg_key/arg_value XML.
+    // Replaying the wrong dialect leaves the model stuck after MCP dispatch.
     let dsml = tool_calls::is_dsml_template(&template.template);
+    let poolside = tool_calls::is_poolside_template(&template.template);
     let mut chat_msgs: Vec<tokenizer::ChatMessage> = Vec::new();
     for msg in messages {
         let role = msg["role"].as_str().unwrap_or("user").to_string();
@@ -1344,11 +1344,13 @@ fn encode_messages_jinja(
                     })
                     .collect();
                 if !pairs.is_empty() {
+                    if !content.is_empty() {
+                        content.push('\n');
+                    }
                     if dsml {
-                        if !content.is_empty() {
-                            content.push('\n');
-                        }
                         content.push_str(&tool_calls::format_dsml_tool_calls(&pairs));
+                    } else if poolside {
+                        content.push_str(&tool_calls::format_poolside_tool_calls(&pairs));
                     } else {
                         content.push_str(&tool_calls::format_generic_tool_calls(&pairs));
                     }
@@ -1356,17 +1358,25 @@ fn encode_messages_jinja(
             }
         }
         if role == "tool" {
-            let body = if dsml {
-                tool_calls::format_dsml_tool_result(&content)
+            if poolside && !dsml {
+                // Laguna Jinja: role=tool → <tool_response>{{ content }}</tool_response>
+                chat_msgs.push(tokenizer::ChatMessage {
+                    role: "tool".into(),
+                    content,
+                });
             } else {
-                let id = msg["tool_call_id"].as_str().unwrap_or("");
-                tool_calls::format_generic_tool_result(id, &content)
-            };
-            // DeepSeek V4 examples feed tool results as a user turn.
-            chat_msgs.push(tokenizer::ChatMessage {
-                role: "user".into(),
-                content: body,
-            });
+                let body = if dsml {
+                    tool_calls::format_dsml_tool_result(&content)
+                } else {
+                    let id = msg["tool_call_id"].as_str().unwrap_or("");
+                    tool_calls::format_generic_tool_result(id, &content)
+                };
+                // DeepSeek V4 examples feed tool results as a user turn.
+                chat_msgs.push(tokenizer::ChatMessage {
+                    role: "user".into(),
+                    content: body,
+                });
+            }
             continue;
         }
         chat_msgs.push(tokenizer::ChatMessage { role, content });
@@ -1485,7 +1495,7 @@ fn encode_messages(
                         })
                         .collect();
                     if !pairs.is_empty() {
-                        // DeepSeek markers in vocab → DSML replay
+                        // DeepSeek markers in vocab → DSML; Laguna → poolside XML
                         let dsml = tok.find_token("<｜User｜>").is_some()
                             || tok.find_token("<｜DSML｜tool_calls>").is_some();
                         if dsml {
@@ -1493,6 +1503,11 @@ fn encode_messages(
                                 content.push('\n');
                             }
                             content.push_str(&tool_calls::format_dsml_tool_calls(&pairs));
+                        } else if m.is_laguna() {
+                            if !content.is_empty() {
+                                content.push('\n');
+                            }
+                            content.push_str(&tool_calls::format_poolside_tool_calls(&pairs));
                         } else {
                             content.push_str(&tool_calls::format_generic_tool_calls(&pairs));
                         }
@@ -1505,6 +1520,8 @@ fn encode_messages(
                 let dsml = tok.find_token("<｜User｜>").is_some();
                 let body = if dsml {
                     tool_calls::format_dsml_tool_result(&content)
+                } else if m.is_laguna() {
+                    tool_calls::format_poolside_tool_result(&content)
                 } else {
                     tool_calls::format_generic_tool_result(id, &content)
                 };
@@ -2090,6 +2107,7 @@ fn handle_chat(
             } else if full.contains("DSML")
                 || full.contains("tool_calls:opensource")
                 || full.contains("<tool_call>")
+                || full.contains("<arg_key>")
             {
                 eprintln!(
                     "pulsar-serve: {id}: tool-like markup present but parse yielded 0 calls ({} bytes)",

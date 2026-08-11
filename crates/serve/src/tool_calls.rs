@@ -1,15 +1,17 @@
 //! Parse model-emitted tool-call blocks into (clean_text, Vec<(name, args_json)>).
 //!
 //! Models disagree on syntax. Pulsar historically taught a generic JSON form;
-//! DeepSeek V4 / Hy3 (and their GGUF Jinja templates) emit native formats
-//! instead. The agentic MCP loop must accept all of them or the raw markup
-//! leaks into the user reply and no tool runs.
+//! DeepSeek V4 / Hy3 / Poolside Laguna (and their GGUF Jinja templates) emit
+//! native formats instead. The agentic MCP loop must accept all of them or the
+//! raw markup leaks into the user reply and no tool runs.
 //!
 //! Supported:
-//! 1. Generic: `<tool_call>{"name":"…","arguments":{…}}</tool_call>`
-//! 2. Hy3 opensource:
+//! 1. Generic JSON: `<tool_call>{"name":"…","arguments":{…}}</tool_call>`
+//! 2. Poolside Laguna XML (same `<tool_call>` open tag, different body):
+//!    `<tool_call>terminal<arg_key>cmd</arg_key><arg_value>uname -a</arg_value></tool_call>`
+//! 3. Hy3 opensource:
 //!    `<tool_calls:opensource><tool_call:opensource>NAME<tool_sep:opensource>…`
-//! 3. DeepSeek DSML — fullwidth `｜` (U+FF5C) **or** ASCII `|`:
+//! 4. DeepSeek DSML — fullwidth `｜` (U+FF5C) **or** ASCII `|`:
 //!    `<｜DSML｜tool_calls…>` / `<|DSML|tool_calls…>` with invoke + parameter
 
 /// Byte markers that open a tool-call region (stream holdback / silence).
@@ -26,6 +28,14 @@ pub const TOOL_OPEN_MARKERS: &[&[u8]] = &[
 /// True when a Jinja template (or free text) uses DeepSeek DSML tool markup.
 pub fn is_dsml_template(template: &str) -> bool {
     template.contains("DSML") || template.contains("｜DSML｜") || template.contains("|DSML|")
+}
+
+/// True when a Jinja template uses Poolside Laguna tool markup
+/// (`<arg_key>` / `<tool_response>` / `<available_tools>`).
+pub fn is_poolside_template(template: &str) -> bool {
+    template.contains("<arg_key>")
+        || template.contains("<tool_response>")
+        || template.contains("<available_tools>")
 }
 
 /// Render one or more tool calls as a DeepSeek DSML block (fullwidth pipes).
@@ -85,6 +95,39 @@ pub fn format_generic_tool_calls(calls: &[(String, String)]) -> String {
 
 pub fn format_generic_tool_result(call_id: &str, content: &str) -> String {
     format!("<tool_result id=\"{call_id}\">\n{content}\n</tool_result>")
+}
+
+/// Poolside Laguna tool-call body (name + arg_key/arg_value pairs).
+pub fn format_poolside_tool_calls(calls: &[(String, String)]) -> String {
+    let mut s = String::new();
+    for (name, args_json) in calls {
+        s.push_str("<tool_call>");
+        s.push_str(name);
+        if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(args_json) {
+            for (k, v) in map {
+                s.push_str("<arg_key>");
+                s.push_str(&k);
+                s.push_str("</arg_key><arg_value>");
+                match v {
+                    serde_json::Value::String(val) => s.push_str(&val),
+                    other => s.push_str(&other.to_string()),
+                }
+                s.push_str("</arg_value>");
+            }
+        } else if !args_json.is_empty() && args_json != "{}" {
+            s.push_str("<arg_key>arguments</arg_key><arg_value>");
+            s.push_str(args_json);
+            s.push_str("</arg_value>");
+        }
+        s.push_str("</tool_call>");
+    }
+    s
+}
+
+/// Poolside Laguna tool result turn content (template wraps role=tool, or
+/// embed pre-wrapped when replaying as user content).
+pub fn format_poolside_tool_result(content: &str) -> String {
+    format!("<tool_response>{content}</tool_response>")
 }
 
 /// Split assistant text into (visible content without tool markup, parsed calls).
@@ -311,14 +354,69 @@ fn take_generic(s: &str) -> Option<(String, String, usize)> {
     let end = body.find(CLOSE)?;
     let block = body[..end].trim();
     let consumed = OPEN.len() + end + CLOSE.len();
-    let v: serde_json::Value = serde_json::from_str(block).ok()?;
-    let name = v.get("name")?.as_str()?.to_string();
-    let args = if v.get("arguments").is_none_or(|a| a.is_null()) {
-        "{}".into()
-    } else {
-        v["arguments"].to_string()
-    };
-    Some((name, args, consumed))
+    // 1) Hermes / Qwen JSON body
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(block) {
+        if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
+            let args = if v.get("arguments").is_none_or(|a| a.is_null()) {
+                "{}".into()
+            } else {
+                v["arguments"].to_string()
+            };
+            return Some((name.to_string(), args, consumed));
+        }
+    }
+    // 2) Poolside Laguna XML body:
+    //    terminal<arg_key>cmd</arg_key><arg_value>uname -a</arg_value>
+    if let Some((name, args)) = take_poolside_body(block) {
+        return Some((name, args, consumed));
+    }
+    None
+}
+
+/// Parse Poolside tool-call body (no outer tags): `name` + optional arg pairs.
+fn take_poolside_body(block: &str) -> Option<(String, String)> {
+    const KEY_O: &str = "<arg_key>";
+    const KEY_C: &str = "</arg_key>";
+    const VAL_O: &str = "<arg_value>";
+    const VAL_C: &str = "</arg_value>";
+
+    let block = block.trim();
+    if block.is_empty() {
+        return None;
+    }
+    // Name is everything before the first <arg_key>, or the whole block.
+    let name_end = block.find(KEY_O).unwrap_or(block.len());
+    let name = block[..name_end].trim().to_string();
+    // Reject JSON leftovers and empty / tag-like names.
+    if name.is_empty() || name.starts_with('{') || name.starts_with('<') {
+        return None;
+    }
+    // Single-token tool names (allow `__`, `.`, `-`, digits).
+    if name.split_whitespace().count() != 1 {
+        return None;
+    }
+    let mut map = serde_json::Map::new();
+    let mut cursor = &block[name_end..];
+    while let Some(k0) = cursor.find(KEY_O) {
+        let after_k0 = &cursor[k0 + KEY_O.len()..];
+        let Some(k1) = after_k0.find(KEY_C) else {
+            break;
+        };
+        let key = after_k0[..k1].trim().to_string();
+        let after_k1 = &after_k0[k1 + KEY_C.len()..];
+        let Some(v0) = after_k1.find(VAL_O) else {
+            break;
+        };
+        let after_v0 = &after_k1[v0 + VAL_O.len()..];
+        let Some(v1) = after_v0.find(VAL_C) else {
+            break;
+        };
+        let val = after_v0[..v1].to_string();
+        map.insert(key, json_value_from_str(&val));
+        cursor = &after_v0[v1 + VAL_C.len()..];
+    }
+    let args = serde_json::Value::Object(map).to_string();
+    Some((name, args))
 }
 
 fn take_hy3(s: &str) -> Option<(Vec<(String, String)>, usize)> {
@@ -548,6 +646,30 @@ done"#;
         assert_eq!(clean, "hello\n\ndone");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "SearchTool__search_searxng");
+    }
+
+    #[test]
+    fn poolside_laguna_xml() {
+        // Official Poolside form (blog + chat_template history replay).
+        let t = r#"I'll look that up.
+<tool_call>SearchTool__search_searxng<arg_key>query</arg_key><arg_value>NATO members</arg_value><arg_key>limit</arg_key><arg_value>10</arg_value></tool_call>"#;
+        let (clean, calls) = extract_tool_calls(t);
+        assert_eq!(clean, "I'll look that up.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "SearchTool__search_searxng");
+        let v: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(v["query"], "NATO members");
+        assert_eq!(v["limit"], 10);
+    }
+
+    #[test]
+    fn poolside_multiline_name_rejected_as_prose() {
+        // Must not treat free text between tags as a tool name.
+        let t = r#"<tool_call>
+I will search for you
+</tool_call>"#;
+        let (_clean, calls) = extract_tool_calls(t);
+        assert!(calls.is_empty());
     }
 
     #[test]
