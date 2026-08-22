@@ -9238,7 +9238,8 @@ mod real {
                 };
                 t_verify += t0.elapsed();
                 if timing {
-                    eprintln!("mtp step: snap {:.2}ms fwd+amax {:.2}ms total {:.2}ms",
+                    eprintln!("mtp step: draft {:.2}ms snap {:.2}ms fwd+amax {:.2}ms verify-total {:.2}ms",
+                        t_draft.as_secs_f64() * 1e3 / (emitted + 1).max(1) as f64,
                         t_snap.as_secs_f64() * 1e3,
                         t_amax.as_secs_f64() * 1e3,
                         t0.elapsed().as_secs_f64() * 1e3);
