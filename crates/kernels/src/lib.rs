@@ -336,8 +336,6 @@ mod real {
         }
     }
 
-    }
-
     fn ensure_device() {
         use std::sync::Once;
         static ONCE: Once = Once::new();
