@@ -129,10 +129,12 @@ re-reads its shared kv-head rows, so a kv-head-centric layout has
 several-fold headroom left at depth.
 
 A CPU expert lane (opt-in, `PULSAR_CPU=1`) computes host-cache-hit
-experts on the CPU instead of uploading them: AVX2 iq2_xxs and q2_K
+misses on the CPU instead of uploading them: AVX2 iq2_xxs and q2_K
 x q8_K kernels sustain 42 GB/s across the 9900X's cores, above the
 28.7 GB/s the same bytes would cost crossing PCIe, and the dots
-overlap the GPU resolve. Host-cached experts stop competing for
+overlap the GPU resolve. By default the lane also takes VRAM hits that
+are already in host RAM (`PULSAR_CPU_STEAL=0` keeps those on the GPU
+and splits true misses by a measured q* PCIe/host ratio). Host-cached CPU experts stop competing for
 upload bandwidth and VRAM cache slots, so both effects compound:
 DeepSeek-V4-Flash measures 8.2 to 11.3 tok/s, Hy3 6.0 to 6.9, GLM-5.2
 2.7 to 2.8 (re-measured 2026-07-19 after an iq2_xxs correctness fix:
@@ -458,10 +460,14 @@ Everything auto-configures; these override. Shared by `pulsar-cli` and
 | var | default | what |
 |---|---|---|
 | `PULSAR_CPU` | unset | `1` or `N` = host-cache-hit MoE on CPU (`N` worker threads) |
-| `PULSAR_CPU_STEAL` | on | `0` = do not steal VRAM-resident experts onto the CPU lane |
+| `PULSAR_CPU_STEAL` | on | `0` = keep VRAM hits on the GPU and enable q* miss split |
 | `PULSAR_CPU_CAP` | unset | max experts per step on the CPU lane |
 | `PULSAR_CPU_B` | solved | CPU-lane batch / packing bound |
 | `PULSAR_CPU_VERIFY` | unset | set = dump CPU-vs-GPU lane checks (debug) |
+| `PULSAR_NO_HYBRID` | unset | set = every host-cached miss goes to the CPU (disable q*) |
+| `PULSAR_NO_DEV_LRU` | unset | set = heat-only VRAM admits (disable decode LRU eviction) |
+| `PULSAR_PCIE_GBS` | 28.7 | measured PCIe H2D GB/s used by q* |
+| `PULSAR_HOST_GBS` | 42.0 | measured host expert-dot GB/s used by q* |
 
 #### Speculation / drafts
 

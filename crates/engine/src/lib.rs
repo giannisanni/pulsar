@@ -7,11 +7,11 @@
 //! final norm -> lm head.
 //!
 //! Expert streaming: three tiers per layer step. A VRAM hot-set cache
-//! (touch-count admission, so it never thrashes even though one token's
-//! working set exceeds the pool), then an LFU host cache, then io_uring
-//! batch reads whose completions overlap the H2D uploads. The MoE kernels
-//! always receive explicit per-slot device pointers, wherever the bytes
-//! ended up.
+//! (census heat-gate at warm load and prefill; decode LRU can evict a
+//! cold triple to admit a recency-ranked miss), then an LFU host cache,
+//! then io_uring batch reads whose completions overlap the H2D uploads.
+//! The MoE kernels always receive explicit per-slot device pointers,
+//! wherever the bytes ended up.
 
 /// Build identity for --version. The git sha is what a bug report needs;
 /// the crate version alone never moves.
@@ -21,6 +21,12 @@ pub const VERSION: &str = concat!(
     env!("PULSAR_GIT_SHA"),
     ")"
 );
+
+mod hybrid_miss;
+pub use hybrid_miss::{
+    bandwidths_from_env, cpu_steal_from_env, lru_victims, plan_host_misses, plan_host_misses_with,
+    q_star, split_by_recency, MissSplit, DEFAULT_HOST_GBS, DEFAULT_PCIE_GBS,
+};
 
 #[cfg(target_os = "linux")]
 mod real {
@@ -1486,16 +1492,21 @@ mod real {
         entries
     }
 
-    /// Device-side expert slab cache: a uniform-slot VRAM pool holding a
-    /// STABLE hot set. The pool is smaller than one token's slab working
-    /// set, so plain LFU would evict everything every token; instead every
-    /// requested offset gets a global touch count, and a slab is admitted
-    /// only when it is strictly hotter than the coldest resident. Cold
-    /// slabs stream through the staging arena and never enter the pool.
+    /// Device-side expert slab cache: a uniform-slot VRAM pool.
+    ///
+    /// Warm start still pins the census-hot triples. Decode then follows
+    /// the router with LRU (FreeToken-style): a miss in the fill-set can
+    /// evict the least-recently-used *triple* even if the census ranked it
+    /// hotter. Prefill keeps the heat gate so a 16-token union cannot
+    /// churn the pool. `PULSAR_NO_DEV_LRU=1` restores heat-only admits.
     ///
     /// Gate/up/down triples that enter via `maybe_insert_triple` or warm
     /// load share a `group` id so eviction frees the whole triple (avoids
     /// half-resident experts that still force H2D of siblings).
+    ///
+    /// `map` / `meta` / `last` are the host-resident form of a device slot
+    /// table (logical expert offset → slot, recency clock). A later CUDA
+    /// graph can consume the same arrays without a per-layer host resolve.
     pub struct DeviceSlabCache {
         pool: DeviceBuf,
         slab_bytes: usize,
@@ -1509,6 +1520,10 @@ mod real {
         ungrouped: u32,
         /// global (touch count, slab len) per requested offset, cached or not
         touch: std::collections::HashMap<u64, (u64, u64)>,
+        /// last-use clock per offset (decode LRU). Separate from `touch`
+        /// so the census heat used at warm-load is not rewritten.
+        last: std::collections::HashMap<u64, u64>,
+        clock: u64,
         next_group: u32,
         pub hits: u64,
         pub misses: u64,
@@ -1531,10 +1546,38 @@ mod real {
                 free_list: (0..slots as u32).collect(),
                 ungrouped: 0,
                 touch: std::collections::HashMap::new(),
+                last: std::collections::HashMap::new(),
+                clock: 0,
                 next_group: 1,
                 hits: 0,
                 misses: 0,
             })
+        }
+
+        fn note_use(&mut self, offset: u64) {
+            self.clock = self.clock.wrapping_add(1);
+            self.last.insert(offset, self.clock);
+        }
+
+        fn recency(&self, offset: u64) -> u64 {
+            self.last.get(&offset).copied().unwrap_or(0)
+        }
+
+        /// Every offset in a group is pinned if any member is in `in_use`,
+        /// so LRU cannot free a live sibling of a hit.
+        fn group_pinned_offsets(&self, in_use: &[u64]) -> Vec<u64> {
+            let mut pinned = in_use.to_vec();
+            for m in &self.meta {
+                if m.1 == u64::MAX || m.2 == u32::MAX || !in_use.contains(&m.1) {
+                    continue;
+                }
+                for n in &self.meta {
+                    if n.2 == m.2 && n.1 != u64::MAX {
+                        pinned.push(n.1);
+                    }
+                }
+            }
+            pinned
         }
 
         fn slot_ptr(&self, slot: u32) -> *const std::ffi::c_void {
@@ -1579,6 +1622,7 @@ mod real {
             let t = self.touch.entry(offset).or_insert((0, len));
             t.0 += 1;
             let freq = t.0;
+            self.note_use(offset);
             match self.map.get(&offset).copied() {
                 Some(slot) => {
                     self.meta[slot as usize].0 = freq;
@@ -1656,10 +1700,14 @@ mod real {
         /// Admit gate+up+down as one unit (all-or-nothing). Heat is the sum
         /// of per-slab touch counts; eviction picks the coldest freeable
         /// *groups* (or singletons) until three slots are free.
+        ///
+        /// `force` (decode LRU): skip the heat gate and evict the least-
+        /// recently-used freeable groups so a newly routed miss can enter.
         fn maybe_insert_triple(
             &mut self,
             parts: &[(u64, &[u8]); 3],
             in_use: &[u64],
+            force: bool,
         ) -> Result<Option<[*const std::ffi::c_void; 3]>> {
             let mut ptrs = [std::ptr::null(); 3];
             let mut need: Vec<(usize, u64, &[u8])> = Vec::new();
@@ -1679,6 +1727,26 @@ mod real {
                 .sum();
             // free slots already available
             while self.free_list.len() < need.len() {
+                if force {
+                    let pinned = self.group_pinned_offsets(in_use);
+                    let mut occupied: Vec<(u64, u64)> = Vec::new();
+                    let mut slot_of: Vec<u32> = Vec::new();
+                    for (i, m) in self.meta.iter().enumerate() {
+                        if m.1 != u64::MAX {
+                            occupied.push((m.1, self.last.get(&m.1).copied().unwrap_or(0)));
+                            slot_of.push(i as u32);
+                        }
+                    }
+                    // One slot per iteration: free_group_of may release
+                    // three siblings, which would overshoot if we asked
+                    // for `need` victims at once.
+                    let victims = crate::lru_victims(&occupied, &pinned, 1);
+                    if victims.is_empty() {
+                        return Ok(None);
+                    }
+                    self.free_group_of(slot_of[victims[0]]);
+                    continue;
+                }
                 let mut cands: Vec<(u32, u64, u32)> = self
                     .meta
                     .iter()
@@ -1716,10 +1784,87 @@ mod real {
                 debug_assert_eq!(self.meta[slot as usize].1, u64::MAX);
                 self.meta[slot as usize] = (freq, *off, gid);
                 self.map.insert(*off, slot);
+                self.note_use(*off);
                 ptrs[*i] = self.slot_ptr(slot);
             }
             Ok(Some(ptrs))
         }
+    }
+
+    fn dev_lru_on() -> bool {
+        std::env::var_os("PULSAR_NO_DEV_LRU").is_none()
+    }
+
+    /// Decode-time split of host-cached misses: GPU fill-set vs CPU lane.
+    /// Prefill (`cpu_on` false) returns empty — the existing staging path
+    /// handles those experts and the heat gate keeps the census pool.
+    fn hybrid_fill_cpu(cpu_on: bool, host_miss: &[(i32, u64)]) -> (Vec<i32>, Vec<i32>) {
+        if !cpu_on || host_miss.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        // Steal-on is the measured-fast path on consumer PCIe: every
+        // host-cached expert (hit or miss) runs on the CPU, overlapping
+        // GPU. q* fill would H2D a slice of those back onto a 13 GB/s
+        // link and lose. Steal-off keeps hits on the GPU and splits
+        // true misses by measured H2D / host bandwidth.
+        if crate::cpu_steal_from_env() {
+            return (
+                Vec::new(),
+                host_miss.iter().map(|(id, _)| *id).collect(),
+            );
+        }
+        let (env_pcie, host) = crate::bandwidths_from_env();
+        let pcie = if std::env::var("PULSAR_PCIE_GBS").is_ok() {
+            env_pcie
+        } else {
+            let measured = kernels::primary_h2d_gbs();
+            if measured > 0.0 {
+                measured
+            } else {
+                env_pcie
+            }
+        };
+        let mut split = crate::plan_host_misses_with(host_miss, pcie, host);
+        if let Some(cap) = std::env::var("PULSAR_CPU_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            if split.cpu.len() > cap {
+                split.fill.extend(split.cpu.drain(cap..));
+            }
+        }
+        (split.fill, split.cpu)
+    }
+
+    /// H2D a host-cached gate/up/down triple into the VRAM pool as one
+    /// LRU (or heat) admit. Copies payloads out so `store` and `cache`
+    /// do not alias.
+    fn admit_host_triple(
+        store: &StreamingStore,
+        cache: &mut DeviceSlabCache,
+        go: u64,
+        uo: u64,
+        dno: u64,
+        in_use: &[u64],
+        force: bool,
+    ) -> Result<Option<[*const std::ffi::c_void; 3]>> {
+        let Some(g) = store.payload(go) else {
+            return Ok(None);
+        };
+        let Some(u) = store.payload(uo) else {
+            return Ok(None);
+        };
+        let Some(d) = store.payload(dno) else {
+            return Ok(None);
+        };
+        let g = g.to_vec();
+        let u = u.to_vec();
+        let d = d.to_vec();
+        cache.maybe_insert_triple(
+            &[(go, g.as_slice()), (uo, u.as_slice()), (dno, d.as_slice())],
+            in_use,
+            force && dev_lru_on(),
+        )
     }
 
     /// Fetch buffers in CUDA pinned memory (H2D at full PCIe rate; they
@@ -6229,7 +6374,7 @@ mod real {
                 if gp.is_empty() || up.is_empty() || dp.is_empty() {
                     continue;
                 }
-                let _ = self.dev_cache.maybe_insert_triple(&[(g, gp), (u, up), (d, dp)], &[])?;
+                let _ = self.dev_cache.maybe_insert_triple(&[(g, gp), (u, up), (d, dp)], &[], false)?;
             }
             self.store.ensure_with(&host_reads, |_, _| Ok(()))?;
             self.store.reset_stats();
@@ -8418,17 +8563,14 @@ mod real {
                             s.moe_act_op,
                         );
                         let mut cpu_guard: Option<cpu_tier::WaitGuard> = None;
-                        // PULSAR_CPU_STEAL=0: leave dev-cache-resident
-                        // experts to the GPU. Right call on boxes where
-                        // warm VRAM coverage is high and the CPU is weak
-                        // (a V100 user measured the lane net-negative
-                        // there); default 1 = deterministic CPU ownership
-                        // of host-cached experts, which is what stabilizes
-                        // the cache ecology on high-miss boxes like mine.
-                        let cpu_steal =
-                            std::env::var("PULSAR_CPU_STEAL").ok().as_deref() != Some("0");
+                        // Hits stay on the GPU unless PULSAR_CPU_STEAL=1.
+                        // Host-cached misses split by q*: recency-ranked
+                        // fill-set H2Ds into the VRAM LRU, the rest run on
+                        // the CPU lane. PULSAR_NO_HYBRID=1 restores "every
+                        // host-cached miss to the CPU".
+                        let cpu_steal = crate::cpu_steal_from_env();
+                        let mut host_miss: Vec<(i32, u64)> = Vec::new();
                         if cpu_on {
-                            let mut pins = Vec::new();
                             for &e in &distinct {
                                 if e < 0 || e as u32 >= s.n_expert || tier_of(e).is_some() {
                                     continue;
@@ -8436,8 +8578,6 @@ mod real {
                                 let [g3, u3, d3] = slabs_of(e as u32);
                                 let (go, uo, dno) =
                                     (off_of(g3.0, g3.1), off_of(u3.0, u3.1), off_of(d3.0, d3.1));
-                                // PULSAR_CPU_STEAL=0: leave VRAM-resident experts
-                                // on the GPU (weak-CPU / high-coverage boxes).
                                 if !cpu_steal
                                     && (st.dev_cache.map.contains_key(&go)
                                         || st.dev_cache.map.contains_key(&uo)
@@ -8445,10 +8585,6 @@ mod real {
                                 {
                                     continue;
                                 }
-                                // host-cached => CPU lane, even when a slab
-                                // also sits in dev_cache: exclusion made
-                                // ownership a first-touch race, bistable
-                                // run to run (GLM oscillated 1.6-2.8).
                                 if self
                                     .mtp
                                     .as_ref()
@@ -8456,6 +8592,27 @@ mod real {
                                 {
                                     continue;
                                 }
+                                if !st.store.contains(go)
+                                    || !st.store.contains(uo)
+                                    || !st.store.contains(dno)
+                                {
+                                    continue;
+                                }
+                                let rec = st
+                                    .dev_cache
+                                    .recency(go)
+                                    .max(st.dev_cache.recency(uo))
+                                    .max(st.dev_cache.recency(dno));
+                                host_miss.push((e, rec));
+                            }
+                        }
+                        let (fill_set, cpu_set) = hybrid_fill_cpu(cpu_on, &host_miss);
+                        if cpu_on && !cpu_set.is_empty() {
+                            let mut pins = Vec::new();
+                            for &e in &cpu_set {
+                                let [g3, u3, d3] = slabs_of(e as u32);
+                                let (go, uo, dno) =
+                                    (off_of(g3.0, g3.1), off_of(u3.0, u3.1), off_of(d3.0, d3.1));
                                 let (Some(gp), Some(upp), Some(dp)) = (
                                     st.store.peek_ptr(go),
                                     st.store.peek_ptr(uo),
@@ -8463,20 +8620,52 @@ mod real {
                                 ) else {
                                     continue;
                                 };
-                                // PULSAR_CPU_CAP: bound lane experts per
-                                // layer (bisection tool for the GLM loop)
-                                if let Some(cap) = std::env::var("PULSAR_CPU_CAP")
-                                    .ok()
-                                    .and_then(|v| v.parse::<usize>().ok())
-                                {
-                                    if lane.idx.len() >= cap {
-                                        continue;
-                                    }
+                                let up_off = *fused_up_off as usize;
+                                if up_off >= upp.1 {
+                                    continue;
                                 }
-                                lane.add(e, gp.0, unsafe { upp.0.add(*fused_up_off as usize) }, dp.0);
+                                // SAFETY: up_off < payload len of the fused up slab.
+                                lane.add(e, gp.0, unsafe { upp.0.add(up_off) }, dp.0);
                                 pins.extend([go, uo, dno]);
                             }
                             st.store.pinned = pins;
+                        }
+                        if !fill_set.is_empty() {
+                            let mut in_use_hits: Vec<u64> = Vec::new();
+                            for &e in &distinct {
+                                if e < 0 || e as u32 >= s.n_expert {
+                                    continue;
+                                }
+                                let [g3, u3, d3] = slabs_of(e as u32);
+                                for o in [
+                                    off_of(g3.0, g3.1),
+                                    off_of(u3.0, u3.1),
+                                    off_of(d3.0, d3.1),
+                                ] {
+                                    if st.dev_cache.map.contains_key(&o) {
+                                        in_use_hits.push(o);
+                                    }
+                                }
+                            }
+                            for &e in &fill_set {
+                                let [g3, u3, d3] = slabs_of(e as u32);
+                                let (go, uo, dno) =
+                                    (off_of(g3.0, g3.1), off_of(u3.0, u3.1), off_of(d3.0, d3.1));
+                                if let Some(ps) = admit_host_triple(
+                                    &st.store,
+                                    &mut st.dev_cache,
+                                    go,
+                                    uo,
+                                    dno,
+                                    &in_use_hits,
+                                    n_tok == 1,
+                                )? {
+                                    resolved.insert(go, ps[0]);
+                                    resolved.insert(uo, ps[1]);
+                                    resolved.insert(dno, ps[2]);
+                                    in_use_hits.extend([go, uo, dno]);
+                                }
+                            }
                         }
                         // ---- lane B: experts the DISK is about to deliver ----
                         // Lane A above can only claim experts already in RAM,
@@ -8558,6 +8747,7 @@ mod real {
                                 for (t, le) in slabs_of(e as u32) {
                                     let off = off_of(t, le);
                                     st.dev_cache.touch.entry(off).or_insert((0, t.expert_bytes)).0 += 1;
+                                    st.dev_cache.note_use(off);
                                 }
                                 continue;
                             }

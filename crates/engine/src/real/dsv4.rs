@@ -1436,11 +1436,9 @@ impl Model {
             act_op,
         );
         let mut cpu_guard: Option<super::cpu_tier::WaitGuard> = None;
-        // PULSAR_CPU_STEAL=0: leave dev-cache-resident experts to the GPU
-        // (see the eval_layer seam for the tradeoff)
-        let cpu_steal = std::env::var("PULSAR_CPU_STEAL").ok().as_deref() != Some("0");
+        let cpu_steal = crate::cpu_steal_from_env();
+        let mut host_miss: Vec<(i32, u64)> = Vec::new();
         if cpu_on {
-            let mut pins = Vec::new();
             for &e in &distinct {
                 if tier_map.contains_key(&e) {
                     continue;
@@ -1458,6 +1456,24 @@ impl Model {
                 if self.mtp.as_ref().is_some_and(|mt| mt.res_map.contains_key(&go)) {
                     continue;
                 }
+                if !st.store.contains(go) || !st.store.contains(uo) || !st.store.contains(dno) {
+                    continue;
+                }
+                let rec = st
+                    .dev_cache
+                    .recency(go)
+                    .max(st.dev_cache.recency(uo))
+                    .max(st.dev_cache.recency(dno));
+                host_miss.push((e, rec));
+            }
+        }
+        let (fill_set, cpu_set) = super::hybrid_fill_cpu(cpu_on, &host_miss);
+        if cpu_on && !cpu_set.is_empty() {
+            let mut pins = Vec::new();
+            for &e in &cpu_set {
+                let go = gate_exps.abs_offset + e as u64 * gate_exps.expert_bytes;
+                let uo = up_exps.abs_offset + e as u64 * up_exps.expert_bytes;
+                let dno = down_exps.abs_offset + e as u64 * down_exps.expert_bytes;
                 let (Some(gp), Some(upp), Some(dp)) = (
                     st.store.peek_ptr(go),
                     st.store.peek_ptr(uo),
@@ -1487,6 +1503,7 @@ impl Model {
                 for t in [gate_exps, up_exps, down_exps] {
                     let off = t.abs_offset + e as u64 * t.expert_bytes;
                     st.dev_cache.touch.entry(off).or_insert((0, t.expert_bytes)).0 += 1;
+                    st.dev_cache.note_use(off);
                 }
                 continue;
             }
@@ -1504,6 +1521,38 @@ impl Model {
         }
         let in_use: Vec<u64> = offsets.iter().map(|r| r.offset).collect();
         let mut resolved = std::collections::HashMap::new();
+        if !fill_set.is_empty() {
+            let mut in_use_hits: Vec<u64> = Vec::new();
+            for &e in &distinct {
+                let go = gate_exps.abs_offset + e as u64 * gate_exps.expert_bytes;
+                let uo = up_exps.abs_offset + e as u64 * up_exps.expert_bytes;
+                let dno = down_exps.abs_offset + e as u64 * down_exps.expert_bytes;
+                for o in [go, uo, dno] {
+                    if st.dev_cache.map.contains_key(&o) {
+                        in_use_hits.push(o);
+                    }
+                }
+            }
+            for &e in &fill_set {
+                let go = gate_exps.abs_offset + e as u64 * gate_exps.expert_bytes;
+                let uo = up_exps.abs_offset + e as u64 * up_exps.expert_bytes;
+                let dno = down_exps.abs_offset + e as u64 * down_exps.expert_bytes;
+                if let Some(ps) = super::admit_host_triple(
+                    &st.store,
+                    &mut st.dev_cache,
+                    go,
+                    uo,
+                    dno,
+                    &in_use_hits,
+                    n_tok == 1,
+                )? {
+                    resolved.insert(go, ps[0]);
+                    resolved.insert(uo, ps[1]);
+                    resolved.insert(dno, ps[2]);
+                    in_use_hits.extend([go, uo, dno]);
+                }
+            }
+        }
         let mut wants = Vec::new();
         for r in &offsets {
             if st.unified {
